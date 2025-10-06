@@ -1,0 +1,2 @@
+# bot-suite
+ws bot
