@@ -93,6 +93,25 @@ async function handleUserMessage(job: Job) {
       role: "assistant",
       content: reply,
     });
+    // --- Enviar por Twilio si el número existe ---
+try {
+  // Obtiene el número asociado a la conversación
+  const { data: conv } = await supabase
+    .from("conversations")
+    .select("phone")
+    .eq("id", conversationId)
+    .single();
+
+  if (conv?.phone) {
+    const { sendViaTwilio } = await import("./utils/sendViaTwilio");
+    await sendViaTwilio(conv.phone, reply);
+  } else {
+    console.warn(`⚠️ No se encontró número para conversationId ${conversationId}`);
+  }
+} catch (e) {
+  console.error("Error al enviar por Twilio:", e);
+}
+
 
     if (insErr) console.error("insert assistant error:", insErr);
   } catch (e) {
