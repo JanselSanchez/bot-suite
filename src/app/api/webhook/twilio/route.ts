@@ -1,32 +1,49 @@
-// src/app/api/twilio/route.ts
-import { supabase } from "@/app/lib/superbase";
-import { NextRequest, NextResponse } from "next/server";
+import { supabaseAdmin } from "@/app/lib/superbase";
+import { NextRequest } from "next/server";
 
-
-// --- útil para probar en el navegador ---
+// --- Healthcheck (abre en el navegador) ---
 export async function GET() {
-  return NextResponse.json({ ok: true, service: "twilio-webhook" });
+  return new Response(JSON.stringify({ ok: true, service: "twilio-webhook" }), {
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
-// Twilio envía application/x-www-form-urlencoded
+// Twilio envía x-www-form-urlencoded
 function parseForm(body: string) {
   return Object.fromEntries(new URLSearchParams(body));
 }
 
+// crea/obtiene conversación de forma tolerante a fallos
 async function ensureConversation(phone: string) {
-  const { data } = await supabase
+  const { data: sel, error: selErr } = await supabaseAdmin
     .from("conversations")
     .select("id")
     .eq("phone", phone)
     .limit(1)
     .maybeSingle();
-  if (data?.id) return data.id;
-  const { data: created } = await supabase
+
+  if (selErr) console.error("select conversations error:", selErr);
+  if (sel?.id) return sel.id;
+
+  const { data: ins, error: insErr } = await supabaseAdmin
     .from("conversations")
     .insert({ phone })
     .select("id")
     .single();
-  return created!.id;
+
+  if (insErr) {
+    console.error("insert conversations error:", insErr);
+    return null;
+  }
+  return ins?.id ?? null;
+}
+
+async function logMessage(conversation_id: number | null, role: "user" | "bot", text: string) {
+  const payload: any = { role, text };
+  if (conversation_id) payload.conversation_id = conversation_id;
+
+  const { error } = await supabaseAdmin.from("messages").insert(payload);
+  if (error) console.error("insert messages error:", error);
 }
 
 async function sendWhatsApp(to: string, text: string) {
@@ -35,47 +52,43 @@ async function sendWhatsApp(to: string, text: string) {
   const from = process.env.TWILIO_WHATSAPP_FROM!; // ej: whatsapp:+14155238886
   const auth = Buffer.from(`${sid}:${token}`).toString("base64");
 
-  const body = new URLSearchParams({ From: from, To: to, Body: text }).toString();
   await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
     method: "POST",
     headers: {
       Authorization: `Basic ${auth}`,
       "Content-Type": "application/x-www-form-urlencoded",
     },
-    body,
+    body: new URLSearchParams({ From: from, To: to, Body: text }).toString(),
   });
 }
 
 export async function POST(req: NextRequest) {
-  const raw = await req.text();          // leer como texto (form-urlencoded)
-  const f = parseForm(raw);
-  const from = f.From;                   // "whatsapp:+1829XXXXXXX"
-  const body = (f.Body || "").trim();
+  try {
+    const raw = await req.text();
+    const form = parseForm(raw);
 
-  // Guarda en BD
-  const convId = await ensureConversation(from);
-  await supabase.from("messages").insert({
-    conversation_id: convId,
-    role: "user",
-    text: body,
-  });
+    const from = form.From as string;              // "whatsapp:+1XXXXXXXXXX"
+    const message = (form.Body || "").trim();
 
-  // Respuesta simple (luego metemos FAQs/sector)
-  const reply =
-    !body
-      ? "¿Podrías repetir el mensaje?"
-      : body.toLowerCase().includes("hola")
-      ? "¡Hola! 👋 Soy tu asistente. ¿En qué puedo ayudarte?"
-      : "Recibido ✅. En breve te ayudamos.";
+    console.log("📩 IN:", from, message);
 
-  await sendWhatsApp(from, reply);
+    // guarda en BD (sin romper si falla)
+    const convId = await ensureConversation(from);
+    await logMessage(convId, "user", message);
 
-  await supabase.from("messages").insert({
-    conversation_id: convId,
-    role: "bot",
-    text: reply,
-  });
+    // respuesta simple (luego pluggeamos FAQs/sector)
+    const reply = message.toLowerCase().includes("hola")
+      ? "👋 ¡Hola! Bot operativo con Twilio + Render ✅"
+      : "Recibido ✅. ¿En qué puedo ayudarte?";
 
-  // Twilio solo necesita 200 (TwiML opcional)
-  return new Response("<Response/>", { headers: { "Content-Type": "text/xml" } });
+    await sendWhatsApp(from, reply);
+    await logMessage(convId, "bot", reply);
+
+    // Twilio solo necesita 200
+    return new Response("<Response/>", { headers: { "Content-Type": "text/xml" } });
+  } catch (err) {
+    console.error("Webhook error:", err);
+    // devolvemos 200 para evitar reintentos en bucle
+    return new Response("<Response/>", { headers: { "Content-Type": "text/xml" }, status: 200 });
+  }
 }
