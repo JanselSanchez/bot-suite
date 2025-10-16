@@ -1,34 +1,39 @@
+// worker/utils/sendViaTwilio.ts
 import twilio from "twilio";
 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID!;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN!;
-const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM!;
+const SID = process.env.TWILIO_ACCOUNT_SID!;
+const TOKEN = process.env.TWILIO_AUTH_TOKEN!;
+const FROM_WA = process.env.TWILIO_WHATSAPP_FROM; // e.g. whatsapp:+14155238886
+const FROM_SMS = process.env.TWILIO_SMS_FROM;     // si quieres SMS (opcional)
 
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM) {
-  console.error("⚠️ Falta configuración Twilio en .env.local");
+if (!SID || !TOKEN) {
+  throw new Error("Faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN");
 }
 
-const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+const client = twilio(SID, TOKEN);
 
 /**
- * Envía un mensaje de WhatsApp vía Twilio.
- * Se usa desde el worker al generar la respuesta del bot.
+ * Envia por WhatsApp si el 'to' empieza con 'whatsapp:'.
+ * Si no, intenta SMS (requiere FROM_SMS y que el to esté verificado si tu cuenta es trial).
  */
 export async function sendViaTwilio(to: string, body: string) {
+  const isWhatsApp = to.startsWith("whatsapp:");
+  const from = isWhatsApp ? FROM_WA : FROM_SMS;
+
+  if (!from) {
+    console.warn(`[twilio] No hay remitente configurado para ${isWhatsApp ? "WhatsApp" : "SMS"}.`);
+    return;
+  }
+
   try {
-    if (!to.startsWith("whatsapp:")) {
-      to = `whatsapp:${to}`;
-    }
-
-    const msg = await client.messages.create({
-      from: TWILIO_WHATSAPP_FROM,
-      to,
-      body,
-    });
-
-    console.log(`📤 Twilio enviado a ${to} | SID: ${msg.sid}`);
-    return msg.sid;
+    const msg = await client.messages.create({ from, to, body });
+    console.log(`[twilio] sent OK sid=${msg.sid} to=${to}`);
   } catch (err: any) {
-    console.error("❌ Error enviando Twilio:", err.message || err);
+    // Errores típicos:
+    // - 63016 Not a valid 'To' number for WhatsApp
+    // - 63018 Unapproved template/out-of-session (para cuentas WA Business; en sandbox no aplica si te uniste)
+    // - 21606 The 'To' phone number provided is not a valid SMS-capable number
+    console.error("[twilio] send error:", err?.code, err?.message);
+    throw err;
   }
 }

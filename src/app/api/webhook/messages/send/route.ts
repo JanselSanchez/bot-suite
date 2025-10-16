@@ -2,9 +2,23 @@
 import { NextRequest } from "next/server";
 import { chatQueue } from "@/server/queue";
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
+import crypto from "crypto";
 
 export async function GET() {
   return Response.json({ ok: true, route: "/api/webhook/messages/send" });
+}
+
+/**
+ * Genera un jobId determinista para BullMQ cuando NO tenemos externalId del proveedor.
+ * Usa bucket de 1 minuto para absorber dobles submits/reintentos muy cercanos.
+ */
+function fallbackJobId(conversationId: string, text: string) {
+  const minuteBucket = Math.floor(Date.now() / 60000);
+  const key = crypto
+    .createHash("sha256")
+    .update(`${conversationId}|${text.trim()}|${minuteBucket}`)
+    .digest("hex");
+  return `inbound:${conversationId}:${key}`;
 }
 
 export async function POST(req: NextRequest) {
@@ -12,48 +26,157 @@ export async function POST(req: NextRequest) {
   try {
     body = await req.json();
   } catch (e: any) {
-    return Response.json({ ok: false, error: "JSON parse failed", detail: e?.message }, { status: 400 });
+    return Response.json(
+      { ok: false, error: "JSON parse failed", detail: e?.message },
+      { status: 400 }
+    );
   }
 
-  // log de lo que realmente llegó
-  const { conversationId, text } = body ?? {};
-  const debug = { rawBody: body, conversationIdType: typeof conversationId, textType: typeof text };
+  // Extrae campos (admite opcional externalId/metadata from Twilio u otro proveedor)
+  const {
+    conversationId,
+    text,
+    externalId, // p.ej. Twilio MessageSid
+    provider,   // opcional, "twilio" | "whatsapp" | ...
+    meta,       // opcional: cualquier metadata del proveedor
+  } = body ?? {};
 
-  if (!conversationId || !text || typeof conversationId !== "string" || typeof text !== "string") {
+  const debug = {
+    rawBody: body,
+    conversationIdType: typeof conversationId,
+    textType: typeof text,
+    hasExternalId: !!externalId,
+    provider: provider ?? null,
+  };
+
+  if (
+    !conversationId ||
+    !text ||
+    typeof conversationId !== "string" ||
+    typeof text !== "string"
+  ) {
     return Response.json(
-      { ok: false, error: "Missing or invalid fields", expected: ["conversationId:string", "text:string"], debug },
+      {
+        ok: false,
+        error: "Missing or invalid fields",
+        expected: ["conversationId:string", "text:string"],
+        debug,
+      },
+      { status: 400 }
+    );
+  }
+
+  const trimmedText = text.trim();
+  if (!trimmedText) {
+    return Response.json(
+      { ok: false, error: "Empty text after trim", debug },
       { status: 400 }
     );
   }
 
   try {
-    // Inserta el mensaje del usuario
-    const { data: inserted, error } = await supabaseAdmin
+    // 1) Idempotencia a nivel de mensajes usando externalId (si está disponible)
+    if (externalId) {
+      const { data: existing, error: selErr } = await supabaseAdmin
+        .from("messages")
+        .select("id")
+        .eq("external_id", externalId)
+        .maybeSingle();
+
+      if (selErr) {
+        // No bloquea: seguimos, pero lo registramos en debug
+        console.warn("[messages.select by external_id] warn:", selErr?.message || selErr);
+      }
+
+      if (existing?.id) {
+        // Ya procesado: NO encolar de nuevo
+        return Response.json({
+          ok: true,
+          id: existing.id,
+          dedup: true,
+          debug,
+        });
+      }
+    }
+
+    // 2) Inserta el mensaje del usuario (con external_id si viene)
+    const insertPayload: any = {
+      conversation_id: conversationId,
+      role: "user",
+      content: trimmedText,
+    };
+    if (externalId) insertPayload.external_id = externalId;
+    if (provider || meta) {
+      // si tienes columnas para metadata, puedes guardarlas aquí
+      // insertPayload.provider = provider ?? null;
+      // insertPayload.meta = meta ?? null; // requiere columna jsonb opcional
+    }
+
+    const { data: inserted, error: insErr } = await supabaseAdmin
       .from("messages")
-      .insert({ conversation_id: conversationId, role: "user", content: text })
+      .insert(insertPayload)
       .select("id")
       .single();
 
-    if (error) {
-      return Response.json({ ok: false, error: "DB error", detail: error }, { status: 500 });
+    if (insErr) {
+      // Si rompe por unique constraint en external_id, recupera y sal con dedup
+      const msg = (insErr as any)?.message || "";
+      const code = (insErr as any)?.code || "";
+      const unique =
+        code === "23505" ||
+        msg.toLowerCase().includes("duplicate") ||
+        msg.toLowerCase().includes("unique") ||
+        msg.toLowerCase().includes("external_id");
+
+      if (externalId && unique) {
+        const { data: existing } = await supabaseAdmin
+          .from("messages")
+          .select("id")
+          .eq("external_id", externalId)
+          .maybeSingle();
+
+        if (existing?.id) {
+          return Response.json({
+            ok: true,
+            id: existing.id,
+            dedup: true,
+            debug,
+          });
+        }
+      }
+
+      return Response.json({ ok: false, error: "DB error", detail: insErr }, { status: 500 });
     }
 
-    // Encola job
-// en tu route.ts al hacer chatQueue.add
-await chatQueue.add(
-  "user-message",
-  { conversationId, userMessageId: inserted.id, text },
-  {
-    attempts: 5,
-    backoff: { type: "exponential", delay: 5000 }, // 5s, 10s, 20s...
-    removeOnComplete: true,
-    removeOnFail: false,
-  }
-);
+    // 3) Encola job con jobId idempotente:
+    //    - Si hay externalId (p.ej. Twilio MessageSid) úsalo como jobId
+    //    - Si no hay, usa hash determinista por minuto
+    const jobId = externalId
+      ? `inbound:${provider || "ext"}:${externalId}`
+      : fallbackJobId(conversationId, trimmedText);
 
+    await chatQueue.add(
+      "user-message",
+      {
+        conversationId,
+        userMessageId: inserted.id,
+        text: trimmedText,
+        externalId: externalId ?? null,
+        provider: provider ?? null,
+      },
+      {
+        jobId,                // 👈 evita duplicados en cola
+        attempts: 1,          // 👈 no reintentar mensajes del usuario (evita dobles respuestas)
+        removeOnComplete: true,
+        removeOnFail: false,
+      }
+    );
 
-    return Response.json({ ok: true, id: inserted.id, debug });
+    return Response.json({ ok: true, id: inserted.id, jobId, debug });
   } catch (e: any) {
-    return Response.json({ ok: false, error: "Unhandled", detail: e?.message }, { status: 500 });
+    return Response.json(
+      { ok: false, error: "Unhandled", detail: e?.message },
+      { status: 500 }
+    );
   }
 }
