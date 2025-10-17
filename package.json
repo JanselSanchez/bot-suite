@@ -7,11 +7,18 @@
     "build": "next build --turbopack",
     "start": "next start",
     "lint": "eslint",
-    "bot:worker": "cross-env DOTENV_CONFIG_PATH=.env.local tsx -r dotenv/config worker/botWorker.ts"
+    "bot:worker": "cross-env DOTENV_CONFIG_PATH=.env.local tsx -r dotenv/config worker/botWorker.ts",
+    "worker:notifications": "tsx workers/notifications.ts",
+    "watchdog": "tsx jobs/watchdog.ts",
+    "worker:reminders": "tsx workers/reminders.ts",
+    "worker:outbox": "tsx workers/outbox.ts"
+
   },
   "dependencies": {
     "@radix-ui/react-separator": "^1.1.7",
     "@radix-ui/react-slot": "^1.2.3",
+    "@sentry/nextjs": "^10.20.0",
+    "@sentry/node": "^10.20.0",
     "@supabase/ssr": "^0.7.0",
     "@supabase/supabase-js": "^2.74.0",
     "@tailwindcss/vite": "^4.1.14",
