@@ -11,24 +11,19 @@
   :root { --background: #0a0a0a; --foreground: #ededed; }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
-}
+
 
 /* Contenedor centrado y responsivo */
-@layer utilities {
-  .container { @apply mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8; }
-}
-
-/* Estilos base */
 @layer base {
   :root {
     --bg: 247 247 248;   /* gray-50 */
     --fg: 17 24 39;      /* gray-900 */
   }
-  body { @apply bg-gray-50 text-gray-900 antialiased; }
+
+  /* ❌ Elimina el bg-gray-50 aquí */
+  /* ✅ Deja el color del texto y antialiasing */
+  body { @apply text-gray-900 antialiased; }
+
   a { @apply underline-offset-2 decoration-gray-300 hover:underline hover:decoration-gray-400; }
   h1 { @apply text-2xl md:text-3xl font-semibold tracking-tight; }
   h2 { @apply text-xl md:text-2xl font-semibold tracking-tight; }

@@ -11,6 +11,7 @@ export async function GET() {
     const outbox = new Queue('outbox', { connection: redis })
     const reminders = new Queue('reminders', { connection: redis })
     const noshow = new Queue('noshow', { connection: redis })
+    
 
     const [r1, r2, r3, r4, r5] = await Promise.all([
       bot.getJobCounts(),

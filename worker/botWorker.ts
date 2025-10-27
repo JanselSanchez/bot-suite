@@ -72,6 +72,10 @@ const DEFAULT_TEMPLATES: Record<string, string> = {
     "⏰ Recordatorio: {{customer_name}}, te esperamos el {{date}} a las {{time}} con {{resource_name}}.",
 };
 
+const redis = new IORedis(process.env.REDIS_URL!);
+setInterval(() => {
+  redis.set("worker:hb", "1", "EX", 60).catch(()=>{});
+}, 15000);
 async function getTemplateOrDefault(
   tenantId: string,
   channel: "whatsapp" | "sms" | "email",
