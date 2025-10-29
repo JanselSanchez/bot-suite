@@ -1,3 +1,4 @@
+// src/app/dashboard/bookings/RescheduleDialog.tsx
 "use client";
 import { useEffect, useMemo, useState } from "react";
 
@@ -7,17 +8,16 @@ type Props = {
   booking: {
     id: string;
     tenant_id: string;
-    service_id: string;
+    service_id: string | null;        // ← ✅ ahora permite null
     starts_at: string;
     resource_id: string | null;
   };
 };
 
-// 🕓 Convierte una fecha local (YYYY-MM-DD) a "medianoche RD" expresada en UTC
+// 🕓 Convierte YYYY-MM-DD (hora local RD) a medianoche expresada en UTC
 function rdLocalMidnightToUTC(dateStr: string): string {
   const RD_OFFSET_MIN = 240; // -4h
   const [y, m, d] = dateStr.split("-").map(Number);
-  // construimos medianoche local (Y-M-D 00:00) y la proyectamos a UTC
   const localMidnight = Date.UTC(y, m - 1, d, 0, 0, 0, 0);
   const utcMs = localMidnight + RD_OFFSET_MIN * 60 * 1000;
   return new Date(utcMs).toISOString();
@@ -50,12 +50,18 @@ export default function RescheduleDialog({ open, onOpenChange, booking }: Props)
     (async () => {
       setLoading(true);
       try {
-        // ✅ convertimos fecha local a UTC para el backend
         const dateUTC = rdLocalMidnightToUTC(date);
-        const url = `/api/admin/availability?tenantId=${booking.tenant_id}&serviceId=${booking.service_id}&date=${encodeURIComponent(
-          dateUTC
-        )}`;
-        const res = await fetch(url);
+
+        // Construir URL con params obligatorios
+        const params = new URLSearchParams({
+          tenantId: booking.tenant_id,
+          date: dateUTC,
+        });
+
+        // Incluir serviceId solo si no es null
+        if (booking.service_id) params.set("serviceId", booking.service_id);
+
+        const res = await fetch(`/api/admin/availability?${params.toString()}`);
         const j = await res.json();
         setSlots(j.data ?? []);
       } catch (e) {
@@ -65,7 +71,7 @@ export default function RescheduleDialog({ open, onOpenChange, booking }: Props)
         setLoading(false);
       }
     })();
-  }, [open, booking.service_id, booking.tenant_id, date]);
+  }, [open, booking.tenant_id, booking.service_id, date]);
 
   async function pick(i: number) {
     const chosen = slots[i];

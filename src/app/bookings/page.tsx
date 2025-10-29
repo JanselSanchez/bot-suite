@@ -1,4 +1,5 @@
 // imports nuevos arriba:
+//src/app/bookings/page.tsx
 import FiltersBar from "./FiltersBar";
 import CreateBookingDialog from "./CreateBookingDialog";
 import { useEffect, useState } from "react";
