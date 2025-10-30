@@ -2,6 +2,7 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
@@ -19,7 +20,10 @@ import {
   Bell,
 } from "lucide-react";
 
-// ⬇️ NUEVO: Provider de tenant + selector visual
+// ⬇️ NUEVO: import del logo (ruta real: /src/img/logo.png)
+import Logo from "@/img/logo4.png";
+
+// ⬇️ Provider de tenant + selector visual
 import { ActiveTenantProvider } from "@/app/providers/active-tenant";
 import ActiveTenantMenu from "@/componentes/ActiveTenantMenu";
 
@@ -34,7 +38,6 @@ const LINKS = [
   { href: "/dashboard/reschedule", label: "Reprogramar", icon: RefreshCw },
   { href: "/dashboard/availability", label: "Disponibilidad", icon: Clock },
   { href: "/dashboard/templates", label: "Plantillas", icon: Layers },
-  { href: "/dashboard/editor", label: "Editor del Bot", icon: Bot },
   { href: "/dashboard/status", label: "Estado", icon: Activity },
   { href: "/dashboard/settings", label: "Configuración", icon: Settings },
 ];
@@ -50,7 +53,9 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   useEffect(() => {
     (async () => {
-      const { data: { user } } = await sb.auth.getUser();
+      const {
+        data: { user },
+      } = await sb.auth.getUser();
       if (user) setUserName(user.user_metadata?.full_name || user.email || "Usuario");
     })();
   }, []);
@@ -98,12 +103,20 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             <div className="rounded-2xl border border-white/40 bg-white/50 backdrop-blur-xl shadow-[0_8px_40px_rgba(31,41,55,.08)] px-4">
               <div className="h-14 flex items-center justify-between gap-4">
                 {/* Brand */}
-                <div className="flex items-center gap-3">
-                  <div className="h-9 w-9 rounded-2xl bg-gradient-to-br from-indigo-600 to-fuchsia-600 text-white grid place-items-center shadow-sm">
-                    ✨
+                <Link href="/dashboard" className="flex items-center gap-3 no-underline ">
+                <div className="h-9 w-9 rounded-2xl bg-gradient-to-br from-indigo-600 to-fuchsia-600 text-white grid place-items-center shadow-sm no-underline ">
+                    {/* ⬇️ Logo visible con next/image */}
+                    <Image
+                      src={Logo}
+                      alt="PymeBOT"
+                      width={80} 
+                      height={80}
+                      className="object-contain no-underline "
+                      priority
+                    />
                   </div>
-                  <span className="font-semibold tracking-wide">PymeBOT</span>
-                </div>
+                  <span className="font-semibold tracking-wide no-underline ">PymeBOT</span>
+                </Link>
 
                 {/* Centro: Pills + Selector de negocio */}
                 <div className="hidden md:flex items-center gap-3">
@@ -129,7 +142,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                     })}
                   </nav>
 
-                  {/* Selector de negocio (píldora) — usa el estado global */}
+                  {/* Selector de negocio */}
                   <ActiveTenantMenu />
                 </div>
 
@@ -163,12 +176,14 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         <div className="mx-auto max-w-7xl px-4 py-6 grid grid-cols-1 lg:grid-cols-[260px_1fr] gap-6">
           {/* Sidebar */}
           <aside className="rounded-3xl border border-white/50 bg-white/60 backdrop-blur-xl shadow-[0_10px_40px_rgba(2,6,23,.06)] p-4">
-            <div className="flex items-center gap-2 mb-5">
-              <div className="h-8 w-8 rounded-xl bg-indigo-600/10 grid place-items-center">
-                <span className="text-indigo-600 font-semibold">PB</span>
+            <Link href="/dashboard">
+              <div className="flex items-center gap-2 mb-5">
+                <div className="h-8 w-8 rounded-xl bg-indigo-600/10 grid place-items-center">
+                  <span className="text-indigo-600 font-semibold">PB</span>
+                </div>
+                <span className="text-sm font-medium text-slate-700">Bot Suite</span>
               </div>
-              <span className="text-sm font-medium text-slate-700">Bot Suite</span>
-            </div>
+            </Link>
             <nav className="space-y-1">
               {LINKS.map(({ href, label, icon: Icon }) => {
                 const active = pathname === href;
@@ -183,7 +198,12 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                         : "text-slate-600 hover:text-indigo-700 hover:bg-indigo-50"
                     )}
                   >
-                    <Icon className={clsx("w-4 h-4", active ? "opacity-90" : "opacity-70 group-hover:opacity-100")} />
+                    <Icon
+                      className={clsx(
+                        "w-4 h-4",
+                        active ? "opacity-90" : "opacity-70 group-hover:opacity-100"
+                      )}
+                    />
                     <span>{label}</span>
                   </Link>
                 );
