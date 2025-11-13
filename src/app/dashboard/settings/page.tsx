@@ -1,11 +1,9 @@
-// src/app/dashboard/settings/page.tsx
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@supabase/supabase-js";
 
-// UI tuyas
 import SubscriptionBadge from "@/app/dashboard/components/SubscriptionBadge";
 import BusinessHoursEditor from "@/componentes/Availability/BusinessHoursEditor";
 import ExceptionsTable from "@/componentes/Availability/ExceptionsTable";
@@ -21,6 +19,7 @@ const KEY_SELECTED_TENANT = "pb.selectedTenantId";
 
 type Membership = { tenant_id: string; tenant_name: string };
 
+// Normaliza a "whatsapp:+1..." si hace falta
 function normalizePhone(raw: string) {
   const s = (raw || "").trim();
   if (!s) return null;
@@ -32,29 +31,51 @@ function normalizePhone(raw: string) {
   return `whatsapp:${digits}`;
 }
 
+// helpers fecha <-> input "datetime-local"
+function isoToLocalInput(iso: string | null) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
+  const yyyy = d.getFullYear();
+  const mm = pad(d.getMonth() + 1);
+  const dd = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const mi = pad(d.getMinutes());
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+}
+function localInputToIso(val: string) {
+  if (!val) return null;
+  const dt = new Date(val);
+  return dt.toISOString();
+}
+
 export default function SettingsPage() {
   const router = useRouter();
 
   const [loading, setLoading] = useState(true);
 
-  // selector de negocio
+  // selector
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [tenantId, setTenantId] = useState<string>("");
 
-  // datos editables del tenant
+  // datos básicos
   const [name, setName] = useState("");
   const [phone, setPhone] = useState(""); // sin "whatsapp:"
   const [timezone, setTimezone] = useState(DEFAULT_TZ);
-  const [status, setStatus] = useState("active");
+  const [status, setStatus] =
+    useState<"active" | "inactive" | "trial" | "blocked">("active");
   const [saving, setSaving] = useState(false);
 
-  // resource actual para Availability/Calendar
+  // facturación / gate
+  const [validUntil, setValidUntil] = useState<string | null>(null);
+  const [graceDays, setGraceDays] = useState<number>(0);
+
+  // recurso para el calendario
   const [resourceId, setResourceId] = useState<string | null>(null);
 
-  // ---------- CARGA INICIAL: lista de tenants + selección inicial ----------
+  // ---------- CARGA INICIAL ----------
   useEffect(() => {
     (async () => {
-      // 1) lista completa de tenants (así ves los 3 que ya tienes)
       const { data: ts, error: tErr } = await sb
         .from("tenants")
         .select("id,name")
@@ -66,24 +87,22 @@ export default function SettingsPage() {
         return;
       }
 
-      const all: Membership[] = (ts || []).map((t) => ({
+      const all: Membership[] = (ts || []).map((t: any) => ({
         tenant_id: t.id,
         tenant_name: t.name,
       }));
       setMemberships(all);
 
-      // 2) selección inicial: localStorage → primero de la lista
       let initial = "";
       try {
         const fromStorage =
           typeof window !== "undefined"
             ? localStorage.getItem(KEY_SELECTED_TENANT)
             : null;
-        if (fromStorage && all.some((m) => m.tenant_id === fromStorage)) {
-          initial = fromStorage;
-        } else {
-          initial = all[0]?.tenant_id || "";
-        }
+        initial =
+          fromStorage && all.some((m) => m.tenant_id === fromStorage)
+            ? fromStorage
+            : all[0]?.tenant_id || "";
       } catch {
         initial = all[0]?.tenant_id || "";
       }
@@ -98,7 +117,7 @@ export default function SettingsPage() {
     })();
   }, []);
 
-  // persistir selección cuando cambie
+  // persistir selección
   useEffect(() => {
     if (!tenantId) return;
     try {
@@ -106,7 +125,7 @@ export default function SettingsPage() {
     } catch {}
   }, [tenantId]);
 
-  // cuando cambie el tenant desde el selector, recargar datos
+  // recarga al cambiar tenant
   useEffect(() => {
     if (!tenantId) return;
     (async () => {
@@ -116,9 +135,9 @@ export default function SettingsPage() {
   }, [tenantId]);
 
   async function loadTenant(tid: string) {
-    const { data: t, error } = await sb
+    const { data, error } = await sb
       .from("tenants")
-      .select("name, phone, timezone, status")
+      .select("name, phone, timezone, status, valid_until, grace_days")
       .eq("id", tid)
       .maybeSingle();
 
@@ -127,10 +146,24 @@ export default function SettingsPage() {
       return;
     }
 
-    setName(t?.name || "");
-    setPhone((t?.phone || "").replace(/^whatsapp:/i, ""));
-    setTimezone(t?.timezone || DEFAULT_TZ);
-    setStatus(t?.status || "active");
+    const t = data ?? null;
+    if (!t) {
+      setName("");
+      setPhone("");
+      setTimezone(DEFAULT_TZ);
+      setStatus("active");
+      setValidUntil(null);
+      setGraceDays(0);
+      return;
+    }
+
+    setName(t.name ?? "");
+    setPhone((t.phone ?? "").replace(/^whatsapp:/i, ""));
+    setTimezone(t.timezone ?? DEFAULT_TZ);
+    setStatus((t.status as any) ?? "active");
+
+    setValidUntil(t.valid_until ? new Date(t.valid_until as string).toISOString() : null);
+    setGraceDays(Number.isFinite(t.grace_days) ? Number(t.grace_days) : 0);
   }
 
   async function pickDefaultResource(tid: string) {
@@ -155,6 +188,8 @@ export default function SettingsPage() {
     setResourceId(rid);
   }
 
+  // ====== GUARDADOS ======
+
   async function save() {
     if (!tenantId) return;
     setSaving(true);
@@ -162,7 +197,6 @@ export default function SettingsPage() {
     const payload: Record<string, any> = {
       name: name.trim(),
       timezone,
-      status, // usa valores permitidos por tu CHECK: 'active' | 'inactive' | 'trial' | 'blocked'
       phone: normalizePhone(phone),
     };
 
@@ -173,7 +207,6 @@ export default function SettingsPage() {
       console.error(error);
       alert(error.message || "No se pudo guardar");
     } else {
-      // refresca nombre en el selector
       setMemberships((prev) =>
         prev.map((m) =>
           m.tenant_id === tenantId ? { ...m, tenant_name: payload.name } : m
@@ -182,6 +215,80 @@ export default function SettingsPage() {
       alert("Cambios guardados");
     }
   }
+
+  // Cambiar estado legacy (editable)
+  async function handleLegacyStatusChange(
+    newStatus: "active" | "inactive" | "trial" | "blocked"
+  ) {
+    if (!tenantId) return;
+    const old = status;
+    setStatus(newStatus);
+  
+    const { error } = await sb
+      .from("tenants")
+      .update({ status: newStatus })
+      .eq("id", tenantId);
+  
+    if (error) {
+      // 23514 = check_violation en Postgres
+      if ((error as any).code === "23514") {
+        alert("Tu BD tiene un CHECK que no permite ese valor. Ajusta el constraint o deja el estado en 'active'.");
+      } else {
+        alert(error.message || "No se pudo actualizar el estado");
+      }
+      setStatus(old); // revertir en UI
+    }
+  }
+  
+
+  async function updateField(patch: Partial<{ valid_until: string | null; grace_days: number }>) {
+    if (!tenantId) return;
+    const { error } = await sb.from("tenants").update(patch).eq("id", tenantId);
+    if (error) {
+      console.error("update tenants error:", error);
+      alert("No se pudo guardar. Revisa consola.");
+    }
+  }
+
+  async function handleSaveValidUntil(e: React.FormEvent) {
+    e.preventDefault();
+    // `validUntil` ya está en ISO por el onChange => guardamos tal cual
+    await updateField({ valid_until: validUntil });
+  }
+
+  async function handleExtend30() {
+    const base = validUntil ? new Date(validUntil) : new Date();
+    const next = new Date(base.getTime());
+    next.setMonth(next.getMonth() + 1);
+    const iso = next.toISOString();
+    setValidUntil(iso);
+    await updateField({ valid_until: iso });
+  }
+
+  // Suspender ahora: mueve la fecha al pasado más allá de la gracia actual
+  async function handleSuspendNow() {
+    const ms = ((graceDays ?? 0) + 1) * 24 * 60 * 60 * 1000;
+    const past = new Date(Date.now() - ms).toISOString();
+    setValidUntil(past);
+    await updateField({ valid_until: past });
+  }
+
+  async function handleSaveGrace() {
+    const g = Number(graceDays || 0);
+    setGraceDays(g);
+    await updateField({ grace_days: g });
+  }
+
+  // ====== Estado calculado (igual que el webhook) ======
+  const computedStatus = useMemo<"active" | "past_due" | "suspended">(() => {
+    if (!validUntil) return "active";
+    const dueMs = new Date(validUntil).getTime();
+    const now = Date.now();
+    const graceMs = (graceDays ?? 0) * 24 * 60 * 60 * 1000;
+    if (now > dueMs + graceMs) return "suspended";
+    if (now > dueMs) return "past_due";
+    return "active";
+  }, [validUntil, graceDays]);
 
   const canShowCalendar = useMemo<boolean>(
     () => Boolean(tenantId && resourceId),
@@ -206,7 +313,7 @@ export default function SettingsPage() {
         {tenantId ? <SubscriptionBadge tenantId={tenantId} /> : null}
       </header>
 
-      {/* Selector + edición básica */}
+      {/* Datos del negocio */}
       <section className="relative z-10 rounded-3xl border border-white/60 bg-white/80 shadow-xl backdrop-blur-xl p-6 md:p-8">
         <div className="mb-6 flex items-start gap-3">
           <div className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white shadow">
@@ -256,36 +363,28 @@ export default function SettingsPage() {
               onChange={(e) => setPhone(e.target.value)}
             />
             <p className="mt-1 text-xs text-gray-400">
-              Se guardará como <code>whatsapp:+…</code>
+              Se guardará como <code>whatsapp:+…</code> en el campo <b>phone</b>.
             </p>
           </div>
 
+          {/* Estado legacy: EDITABLE */}
           <div>
-            <label className="block text-sm font-medium text-gray-700">Zona horaria</label>
-            <select
-              className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
-              value={timezone}
-              onChange={(e) => setTimezone(e.target.value)}
-            >
-              <option value="America/Santo_Domingo">America/Santo_Domingo</option>
-              <option value="America/New_York">America/New_York</option>
-              <option value="America/Mexico_City">America/Mexico_City</option>
-              <option value="UTC">UTC</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700">Estado</label>
+            <label className="block text-sm font-medium text-gray-700">Estado (legacy)</label>
             <select
               className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
               value={status}
-              onChange={(e) => setStatus(e.target.value)}
+              onChange={(e) =>
+                handleLegacyStatusChange(e.target.value as "active" | "inactive" | "trial" | "blocked")
+              }
             >
               <option value="active">active</option>
               <option value="inactive">inactive</option>
               <option value="trial">trial</option>
               <option value="blocked">blocked</option>
             </select>
+            <p className="mt-1 text-xs text-gray-400">
+              Informativo. El encendido real del bot depende de <b>Vigente</b> + <b>Gracia</b>.
+            </p>
           </div>
         </div>
 
@@ -307,6 +406,79 @@ export default function SettingsPage() {
         </div>
       </section>
 
+      {/* === Facturación / Control del bot === */}
+      <section className="relative z-10 rounded-3xl border border-white/60 bg-white/80 shadow-xl backdrop-blur-xl p-6 md:p-8 space-y-6">
+        <div className="mb-2">
+          <h2 className="text-lg font-semibold tracking-tight">Facturación y control del bot</h2>
+          <p className="text-sm text-gray-500">
+            El webhook bloquea el bot si el vencimiento pasó (se considera el período de gracia).
+          </p>
+        </div>
+
+        {/* Estado calculado */}
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-600">Estado actual:</span>
+          <span
+            className={`px-2.5 py-1 rounded-full text-xs font-medium ${
+              computedStatus === "active"
+                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                : computedStatus === "past_due"
+                ? "bg-amber-50 text-amber-700 border border-amber-200"
+                : "bg-rose-50 text-rose-700 border border-rose-200"
+            }`}
+          >
+            {computedStatus === "active" ? "Activo" : computedStatus === "past_due" ? "Vencido (gracia)" : "Suspendido"}
+          </span>
+        </div>
+
+        {/* Vencimiento + Gracia */}
+        <div className="grid gap-4 md:grid-cols-3">
+          <div className="md:col-span-2">
+            <label className="block text-sm font-medium text-gray-700">Vigente hasta</label>
+            <form className="mt-1 flex flex-col sm:flex-row gap-3" onSubmit={handleSaveValidUntil}>
+              <input
+                type="datetime-local"
+                className="w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
+                value={isoToLocalInput(validUntil)}
+                onChange={(e) => setValidUntil(localInputToIso(e.target.value))}
+              />
+              <button className="rounded-2xl border px-5 py-2.5 text-sm text-gray-700 hover:bg-gray-50" type="submit">
+                Guardar fecha
+              </button>
+              <button
+                type="button"
+                onClick={handleExtend30}
+                className="rounded-2xl border px-5 py-2.5 text-sm text-gray-700 hover:bg-gray-50"
+              >
+                Extender 30 días
+              </button>
+              <button
+                type="button"
+                onClick={handleSuspendNow}
+                className="rounded-2xl border px-5 py-2.5 text-sm text-rose-700 hover:bg-rose-50"
+              >
+                Suspender ahora
+              </button>
+            </form>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">Gracia (días)</label>
+            <input
+              type="number"
+              min={0}
+              className="mt-1 w-32 rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
+              value={graceDays}
+              onChange={(e) => setGraceDays(Number(e.target.value))}
+              onBlur={handleSaveGrace}
+            />
+            <p className="mt-1 text-xs text-gray-400">
+              Tras vencer + gracia, el estado pasa a <b>Suspended</b>.
+            </p>
+          </div>
+        </div>
+      </section>
+
       {/* Horarios */}
       <section className="space-y-4">
         <h2 className="text-xl font-medium">Horarios de atención</h2>
@@ -322,9 +494,7 @@ export default function SettingsPage() {
       {/* Excepciones */}
       <section className="space-y-4">
         <h2 className="text-xl font-medium">Excepciones / Feriados</h2>
-        {tenantId ? (
-          <ExceptionsTable tenantId={tenantId} resourceId={resourceId} />
-        ) : null}
+        {tenantId ? <ExceptionsTable tenantId={tenantId} resourceId={resourceId} /> : null}
       </section>
 
       {/* Calendario */}

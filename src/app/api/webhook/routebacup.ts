@@ -1,4 +1,4 @@
-import { supabase } from "@/app/lib/superbase";
+import { supabaseAdmin } from "@/app/lib/superbase";
 import { NextRequest, NextResponse } from "next/server";
 
 
@@ -27,7 +27,7 @@ export async function POST(req: NextRequest) {
     if (!from || !text) return NextResponse.json({ ok: true });
 
     // Guardar conversación
-    const { data: existing } = await supabase
+    const { data: existing } = await supabaseAdmin
       .from("conversations")
       .select("id")
       .eq("phone", from)
@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
 
     let conversationId = existing?.id;
     if (!conversationId) {
-      const { data: created } = await supabase
+      const { data: created } = await supabaseAdmin
         .from("conversations")
         .insert({ phone: from })
         .select("id")
@@ -44,14 +44,14 @@ export async function POST(req: NextRequest) {
       conversationId = created?.id;
     }
 
-    await supabase.from("messages").insert({
+    await supabaseAdmin.from("messages").insert({
       conversation_id: conversationId,
       role: "user",
       text,
     });
 
     // Configuración de negocio
-    const { data: settings } = await supabase
+    const { data: settings } = await supabaseAdmin
       .from("business_settings")
       .select("*")
       .eq("id", "default")
@@ -75,7 +75,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (["cita", "cotizacion", "precio", "info"].includes(intent)) {
-      await supabase.from("leads").insert({ phone: from, intent });
+      await supabaseAdmin.from("leads").insert({ phone: from, intent });
       const msgReply = "Listo 📌 Tomé tus datos. ¿Tu nombre y mejor horario?";
       await replyText(from, msgReply);
       await saveBotMsg(conversationId!, msgReply);
@@ -106,7 +106,7 @@ function detectIntent(text: string, kws: string[]) {
 }
 
 async function faqLookup(q: string) {
-  const { data: faqs } = await supabase.from("faqs").select("*").eq("active", true);
+  const { data: faqs } = await supabaseAdmin.from("faqs").select("*").eq("active", true);
   const ql = q.toLowerCase();
   let best = { ans: null as string | null, score: 0 };
   for (const f of faqs || []) {
@@ -140,5 +140,5 @@ async function replyText(to: string, text: string) {
 }
 
 async function saveBotMsg(conversationId: string, text: string) {
-  await supabase.from("messages").insert({ conversation_id: conversationId, role: "bot", text });
+  await supabaseAdmin.from("messages").insert({ conversation_id: conversationId, role: "bot", text });
 }

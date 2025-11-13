@@ -1,9 +1,14 @@
+// src/app/(auth)/signout/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 
-export async function POST() {
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+async function doSignout(req: Request) {
   const cookieStore = await cookies();
+
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
@@ -22,6 +27,27 @@ export async function POST() {
     }
   );
 
+  // Cerrar sesión en Supabase
   await supabase.auth.signOut();
-  return NextResponse.redirect(new URL("/login", process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000"));
+
+  // Borrar tenant activo
+  cookieStore.set("pyme.active_tenant", "", {
+    path: "/",
+    maxAge: 0,
+  });
+
+  // ⬅️ OJO: aquí es /login, SIN /auth
+  const url = new URL(req.url);
+  const loginUrl = new URL("/login", url.origin);
+
+  return NextResponse.redirect(loginUrl);
+}
+
+// Acepta GET y POST
+export async function GET(req: Request) {
+  return doSignout(req);
+}
+
+export async function POST(req: Request) {
+  return doSignout(req);
 }

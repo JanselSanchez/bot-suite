@@ -1,32 +1,21 @@
+// src/app/dashboard/tenants/new/page.tsx
 "use client";
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { createClient } from "@supabase/supabase-js";
-
 import { Building2, ShieldCheck, Phone } from "lucide-react";
 import { Button } from "@/componentes/ui/button";
 
-const sb = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
-
-// RD por defecto
 const DEFAULT_TZ = "America/Santo_Domingo";
 
-// normaliza a formatos que ya usas en DB (ej. "whatsapp:+1829XXXXXXX")
+// Normaliza a "whatsapp:+1XXXXXXXXXX" para RD, o respeta "whatsapp:+..."
 function normalizePhone(raw: string) {
-  const s = raw.trim();
+  const s = (raw || "").trim();
   if (!s) return null;
-  // si ya viene con "whatsapp:" lo respetamos
   if (s.toLowerCase().startsWith("whatsapp:")) return s;
-  // si empieza con + lo convertimos a "whatsapp:+"
   if (s.startsWith("+")) return `whatsapp:${s}`;
-  // limpia caracteres no numéricos y asume RD si faltó "+"
   const digits = s.replace(/[^\d+]/g, "");
   if (digits.startsWith("+")) return `whatsapp:${digits}`;
-  // si no puso +, pero puso 10 dígitos RD, anteponemos +1
   if (/^\d{10}$/.test(digits)) return `whatsapp:+1${digits}`;
   return `whatsapp:${digits}`;
 }
@@ -42,45 +31,39 @@ export default function NewTenantPage() {
 
   async function handleCreate() {
     if (!name.trim()) return;
+
     setLoading(true);
     try {
-      const { data: { user } } = await sb.auth.getUser();
-      if (!user) { alert("Inicia sesión"); return; }
-
       const payload: any = {
         name: name.trim(),
-        timezone: timezone || "America/Santo_Domingo",
-        // status: "activa",   // ❌ quítalo
-        // O bien:
-        // status: "active",   // ✅ si quieres fijarlo explícito
+        timezone: timezone || DEFAULT_TZ,
       };
       const normalized = normalizePhone(phone);
       if (normalized) payload.phone = normalized;
-      
-      const { data: tenant, error } = await sb
-        .from("tenants")
-        .insert([payload])
-        .select()
-        .single();
 
-      if (error || !tenant) {
-        console.error("insert tenants error:", error);
-        alert(error?.message || "No se pudo crear el negocio");
+      const r = await fetch("/api/admin/new-business", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include", // IMPORTANTÍSIMO: envía la cookie de sesión
+        body: JSON.stringify(payload),
+      });
+
+      if (r.status === 401) {
+        alert("Inicia sesión");
         return;
       }
 
-      // Si existe tenant_users, intenta asociar al propietario (ignorable si no existe)
-      try {
-        await sb.from("tenant_users").insert([{
-          tenant_id: tenant.id,
-          user_id: user.id,
-          role: "owner",
-        }]);
-      } catch (e) {
-        console.warn("tenant_users insert skipped:", (e as any)?.message);
+      const j = await r.json();
+      if (!j.ok) {
+        alert(j.error || "No se pudo crear el negocio");
+        return;
       }
 
+      // opcional: j.tenantId queda como activo vía cookie
       router.push("/dashboard");
+    } catch (e) {
+      console.error(e);
+      alert("Error de red");
     } finally {
       setLoading(false);
     }

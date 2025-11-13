@@ -60,11 +60,14 @@ export default function LoginPage() {
       if (isReset) {
         const { error } = await sb.auth.resetPasswordForEmail(email, {
           redirectTo:
-            typeof window !== "undefined" ? `${window.location.origin}/login` : undefined,
+            typeof window !== "undefined"
+              ? `${window.location.origin}/auth/login`
+              : undefined,
         });
         if (error) throw error;
         setMsg("Te enviamos un correo para restablecer tu contraseña.");
       }
+      
     } catch (e: any) {
       const m = e?.message || "Ocurrió un error, intenta de nuevo.";
       if (m.includes("Invalid login credentials")) setErr("Credenciales inválidas.");

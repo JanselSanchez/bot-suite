@@ -8,58 +8,88 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const tenantId = url.searchParams.get("tenantId")?.trim();
+
   if (!tenantId) {
-    return NextResponse.json({ ok: false, error: "tenantId required" }, { status: 400 });
+    return NextResponse.json(
+      { ok: false, error: "tenantId required" },
+      { status: 400 }
+    );
   }
 
   const sb = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!, // SERVICE ROLE (server)
+    process.env.SUPABASE_SERVICE_ROLE_KEY!, // SERVICE ROLE (server only)
     { auth: { persistSession: false } }
   );
 
-  // Totales
-  const { count: totalBookings, error: eBk } = await sb
-    .from("bookings")
-    .select("id", { count: "exact", head: true })
-    .eq("tenant_id", tenantId);
+  try {
+    // Ejecutamos todo en paralelo
+    const [
+      bookingsCountRes,
+      tenantsCountRes,
+      messagesCountRes,
+      recentRes,
+    ] = await Promise.all([
+      sb
+        .from("bookings")
+        .select("id", { count: "exact", head: true })
+        .eq("tenant_id", tenantId),
+      sb
+        .from("tenants")
+        .select("id", { count: "exact", head: true }),
+      sb
+        .from("messages")
+        .select("id", { count: "exact", head: true })
+        .eq("tenant_id", tenantId), // ← si quieres global, elimina esta línea
+      sb
+        .from("bookings")
+        .select("id, customer_name, created_at")
+        .eq("tenant_id", tenantId)
+        .order("created_at", { ascending: false })
+        .limit(5),
+    ]);
 
-  const { count: totalTenants, error: eTen } = await sb
-    .from("tenants")
-    .select("id", { count: "exact", head: true });
+    const eBk = bookingsCountRes.error;
+    const eTen = tenantsCountRes.error;
+    const eMsg = messagesCountRes.error;
+    const eRecent = recentRes.error;
 
-  const { count: totalMessages, error: eMsg } = await sb
-    .from("messages")
-    .select("id", { count: "exact", head: true });
+    if (eBk || eTen || eMsg || eRecent) {
+      console.error("[/api/admin/metrics] ERR", {
+        tenantId,
+        eBk: eBk?.message,
+        eTen: eTen?.message,
+        eMsg: eMsg?.message,
+        eRecent: eRecent?.message,
+      });
+    }
 
-  // Recientes (últimas 5 del tenant)
-  const { data: recentBookings, error: eRecent } = await sb
-    .from("bookings")
-    .select("id, customer_name, created_at")
-    .eq("tenant_id", tenantId)
-    .order("created_at", { ascending: false })
-    .limit(5);
+    const recent =
+      (recentRes.data ?? []).map((b: any) => ({
+        id: b.id,
+        title: `Nueva cita ${
+          b.customer_name ? `de ${b.customer_name}` : `#${String(b.id).slice(0, 6)}`
+        }`,
+        created_at: b.created_at as string,
+      })) ?? [];
 
-  if (eBk || eTen || eMsg || eRecent) {
-    console.error("[/api/admin/metrics] ERR", { eBk, eTen, eMsg, eRecent, tenantId });
-  }
-
-  const recent = (recentBookings ?? []).map((b) => ({
-    id: b.id,
-    title: `Nueva cita ${b.customer_name ? `de ${b.customer_name}` : `#${String(b.id).slice(0, 6)}`}`,
-    created_at: b.created_at as string,
-  }));
-
-  return NextResponse.json(
-    {
-      ok: true,
-      totals: {
-        bookings: totalBookings ?? 0, // bookings del tenant actual
-        tenants: totalTenants ?? 0,   // total de tenants (clientes)
-        messages: totalMessages ?? 0, // total de mensajes
+    return NextResponse.json(
+      {
+        ok: true,
+        totals: {
+          bookings: bookingsCountRes.count ?? 0, // bookings del tenant
+          tenants: tenantsCountRes.count ?? 0,   // total de tenants (global)
+          messages: messagesCountRes.count ?? 0, // mensajes del tenant (o global si quitas eq)
+        },
+        recent,
       },
-      recent,
-    },
-    { headers: { "cache-control": "no-store" } }
-  );
+      { headers: { "cache-control": "no-store" } }
+    );
+  } catch (e: any) {
+    console.error("[/api/admin/metrics] fatal", e);
+    return NextResponse.json(
+      { ok: false, error: e?.message ?? "Unexpected error" },
+      { status: 500 }
+    );
+  }
 }
