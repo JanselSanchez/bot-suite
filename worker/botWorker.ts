@@ -2,6 +2,7 @@
 import "dotenv/config";
 import * as dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
+
 import { ensureTenantActiveOrThrow } from "./enforcement";
 import { startOutboxWorker } from "./outboxWorker";
 
@@ -11,11 +12,21 @@ import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 
 import { parseDayLabel, formatHour } from "./utils/dates";
-import { getAvailableSlots } from "../src/server/availability";
 import { handleReverseFlow, handleRescheduleChoice } from "./flows/reverseFlow";
-// ⬇️ FIX: evitar alias @ en el worker
-import { detectIntentBasic } from "../src/server/intents";
 import { scheduleDailyReminders, startRemindersWorker } from "./reminders";
+
+// ⬇️ IMPORTS CORRECTOS SIN ALIAS (@)
+import { getAvailableSlots } from "../src/server/availability";
+import { detectIntentBasic } from "../src/server/intents";
+
+// Tipo para los slots que devuelve availability
+type SlotCandidate = {
+  start: string | Date;
+  end: string | Date;
+  resource_id: string;
+  resource_name: string;
+  service_id?: string;
+};
 
 // ---------- ENV ----------
 const REDIS_URL = process.env.REDIS_URL!;
@@ -23,6 +34,11 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const MOCK_AI = process.env.MOCK_AI === "true";
+
+// endpoint HTTP central para crear bookings
+const BOOKINGS_API_URL =
+  process.env.BOOKINGS_API_URL ||
+  "http://localhost:3001/api/admin/bookings/create";
 
 if (!REDIS_URL) throw new Error("Falta REDIS_URL");
 if (!SUPABASE_URL) throw new Error("Falta NEXT_PUBLIC_SUPABASE_URL");
@@ -54,9 +70,9 @@ if (!MOCK_AI) {
   }
 }
 
-// >>> NUEVO: utilidades de plantillas (render + defaults + fetch desde DB)
+// >>> utilidades de plantillas (render + defaults + fetch desde DB)
 function renderTemplate(body: string, vars: Record<string, string>) {
-  return body.replace(/\{\{(\w+)\}\}/g, (_, key) => (vars[key] ?? ""));
+  return body.replace(/\{\{(\w+)\}\}/g, (_, key) => vars[key] ?? "");
 }
 
 const DEFAULT_TEMPLATES: Record<string, string> = {
@@ -74,8 +90,9 @@ const DEFAULT_TEMPLATES: Record<string, string> = {
 
 const redis = new IORedis(process.env.REDIS_URL!);
 setInterval(() => {
-  redis.set("worker:hb", "1", "EX", 60).catch(()=>{});
+  redis.set("worker:hb", "1", "EX", 60).catch(() => {});
 }, 15000);
+
 async function getTemplateOrDefault(
   tenantId: string,
   channel: "whatsapp" | "sms" | "email",
@@ -104,9 +121,17 @@ async function getTemplateOrDefault(
   }
 }
 
-// >>> NUEVO: helper de “gating” pago
-async function sendPaymentRequired(tenantId: string, conversationId: string, toPhone: string) {
-  const tpl = await getTemplateOrDefault(tenantId, "whatsapp", "payment_required");
+// >>> helper de “gating” pago
+async function sendPaymentRequired(
+  tenantId: string,
+  conversationId: string,
+  toPhone: string
+) {
+  const tpl = await getTemplateOrDefault(
+    tenantId,
+    "whatsapp",
+    "payment_required"
+  );
   let paymentLink = "https://tu-dominio.com/billing";
   try {
     const { data: st } = await supabase
@@ -115,7 +140,7 @@ async function sendPaymentRequired(tenantId: string, conversationId: string, toP
       .eq("tenant_id", tenantId)
       .maybeSingle();
     if (st?.payment_link) paymentLink = st.payment_link;
-  } catch (e) {
+  } catch {
     console.warn("[settings.payment_link] fallback");
   }
 
@@ -158,7 +183,10 @@ async function sendPaymentRequired(tenantId: string, conversationId: string, toP
 }
 
 // ---------- HELPERS ----------
-async function replyAndMaybeTwilio(conversationId: string, text: string): Promise<void> {
+async function replyAndMaybeTwilio(
+  conversationId: string,
+  text: string
+): Promise<void> {
   await supabase.from("messages").insert({
     conversation_id: conversationId,
     role: "assistant",
@@ -177,7 +205,7 @@ async function replyAndMaybeTwilio(conversationId: string, text: string): Promis
   } catch (e) {
     console.error("[Twilio] error:", e);
 
-    // >>> NUEVO: encolar en outbox si hay rate-limit 429
+    // encolar en outbox si hay rate-limit 429
     try {
       const msg = String((e as any)?.message || "");
       if (msg.includes("429") || msg.toLowerCase().includes("rate")) {
@@ -207,7 +235,9 @@ async function replyAndMaybeTwilio(conversationId: string, text: string): Promis
 async function firstServiceForTenant(tenantId: string) {
   const { data: svc, error } = await supabase
     .from("services")
-    .select("id, name, duration_min, buffer_after_min, duration_minutes, buffer_minutes")
+    .select(
+      "id, name, duration_min, buffer_after_min, duration_minutes, buffer_minutes"
+    )
     .eq("tenant_id", tenantId)
     .order("created_at", { ascending: true })
     .limit(1)
@@ -241,7 +271,7 @@ function formatDateEsDO(d: Date) {
 const RD_OFFSET_MIN = 240;
 function rdLocalMidnightAsUTC(d: Date): Date {
   const y = d.getFullYear();
-  const m = d.getMonth(); // 0-based
+  const m = d.getMonth();
   const day = d.getDate();
   const ms = Date.UTC(y, m, day, 0, 0, 0, 0) + RD_OFFSET_MIN * 60 * 1000;
   return new Date(ms);
@@ -276,7 +306,7 @@ function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date) {
   return aStart < bEnd && bStart < aEnd;
 }
 
-// === NUEVO: formateador de hora RD con “a. m./p. m.” ===
+// formateador de hora RD con “a. m./p. m.”
 const hourFmtRD = new Intl.DateTimeFormat("es-DO", {
   hour: "2-digit",
   minute: "2-digit",
@@ -290,7 +320,9 @@ const hourFmtRD = new Intl.DateTimeFormat("es-DO", {
 async function ensureConversationState(conversationId: string) {
   const { data: state, error: selErr } = await supabase
     .from("conversation_state")
-    .select("conversation_id, tenant_id, stage, pending_slots, pending_service_id, updated_at")
+    .select(
+      "conversation_id, tenant_id, stage, pending_slots, pending_service_id, updated_at"
+    )
     .eq("conversation_id", conversationId)
     .maybeSingle();
   if (selErr) console.error("[conversation_state.select] error:", selErr);
@@ -358,11 +390,9 @@ async function listSlotsAndAdvance(
   }
 
   try {
-    // Pedimos la fecha como 'medianoche local RD' en UTC
     const dayUTC = rdLocalMidnightAsUTC(day);
 
-    // Slots base (ya excluye 'confirmed')
-    const slots = await getAvailableSlots({
+    const rawSlots = await getAvailableSlots({
       supabase,
       tenantId,
       serviceId: svc.id,
@@ -370,47 +400,76 @@ async function listSlotsAndAdvance(
       maxSlots: 24,
     });
 
+    const slots = (rawSlots ?? []) as SlotCandidate[];
+
     if (!slots.length) {
-      await replyAndMaybeTwilio(conversationId, "Ese día estoy full. ¿Probamos otro día?");
+      await replyAndMaybeTwilio(
+        conversationId,
+        "Ese día estoy full. ¿Probamos otro día?"
+      );
       return true;
     }
 
-    // Filtrar también contra 'rescheduled' + solape real
-    const resourceIds = Array.from(new Set(slots.map((s) => s.resource_id)));
+    const resourceIds: string[] = Array.from(
+      new Set<string>(slots.map((s: SlotCandidate) => s.resource_id))
+    );
+
     const busy = await getBusyForDay({
       tenantId,
       resourceIds,
       dayStartUTC: dayUTC,
     });
 
-    const slotsKept = slots.filter((s) => {
-      const sStart = s.start instanceof Date ? s.start : new Date(s.start);
-      const sEnd = s.end instanceof Date ? s.end : new Date(s.end);
-      const clashes = busy.some(
-        (b) => b.resource_id === s.resource_id && overlaps(sStart, sEnd, new Date(b.starts_at), new Date(b.ends_at))
+    const slotsKept: SlotCandidate[] = slots.filter((s: SlotCandidate) => {
+      const sStart =
+        s.start instanceof Date ? s.start : new Date(s.start);
+      const sEnd =
+        s.end instanceof Date ? s.end : new Date(s.end);
+      const clashes = (busy || []).some(
+        (b) =>
+          b.resource_id === s.resource_id &&
+          overlaps(
+            sStart,
+            sEnd,
+            new Date(b.starts_at),
+            new Date(b.ends_at)
+          )
       );
       return !clashes;
     });
 
     if (!slotsKept.length) {
-      await replyAndMaybeTwilio(conversationId, "Ese día no me quedan horarios libres. Probemos otro día.");
+      await replyAndMaybeTwilio(
+        conversationId,
+        "Ese día no me quedan horarios libres. Probemos otro día."
+      );
       return true;
     }
 
-    // === NUEVO: mostrar hasta 12 opciones con AM/PM RD ===
     const MAX_OPTS = 12;
     const list = slotsKept
       .slice(0, MAX_OPTS)
-      .map((s, i) => `${i + 1}) ${hourFmtRD.format(new Date(s.start))} con ${s.resource_name}`)
+      .map(
+        (s: SlotCandidate, i: number) =>
+          `${i + 1}) ${hourFmtRD.format(
+            new Date(s.start)
+          )} con ${s.resource_name}`
+      )
       .join("\n");
 
     await supabase
       .from("conversation_state")
       .update({
         stage: "awaiting_slot",
-        pending_slots: slotsKept.slice(0, MAX_OPTS).map((s) => ({
-          start: s.start.toISOString(),
-          end: s.end.toISOString(),
+        pending_slots: slotsKept.slice(0, MAX_OPTS).map((s: SlotCandidate) => ({
+          start:
+            s.start instanceof Date
+              ? s.start.toISOString()
+              : new Date(s.start).toISOString(),
+          end:
+            s.end instanceof Date
+              ? s.end.toISOString()
+              : new Date(s.end).toISOString(),
           resource_id: s.resource_id,
           resource_name: s.resource_name,
           service_id: svc.id,
@@ -422,7 +481,10 @@ async function listSlotsAndAdvance(
 
     await replyAndMaybeTwilio(
       conversationId,
-      `Para ese día tengo:\n${list}\n\nElige un número (1-${Math.min(MAX_OPTS, slotsKept.length)}).`
+      `Para ese día tengo:\n${list}\n\nElige un número (1-${Math.min(
+        MAX_OPTS,
+        slotsKept.length
+      )}).`
     );
 
     return true;
@@ -438,22 +500,24 @@ async function listSlotsAndAdvance(
 
 // ---------- LÓGICA ----------
 async function handleUserMessage(job: Job) {
-  const { conversationId, text } = job.data as { conversationId: string; text: string };
+  const { conversationId, text } = job.data as {
+    conversationId: string;
+    text: string;
+  };
 
-  // 0) Asegurar estado y tenant
   const ensured = await ensureConversationState(conversationId);
   const currentStage = ensured.stage ?? "awaiting_day";
   const tenantId = ensured.tenant_id as string | undefined;
-  const pendingSlots = ((ensured.pending_slots as any[]) ?? []) as Array<{
-    start: string;
-    end: string;
-    resource_id: string;
-    resource_name: string;
-    service_id?: string;
-  }>;
+  const pendingSlots =
+    ((ensured.pending_slots as any[]) ?? []) as Array<{
+      start: string;
+      end: string;
+      resource_id: string;
+      resource_name: string;
+      service_id?: string;
+    }>;
   const pendingServiceId = ensured.pending_service_id as string | undefined;
 
-  // obtener teléfono del cliente
   const { data: convRow } = await supabase
     .from("conversations")
     .select("phone")
@@ -461,29 +525,33 @@ async function handleUserMessage(job: Job) {
     .maybeSingle();
   const phone = convRow?.phone ?? "";
 
-  console.log("[worker] stage=", currentStage, "tenantId=", tenantId, "text=", JSON.stringify(text));
+  console.log(
+    "[worker] stage=",
+    currentStage,
+    "tenantId=",
+    tenantId,
+    "text=",
+    JSON.stringify(text)
+  );
 
-  // >>> NUEVO: enforcement global al inicio del manejo de mensaje
   if (tenantId) {
     try {
       await ensureTenantActiveOrThrow(tenantId);
-    } catch (e) {
+    } catch {
       await sendPaymentRequired(tenantId, conversationId, phone);
       return;
     }
   }
 
-  // === NLP rápido: cancelar / reprogramar ===
+  // NLP rápido: cancelar / reprogramar
   if (tenantId) {
     const quickIntent = await detectIntentBasic(text, tenantId);
 
-    // Si el usuario pide cancelar/reprogramar, delega flujo inverso
     if (quickIntent === "cancel" || quickIntent === "reschedule") {
       const handled = await handleReverseFlow(tenantId, phone, text);
       if (handled) return;
     }
 
-    // ⬇️ Si envía un número y NO estamos en reserva normal, trátalo como re-agenda
     if (/^\d+$/.test(text.trim())) {
       const n = parseInt(text.trim(), 10);
       if (currentStage !== "awaiting_slot") {
@@ -492,17 +560,18 @@ async function handleUserMessage(job: Job) {
       }
     }
   }
-  // === FIN NLP rápido ===
 
-  // 🔁 Detección de día (PRIORIDAD)
+  // detección de día
   const detectedDay = parseDayLabel(text);
   if (detectedDay) {
     if (!tenantId) {
-      await replyAndMaybeTwilio(conversationId, "No tengo asociado el negocio a esta conversación todavía.");
+      await replyAndMaybeTwilio(
+        conversationId,
+        "No tengo asociado el negocio a esta conversación todavía."
+      );
       return;
     }
 
-    // ✅ Chequeo “cita el mismo día” usando medianoche RD → UTC
     const dayUTC = rdLocalMidnightAsUTC(detectedDay);
     const dayEndUTC = new Date(dayUTC.getTime() + 24 * 60 * 60 * 1000);
 
@@ -520,7 +589,6 @@ async function handleUserMessage(job: Job) {
     if (exErr) console.error("[existingSameDay] error:", exErr);
 
     if (existingSameDay?.length) {
-      // traer nombre del recurso
       let resourceName = "el especialista";
       if (existingSameDay[0].resource_id) {
         const { data: r } = await supabase
@@ -539,14 +607,21 @@ async function handleUserMessage(job: Job) {
       return;
     }
 
-    const handled = await listSlotsAndAdvance(conversationId, tenantId, detectedDay);
+    const handled = await listSlotsAndAdvance(
+      conversationId,
+      tenantId,
+      detectedDay
+    );
     if (handled) return;
   }
 
-  // 1) Si seguimos esperando día
+  // esperando día
   if (currentStage === "awaiting_day") {
     if (!tenantId) {
-      await replyAndMaybeTwilio(conversationId, "No tengo asociado el negocio a esta conversación todavía.");
+      await replyAndMaybeTwilio(
+        conversationId,
+        "No tengo asociado el negocio a esta conversación todavía."
+      );
       return;
     }
     await replyAndMaybeTwilio(
@@ -556,18 +631,21 @@ async function handleUserMessage(job: Job) {
     return;
   }
 
-  // 2) Esperando selección de horario (RESERVA)
+  // esperando selección de horario
   if (currentStage === "awaiting_slot") {
     const n = toInt(text);
     if (!n || n < 1 || n > pendingSlots.length) {
-      await replyAndMaybeTwilio(conversationId, `Dime un número válido (1-${Math.max(1, pendingSlots.length)}).`);
+      await replyAndMaybeTwilio(
+        conversationId,
+        `Dime un número válido (1-${Math.max(1, pendingSlots.length)}).`
+      );
       return;
     }
 
     const chosen = pendingSlots[n - 1];
     const startsAt = new Date(chosen.start);
     const endsAt = new Date(chosen.end);
-    
+
     const resourceId = chosen.resource_id;
     const serviceId = chosen.service_id || pendingServiceId;
 
@@ -588,7 +666,7 @@ async function handleUserMessage(job: Job) {
       return;
     }
 
-    // --- cuota demo: 30/mes ---
+    // cuota demo: 30/mes
     try {
       const now = new Date();
       const y = now.getUTCFullYear();
@@ -622,29 +700,40 @@ async function handleUserMessage(job: Job) {
       console.error("[quota check] error:", e);
     }
 
-    // ======= RESERVA usando RPC (Opción 1) =======
+    // RESERVA vía API HTTP
     try {
-      const { data, error } = await supabase.rpc("book_slot_safe_phone", {
-        p_tenant: tenantId,
-        p_phone: phone,
-        p_service: serviceId,
-        p_resource: resourceId,
-        p_starts: startsAt.toISOString(),
-        p_ends: endsAt.toISOString(),
-        p_customer_name: "Cliente",
-        p_notes: null,
+      const payload = {
+        tenantId,
+        phone,
+        customerName: "Cliente",
+        serviceId,
+        resourceId,
+        startsAtISO: startsAt.toISOString(),
+        endsAtISO: endsAt.toISOString(),
+        notes: null,
+      };
+
+      const res = await fetch(BOOKINGS_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       });
 
-      if (error) {
-        console.error("[rpc book_slot_safe_phone] error:", error);
-        await replyAndMaybeTwilio(conversationId, "Hubo un problema creando la cita. Intenta otro horario.");
+      const json: any = await res.json().catch(() => ({} as any));
+
+      if (!res.ok || !json?.ok) {
+        console.error("[reserve via HTTP] error:", res.status, json);
+        await replyAndMaybeTwilio(
+          conversationId,
+          "Hubo un problema creando la cita. Intenta otro horario."
+        );
         return;
       }
 
-      const result = data?.result as string | undefined;
+      const data = json.data ?? {};
+      const result = data.result as string | undefined;
 
       if (result === "CREATED") {
-        // limpiar estado
         await supabase
           .from("conversation_state")
           .update({
@@ -656,8 +745,9 @@ async function handleUserMessage(job: Job) {
           .eq("conversation_id", conversationId);
 
         const reply =
-          `¡Listo! Te agendé el ${formatDateEsDO(startsAt)} a las ${formatHour(startsAt)} ` +
-          `con ${chosen.resource_name}.`;
+          `¡Listo! Te agendé el ${formatDateEsDO(startsAt)} a las ${formatHour(
+            startsAt
+          )} con ${chosen.resource_name}.`;
         await replyAndMaybeTwilio(conversationId, reply);
         return;
       }
@@ -666,22 +756,24 @@ async function handleUserMessage(job: Job) {
         const when = new Date(data.booking.starts_at);
         await replyAndMaybeTwilio(
           conversationId,
-          `Ya tienes una reserva ese día a las ${formatHour(when)}. ` +
-            `Si deseas *reprogramar* o *cancelar*, dímelo y lo hago.`
+          `Ya tienes una reserva ese día a las ${formatHour(
+            when
+          )}. Si deseas *reprogramar* o *cancelar*, dímelo y lo hago.`
         );
         return;
       }
 
       if (result === "CONFLICT_SLOT") {
-        // re-listar opciones actualizadas
         const sameDayUTC = rdLocalMidnightAsUTC(startsAt);
-        const fresh = await getAvailableSlots({
+        const rawFresh = await getAvailableSlots({
           supabase,
           tenantId,
           serviceId,
           date: sameDayUTC,
           maxSlots: 24,
         });
+
+        const fresh = (rawFresh ?? []) as SlotCandidate[];
 
         if (!fresh.length) {
           await supabase
@@ -701,31 +793,47 @@ async function handleUserMessage(job: Job) {
           return;
         }
 
-        // aplicar el mismo filtro contra 'busy' (confirmed + rescheduled)
-        const resourceIds = Array.from(new Set(fresh.map((s) => s.resource_id)));
+        const resourceIds: string[] = Array.from(
+          new Set<string>(fresh.map((s: SlotCandidate) => s.resource_id))
+        );
+
         const busy = await getBusyForDay({
           tenantId,
           resourceIds,
           dayStartUTC: rdLocalMidnightAsUTC(startsAt),
         });
 
-        const kept = fresh.filter((s) => {
-          const sStart = s.start instanceof Date ? s.start : new Date(s.start);
-          const sEnd = s.end instanceof Date ? s.end : new Date(s.end);
-          return !busy.some(
-            (b) => b.resource_id === s.resource_id && overlaps(sStart, sEnd, new Date(b.starts_at), new Date(b.ends_at))
+        const kept: SlotCandidate[] = fresh.filter((s: SlotCandidate) => {
+          const sStart =
+            s.start instanceof Date ? s.start : new Date(s.start);
+          const sEnd =
+            s.end instanceof Date ? s.end : new Date(s.end);
+          return !(busy || []).some(
+            (b) =>
+              b.resource_id === s.resource_id &&
+              overlaps(
+                sStart,
+                sEnd,
+                new Date(b.starts_at),
+                new Date(b.ends_at)
+              )
           );
         });
 
-        // === NUEVO: limitar y formatear igual que arriba
         const MAX_OPTS = 12;
         await supabase
           .from("conversation_state")
           .update({
             stage: "awaiting_slot",
-            pending_slots: kept.slice(0, MAX_OPTS).map((s) => ({
-              start: s.start.toISOString(),
-              end: s.end.toISOString(),
+            pending_slots: kept.slice(0, MAX_OPTS).map((s: SlotCandidate) => ({
+              start:
+                s.start instanceof Date
+                  ? s.start.toISOString()
+                  : new Date(s.start).toISOString(),
+              end:
+                s.end instanceof Date
+                  ? s.end.toISOString()
+                  : new Date(s.end).toISOString(),
               resource_id: s.resource_id,
               resource_name: s.resource_name,
               service_id: serviceId,
@@ -737,29 +845,44 @@ async function handleUserMessage(job: Job) {
 
         const list = kept
           .slice(0, MAX_OPTS)
-          .map((s, i) => `${i + 1}) ${hourFmtRD.format(new Date(s.start))} con ${s.resource_name}`)
+          .map(
+            (s: SlotCandidate, i: number) =>
+              `${i + 1}) ${hourFmtRD.format(
+                new Date(s.start)
+              )} con ${s.resource_name}`
+          )
           .join("\n");
 
         await replyAndMaybeTwilio(
           conversationId,
-          `Ese horario se ocupó. Me quedan:\n${list}\n\nElige un número (1-${Math.min(MAX_OPTS, kept.length)}).`
+          `Ese horario se ocupó. Me quedan:\n${list}\n\nElige un número (1-${Math.min(
+            MAX_OPTS,
+            kept.length
+          )}).`
         );
         return;
       }
 
-      // Si el RPC devolvió un error genérico
       if (result === "ERROR") {
         const detail = data?.detail ? ` Detalle: ${data.detail}` : "";
-        await replyAndMaybeTwilio(conversationId, "No pude crear la cita." + detail);
+        await replyAndMaybeTwilio(
+          conversationId,
+          "No pude crear la cita." + detail
+        );
         return;
       }
 
-      // Fallback
-      await replyAndMaybeTwilio(conversationId, "No pude crear la cita. Probemos de nuevo.");
+      await replyAndMaybeTwilio(
+        conversationId,
+        "No pude crear la cita. Probemos de nuevo."
+      );
       return;
     } catch (e) {
-      console.error("[reserve via RPC] error:", e);
-      await replyAndMaybeTwilio(conversationId, "Se me cruzó un error creando la cita. Intenta otro horario.");
+      console.error("[reserve via HTTP] error:", e);
+      await replyAndMaybeTwilio(
+        conversationId,
+        "Se me cruzó un error creando la cita. Intenta otro horario."
+      );
       return;
     }
   }
@@ -780,9 +903,18 @@ async function handleUserMessage(job: Job) {
     if (MOCK_AI || !openai) {
       reply = `🤖 (demo) Me dijiste: "${text}"`;
     } else {
-      const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
-        { role: "system", content: "Eres un asistente útil y directo. Responde en español." },
-        ...(history ?? []).map((m: any) => ({ role: m.role, content: m.content })),
+      const messages: Array<{
+        role: "system" | "user" | "assistant";
+        content: string;
+      }> = [
+        {
+          role: "system",
+          content: "Eres un asistente útil y directo. Responde en español.",
+        },
+        ...(history ?? []).map((m: any) => ({
+          role: m.role,
+          content: m.content,
+        })),
         { role: "user", content: text },
       ];
 
@@ -793,12 +925,15 @@ async function handleUserMessage(job: Job) {
           temperature: 0.4,
         });
 
-        reply = completion.choices?.[0]?.message?.content?.trim() ?? "No pude generar respuesta ahora mismo.";
+        reply =
+          completion.choices?.[0]?.message?.content?.trim() ??
+          "No pude generar respuesta ahora mismo.";
       } catch (err: any) {
         const status = err?.status ?? err?.response?.status;
         if (status === 429) throw new Error("OpenAI 429: retry");
         console.error("[OpenAI] error:", err?.message || err);
-        reply = "Estoy un poco ocupado ahora mismo. Intentaré responder en breve.";
+        reply =
+          "Estoy un poco ocupado ahora mismo. Intentaré responder en breve.";
       }
     }
 
@@ -842,12 +977,18 @@ const worker = new Worker(
 );
 
 worker.on("completed", (job) => console.log(`✅ job ${job.id} completed`));
-worker.on("failed", (job, err) => console.error(`❌ job ${job?.id} failed:`, err?.message));
+worker.on("failed", (job, err) =>
+  console.error(`❌ job ${job?.id} failed:`, err?.message)
+);
 
-// Recordatorios
 startRemindersWorker();
-scheduleDailyReminders().catch((e) => console.error("[scheduleDailyReminders] error:", e));
-// Outbox retries
+scheduleDailyReminders().catch((e) =>
+  console.error("[scheduleDailyReminders] error:", e)
+);
 startOutboxWorker();
 
-console.log(`✅ Bot worker corriendo${MOCK_AI || !openai ? " en modo demo (sin OpenAI)" : " (OpenAI activo)"}…`);
+console.log(
+  `✅ Bot worker corriendo${
+    MOCK_AI || !openai ? " en modo demo (sin OpenAI)" : " (OpenAI activo)"
+  }…`
+);

@@ -1,6 +1,6 @@
-// src/app/server/queue.ts  (o src/server/queue.ts, donde lo tengas)
-import { Queue, Worker } from "bullmq";
-import IORedis from "ioredis";
+// src/server/queue.ts
+import { Queue, Worker, JobsOptions } from "bullmq";
+import IORedis, { Redis } from "ioredis";
 
 const redisUrl = process.env.REDIS_URL;
 
@@ -8,18 +8,17 @@ if (!redisUrl) {
   console.warn("[queue] REDIS_URL no está definido. Las colas NO funcionarán.");
 }
 
-// Conexión Redis → Redis Cloud
-export const redisConnection = redisUrl
+// Conexión Redis → puede ser null si no hay URL
+export const redisConnection: Redis | null = redisUrl
   ? new IORedis(redisUrl, {
       maxRetriesPerRequest: null,
       enableReadyCheck: true,
     })
-  : undefined;
+  : null;
 
 // Cola principal de WhatsApp
-export const whatsappQueue = redisConnection
+export const whatsappQueue: Queue | null = redisConnection
   ? new Queue("whatsapp", {
-      // TS sabe que aquí solo entra si redisConnection existe
       connection: redisConnection,
       defaultJobOptions: {
         removeOnComplete: true,
@@ -28,7 +27,36 @@ export const whatsappQueue = redisConnection
     })
   : null;
 
-// Worker WhatsApp
+/**
+ * Encola un mensaje de WhatsApp de forma segura.
+ * Si no hay Redis/cola, solo loguea y no rompe el flujo.
+ */
+export async function enqueueWhatsapp(
+  name: string,
+  data: Record<string, any>,
+  options?: JobsOptions
+): Promise<void> {
+  if (!whatsappQueue) {
+    console.warn(
+      "[queue] whatsappQueue no inicializada. Job NO encolado:",
+      name,
+      data
+    );
+    return;
+  }
+
+  try {
+    const job = await whatsappQueue.add(name, data, options);
+    console.log("[queue] Job encolado:", job.id, name);
+  } catch (error) {
+    console.error("[queue] Error encolando job:", name, error);
+  }
+}
+
+/**
+ * Crea un worker para procesar la cola de WhatsApp.
+ * Lo usamos en worker/whatsappWorker.ts
+ */
 export function createWhatsappWorker(
   handler: (job: any) => Promise<any>
 ) {
@@ -42,7 +70,7 @@ export function createWhatsappWorker(
     concurrency: 5,
   });
 
-  worker.on("failed", (job, err) => {
+  worker.on("failed", (job, err: Error) => {
     console.error("[queue] Job falló:", job?.id, err);
   });
 

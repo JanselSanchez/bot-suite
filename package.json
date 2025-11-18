@@ -2,17 +2,19 @@
   "name": "bot-suite",
   "version": "0.1.0",
   "private": true,
-  "scripts": {
-    "dev": "next dev --turbopack",
-    "build": "next build --turbopack",
-    "start": "next start",
-    "lint": "eslint",
-    "bot:worker": "cross-env DOTENV_CONFIG_PATH=.env.local tsx -r dotenv/config worker/botWorker.ts",
-    "worker:notifications": "tsx workers/notifications.ts",
-    "watchdog": "tsx jobs/watchdog.ts",
-    "worker:reminders": "tsx workers/reminders.ts",
-    "worker:outbox": "tsx workers/outbox.ts"
-  },
+"scripts": {
+  "dev": "next dev --turbopack",
+  "build": "next build --turbopack",
+  "start": "next start",
+  "lint": "eslint",
+  "bot:worker": "cross-env DOTENV_CONFIG_PATH=.env.local tsx -r dotenv/config worker/botWorker.ts",
+  "worker:notifications": "tsx workers/notifications.ts",
+  "watchdog": "tsx jobs/watchdog.ts",
+  "worker:reminders": "tsx workers/reminders.ts",
+  "worker:outbox": "tsx workers/outbox.ts",
+  "worker:whatsapp": "cross-env DOTENV_CONFIG_PATH=.env.local tsx -r dotenv/config worker/whatsappWorker.ts"
+}
+,
   "dependencies": {
     "@radix-ui/react-separator": "^1.1.7",
     "@radix-ui/react-slot": "^1.2.3",
@@ -46,7 +48,7 @@
     "@eslint/eslintrc": "^3",
     "@tailwindcss/forms": "^0.5.10",
     "@tailwindcss/typography": "^0.5.19",
-    "@types/node": "^20.19.19",
+    "@types/node": "^20.19.25",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "autoprefixer": "^10.4.21",
@@ -54,7 +56,8 @@
     "eslint-config-next": "15.5.4",
     "postcss": "^8.5.6",
     "tailwindcss": "^3.4.18",
+    "ts-node": "^10.9.2",
     "tsx": "^4.20.6",
-    "typescript": "^5"
+    "typescript": "^5.9.3"
   }
 }

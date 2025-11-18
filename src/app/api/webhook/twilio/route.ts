@@ -1,6 +1,9 @@
-import { supabaseAdmin } from "@/app/lib/superbase";
-import { NextRequest } from "next/server";
+// src/app/api/webhook/twilio/route.ts
+import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
+
+import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
+import { enqueueWhatsapp } from "@/server/queue";
 
 /* Utils */
 function toE164(s: string): string {
@@ -9,71 +12,110 @@ function toE164(s: string): string {
   if (/^\d+$/.test(v)) return `+${v}`;
   return v;
 }
+
 function parseForm(body: string) {
   return Object.fromEntries(new URLSearchParams(body));
 }
+
 function verifyTwilioSignature(req: NextRequest, rawBody: string) {
+  // Mientras pruebas: deja TWILIO_VERIFY_SIGNATURE sin definir o "false"
   if (process.env.TWILIO_VERIFY_SIGNATURE !== "true") return true;
+
   const token = process.env.TWILIO_AUTH_TOKEN!;
   const sig = req.headers.get("x-twilio-signature") || "";
   const url = process.env.PUBLIC_WEBHOOK_URL || req.url;
+
   const params = new URLSearchParams(rawBody);
   const keys = Array.from(params.keys()).sort();
   const concatenated = keys.map((k) => params.getAll(k).join("")).join("");
   const data = url + concatenated;
-  const expected = crypto.createHmac("sha1", token).update(Buffer.from(data, "utf-8")).digest("base64");
+
+  const expected = crypto
+    .createHmac("sha1", token)
+    .update(Buffer.from(data, "utf-8"))
+    .digest("base64");
+
   const a = Buffer.from(sig);
   const b = Buffer.from(expected);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 /* DB helpers */
-async function ensureConversation(phone: string) {
+async function ensureConversation(phone: string, tenantId?: string | null) {
   const { data: sel } = await supabaseAdmin
     .from("conversations")
-    .select("id")
+    .select("id, tenant_id")
     .eq("phone", phone)
     .limit(1)
     .maybeSingle();
-  if (sel?.id) return sel.id;
-  const { data: ins } = await supabaseAdmin
+
+  // ya existe conversación
+  if (sel?.id) {
+    if (!sel.tenant_id && tenantId) {
+      await supabaseAdmin
+        .from("conversations")
+        .update({ tenant_id: tenantId })
+        .eq("id", sel.id);
+    }
+    return sel.id as string;
+  }
+
+  // crear nueva conversación
+  const { data: ins, error } = await supabaseAdmin
     .from("conversations")
-    .insert({ phone })
+    .insert({ phone, tenant_id: tenantId ?? null })
     .select("id")
     .single();
-  return ins?.id ?? null;
+
+  if (error) {
+    console.error("[ensureConversation.insert] error:", error);
+    return null;
+  }
+  return (ins?.id as string) ?? null;
 }
-async function logMessage(conversation_id: number | null, role: "user" | "bot", text: string) {
-  const payload: any = { role, text };
+
+async function logMessage(
+  conversation_id: string | null,
+  role: "user" | "assistant",
+  text: string
+) {
+  const payload: any = { role, content: text }; // columna correcta: content
   if (conversation_id) payload.conversation_id = conversation_id;
-  await supabaseAdmin.from("messages").insert(payload);
+
+  const { error } = await supabaseAdmin.from("messages").insert(payload);
+  if (error) console.error("[logMessage] error:", error);
 }
 
 async function findTenantByBotNumber(waTo: string) {
   const e164 = toE164(waTo);
-  // 1) si tienes columna wa_number (E.164 sin 'whatsapp:')
+
   let { data, error } = await supabaseAdmin
     .from("tenants")
-    .select("id,name,valid_until,grace_days,wa_number,phone")
+    .select("id, name, valid_until, grace_days, wa_number, phone")
     .eq("wa_number", e164)
     .maybeSingle();
+
   if (error) console.error("tenants wa_number error:", error);
 
-  // 2) fallback: intenta con phone almacenado como 'whatsapp:+...'
   if (!data) {
     const whatsappFmt = `whatsapp:${e164}`;
     const res = await supabaseAdmin
       .from("tenants")
-      .select("id,name,valid_until,grace_days,wa_number,phone")
+      .select("id, name, valid_until, grace_days, wa_number, phone")
       .eq("phone", whatsappFmt)
       .maybeSingle();
+
     if (!res.error) data = res.data ?? null;
   }
+
   return data ?? null;
 }
 
-function isBlockedByBilling(tenant: { valid_until: string | null; grace_days: number | null; due_on?: string | null }) {
-  // Preferimos valid_until. Si no existe, usamos due_on como legado.
+function isBlockedByBilling(tenant: {
+  valid_until: string | null;
+  grace_days: number | null;
+  due_on?: string | null;
+}) {
   const ref = tenant.valid_until ?? tenant.due_on ?? null;
   if (!ref) return false;
   const dueMs = new Date(ref).getTime();
@@ -84,71 +126,117 @@ function isBlockedByBilling(tenant: { valid_until: string | null; grace_days: nu
 async function sendWhatsApp(to: string, text: string) {
   const sid = process.env.TWILIO_ACCOUNT_SID!;
   const token = process.env.TWILIO_AUTH_TOKEN!;
-  const from = process.env.TWILIO_WHATSAPP_FROM!;
+  const from = process.env.TWILIO_WHATSAPP_FROM!; // "whatsapp:+14155238886"
   const auth = Buffer.from(`${sid}:${token}`).toString("base64");
 
-  await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${auth}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({ From: from, To: to, Body: text }).toString(),
-  });
+  await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        From: from,
+        To: to,
+        Body: text,
+      }).toString(),
+    }
+  );
 }
 
 /* Routes */
 export async function GET() {
-  return new Response(JSON.stringify({ ok: true, service: "twilio-webhook" }), {
-    headers: { "Content-Type": "application/json" },
+  return NextResponse.json({
+    ok: true,
+    service: "twilio-webhook",
   });
 }
 
 export async function POST(req: NextRequest) {
   try {
     const raw = await req.text();
+
     if (!verifyTwilioSignature(req, raw)) {
       console.warn("⚠️ Twilio signature verification failed");
-      return new Response("<Response/>", { headers: { "Content-Type": "text/xml" }, status: 200 });
+      return new NextResponse("<Response/>", {
+        headers: { "Content-Type": "text/xml" },
+        status: 200,
+      });
     }
 
     const form = parseForm(raw);
-    const from = String(form.From || "");   // "whatsapp:+1..."
-    const to   = String(form.To   || "");   // "whatsapp:+1415..."
+
+    const from = String(form.From || ""); // "whatsapp:+1829..."
+    const to = String(form.To || ""); // "whatsapp:+1415..."
     const body = String(form.Body || "").trim();
 
-    const fromE164 = toE164(from);
-    const botE164  = toE164(to);
-
-    const convId = await ensureConversation(fromE164);
-    if (body) await logMessage(convId, "user", body);
-
-    const tenant = await findTenantByBotNumber(to);
-    if (!tenant) {
-      console.warn("⚠️ Bot number not linked to any tenant:", botE164);
-      return new Response("<Response/>", { headers: { "Content-Type": "text/xml" } });
+    if (!from || !to || !body) {
+      console.warn("[twilio-webhook] payload incompleto:", { from, to, body });
+      return new NextResponse("<Response/>", {
+        headers: { "Content-Type": "text/xml" },
+        status: 200,
+      });
     }
 
+    const fromE164 = toE164(from);
+    const botE164 = toE164(to);
+
+    // Buscar tenant por número del bot
+    const tenant = await findTenantByBotNumber(to);
+    const tenantId = tenant?.id as string | undefined;
+
+    // Crear / actualizar conversación con tenant_id
+    const convId = await ensureConversation(fromE164, tenantId ?? null);
+    if (!convId) {
+      console.error("[twilio-webhook] no pude crear conversación");
+      return new NextResponse("<Response/>", {
+        headers: { "Content-Type": "text/xml" },
+        status: 200,
+      });
+    }
+
+    // Loguear mensaje del usuario
+    await logMessage(convId, "user", body);
+
+    if (!tenant) {
+      console.warn("⚠️ Bot number not linked to any tenant:", botE164);
+      return new NextResponse("<Response/>", {
+        headers: { "Content-Type": "text/xml" },
+        status: 200,
+      });
+    }
+
+    // Bloqueo por billing
     if (isBlockedByBilling(tenant)) {
       const msg =
         "⚠️ Servicio temporalmente suspendido por pago pendiente. " +
         "Por favor, contacta al negocio para reactivar.";
       await sendWhatsApp(from, msg);
-      await logMessage(convId, "bot", msg);
-      return new Response("<Response/>", { headers: { "Content-Type": "text/xml" } });
+      await logMessage(convId, "assistant", msg);
+      return new NextResponse("<Response/>", {
+        headers: { "Content-Type": "text/xml" },
+        status: 200,
+      });
     }
 
-    // Respuesta simple de ejemplo
-    const low = body.toLowerCase();
-    const reply = low.includes("hola") || low.includes("buenas") || low === "hi"
-      ? "👋 ¡Hola! Bot operativo con Twilio ✅"
-      : "Recibido ✅. ¿En qué puedo ayudarte?";
+    // Encolar para el worker: job "user-message" con conversationId + texto
+    await enqueueWhatsapp("user-message", {
+      conversationId: convId,
+      text: body,
+    });
 
-    await sendWhatsApp(from, reply);
-    await logMessage(convId, "bot", reply);
-    return new Response("<Response/>", { headers: { "Content-Type": "text/xml" } });
+    // Twilio solo necesita 200 OK
+    return new NextResponse("<Response/>", {
+      headers: { "Content-Type": "text/xml" },
+      status: 200,
+    });
   } catch (err) {
     console.error("Webhook error:", err);
-    return new Response("<Response/>", { headers: { "Content-Type": "text/xml" }, status: 200 });
+    return new NextResponse("<Response/>", {
+      headers: { "Content-Type": "text/xml" },
+      status: 200,
+    });
   }
 }

@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "ES2020",
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/app/*"]
+    },
+    "outDir": "dist-worker"
+  },
+  "include": [
+    "worker/**/*.ts",
+    "src/app/server/**/*.ts",
+    "src/app/worker/**/*.ts"
+  ]
+}
