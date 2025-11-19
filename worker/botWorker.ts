@@ -70,6 +70,12 @@ if (!MOCK_AI) {
   }
 }
 
+// Heartbeat separado para monitoreo
+const redis = new IORedis(REDIS_URL);
+setInterval(() => {
+  redis.set("worker:hb", "1", "EX", 60).catch(() => {});
+}, 15000);
+
 // >>> utilidades de plantillas (render + defaults + fetch desde DB)
 function renderTemplate(body: string, vars: Record<string, string>) {
   return body.replace(/\{\{(\w+)\}\}/g, (_, key) => vars[key] ?? "");
@@ -87,11 +93,6 @@ const DEFAULT_TEMPLATES: Record<string, string> = {
   reminder:
     "⏰ Recordatorio: {{customer_name}}, te esperamos el {{date}} a las {{time}} con {{resource_name}}.",
 };
-
-const redis = new IORedis(process.env.REDIS_URL!);
-setInterval(() => {
-  redis.set("worker:hb", "1", "EX", 60).catch(() => {});
-}, 15000);
 
 async function getTemplateOrDefault(
   tenantId: string,
@@ -421,10 +422,8 @@ async function listSlotsAndAdvance(
     });
 
     const slotsKept: SlotCandidate[] = slots.filter((s: SlotCandidate) => {
-      const sStart =
-        s.start instanceof Date ? s.start : new Date(s.start);
-      const sEnd =
-        s.end instanceof Date ? s.end : new Date(s.end);
+      const sStart = s.start instanceof Date ? s.start : new Date(s.start);
+      const sEnd = s.end instanceof Date ? s.end : new Date(s.end);
       const clashes = (busy || []).some(
         (b) =>
           b.resource_id === s.resource_id &&
@@ -804,10 +803,8 @@ async function handleUserMessage(job: Job) {
         });
 
         const kept: SlotCandidate[] = fresh.filter((s: SlotCandidate) => {
-          const sStart =
-            s.start instanceof Date ? s.start : new Date(s.start);
-          const sEnd =
-            s.end instanceof Date ? s.end : new Date(s.end);
+          const sStart = s.start instanceof Date ? s.start : new Date(s.start);
+          const sEnd = s.end instanceof Date ? s.end : new Date(s.end);
           return !(busy || []).some(
             (b) =>
               b.resource_id === s.resource_id &&
@@ -933,7 +930,7 @@ async function handleUserMessage(job: Job) {
         if (status === 429) throw new Error("OpenAI 429: retry");
         console.error("[OpenAI] error:", err?.message || err);
         reply =
-          "Estoy un poco ocupado ahora mismo. Intentaré responder en breve.";
+          "Ahora mismo otro asistente seguirá contigo en breve. 😉";
       }
     }
 

@@ -4,6 +4,9 @@ import IORedis, { Redis } from "ioredis";
 
 const redisUrl = process.env.REDIS_URL;
 
+// Nombre ÚNICO de la cola que usa TODO el sistema
+const QUEUE_NAME = "chat-queue";
+
 if (!redisUrl) {
   console.warn("[queue] REDIS_URL no está definido. Las colas NO funcionarán.");
 }
@@ -16,9 +19,9 @@ export const redisConnection: Redis | null = redisUrl
     })
   : null;
 
-// Cola principal de WhatsApp
+// Cola principal (la misma que usa botWorker: "chat-queue")
 export const whatsappQueue: Queue | null = redisConnection
-  ? new Queue("whatsapp", {
+  ? new Queue(QUEUE_NAME, {
       connection: redisConnection,
       defaultJobOptions: {
         removeOnComplete: true,
@@ -54,8 +57,8 @@ export async function enqueueWhatsapp(
 }
 
 /**
- * Crea un worker para procesar la cola de WhatsApp.
- * Lo usamos en worker/whatsappWorker.ts
+ * Crea un worker para procesar la cola (si lo quieres usar en otro archivo).
+ * OJO: botWorker.ts ya crea su propio Worker("chat-queue"), esto es opcional.
  */
 export function createWhatsappWorker(
   handler: (job: any) => Promise<any>
@@ -65,7 +68,7 @@ export function createWhatsappWorker(
     return null;
   }
 
-  const worker = new Worker("whatsapp", handler, {
+  const worker = new Worker(QUEUE_NAME, handler, {
     connection: redisConnection,
     concurrency: 5,
   });
