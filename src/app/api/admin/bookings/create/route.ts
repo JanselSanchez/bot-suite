@@ -13,7 +13,7 @@ export async function GET() {
 
 // 🔹 POST real (lo que ya tienes)
 function normalizeWhatsappPhone(phoneRaw: string): string {
-  let s = (phoneRaw || "").trim();
+  const s = (phoneRaw || "").trim();
   if (!s) return s;
 
   if (s.toLowerCase().startsWith("whatsapp:")) return s;

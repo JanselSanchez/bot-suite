@@ -1,11 +1,11 @@
 // worker/whatsappWorker.ts
 import "dotenv/config";
 import twilio from "twilio";
-import { createWhatsappWorker } from "@/server/queue";
+import { createWhatsappWorker } from "../src/server/queue";
 import type {
   WhatsappJobPayload,
   WhatsappEventType,
-} from "@/server/whatsapp";
+} from "../src/server/whatsapp";
 
 // ========= Config Twilio =========
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -18,48 +18,35 @@ if (!accountSid || !authToken || !from) {
   );
 }
 
-const twilioClient =
-  accountSid && authToken
-    ? twilio(accountSid, authToken)
-    : (null as unknown as ReturnType<typeof twilio>);
+const twilioClient: twilio.Twilio | null =
+  accountSid && authToken ? twilio(accountSid, authToken) : null;
 
 // ========= Plantillas internas por tipo =========
 
-type TemplateVars = {
-  [key: string]: any;
-  customerName?: string;
-  businessName?: string;
-  message?: string;
-  bookingTime?: string;
-};
-
+type TemplateVars = Record<string, string>;
 type TemplateRenderer = (vars: TemplateVars) => string;
 
 const INTERNAL_TEMPLATES: Record<string, TemplateRenderer> = {
-  // Plantilla genérica de bienvenida
-  default_generic: (v) =>
+  default_generic: (v: TemplateVars) =>
     `Hola ${v.customerName ?? ""} 👋, te escribe ${
       v.businessName ?? "nuestro equipo"
     }. ${v.message ?? ""}`.trim(),
 
-  // Cita creada
-  default_booking_created: (v) =>
+  default_booking_created: (v: TemplateVars) =>
     `Hola ${v.customerName ?? ""} 👋, tu cita en ${
       v.businessName ?? "nuestro negocio"
     } fue agendada para ${
       v.bookingTime ?? "la fecha acordada"
     }. Si necesitas cambiarla responde a este mensaje.`,
 
-  // Cita reprogramada
-  default_booking_rescheduled: (v) =>
+  default_booking_rescheduled: (v: TemplateVars) =>
     `Hola ${v.customerName ?? ""} 👋, tu cita en ${
       v.businessName ?? "nuestro negocio"
     } fue reprogramada para ${
       v.bookingTime ?? "la nueva fecha"
     }. Si no puedes asistir, respóndenos por aquí.`,
 
-  // Cita cancelada
-  default_booking_cancelled: (v) =>
+  default_booking_cancelled: (v: TemplateVars) =>
     `Hola ${v.customerName ?? ""} 👋, tu cita en ${
       v.businessName ?? "nuestro negocio"
     } ha sido cancelada. Si deseas agendar una nueva, responde a este mensaje.`,
@@ -72,13 +59,24 @@ const INTERNAL_TEMPLATES: Record<string, TemplateRenderer> = {
  *  3) plantilla por defecto según event
  */
 function buildBodyFromPayload(payload: WhatsappJobPayload): string | null {
+  // Forzar a string de forma segura
+  const rawBody =
+    typeof payload.body === "string" ? payload.body : "";
+
   // 1) Si ya viene body directo, lo respetamos
-  if (payload.body && payload.body.trim().length > 0) {
-    return payload.body.trim();
+  if (rawBody.trim().length > 0) {
+    return rawBody.trim();
   }
 
-  const vars: TemplateVars = payload.variables ?? {};
-  const key = payload.templateKey;
+  // variables siempre como Record<string, string>
+  const vars: TemplateVars =
+    (payload.variables as TemplateVars | undefined) ?? {};
+
+  // templateKey seguro
+  const key =
+    typeof payload.templateKey === "string"
+      ? payload.templateKey
+      : undefined;
 
   // 2) Si hay templateKey explícito, usamos esa
   if (key && INTERNAL_TEMPLATES[key]) {
@@ -86,7 +84,11 @@ function buildBodyFromPayload(payload: WhatsappJobPayload): string | null {
   }
 
   // 3) Fall-back según tipo de evento
-  const eventTemplateKey = getDefaultTemplateKeyForEvent(payload.event);
+  const event =
+    (payload.event as WhatsappEventType | undefined) ??
+    ("generic" as WhatsappEventType);
+
+  const eventTemplateKey = getDefaultTemplateKeyForEvent(event);
   const renderer = INTERNAL_TEMPLATES[eventTemplateKey];
 
   if (!renderer) return null;
@@ -117,7 +119,9 @@ const worker = createWhatsappWorker(async (job) => {
   console.log("  → data:", payload);
 
   if (!twilioClient || !from) {
-    console.error("[worker:whatsapp] Twilio no está configurado correctamente.");
+    console.error(
+      "[worker:whatsapp] Twilio no está configurado correctamente."
+    );
     throw new Error("Twilio client not configured");
   }
 
@@ -127,27 +131,32 @@ const worker = createWhatsappWorker(async (job) => {
       "[worker:whatsapp] No se pudo construir el body del mensaje:",
       payload
     );
-    return { ok: false, reason: "empty_body" };
+    return { ok: false as const, reason: "empty_body" as const };
   }
 
-  if (!payload.to) {
+  const to =
+    typeof payload.to === "string" ? payload.to : "";
+
+  if (!to) {
     console.warn("[worker:whatsapp] Falta 'to' en payload:", payload);
-    return { ok: false, reason: "missing_to" };
+    return { ok: false as const, reason: "missing_to" as const };
   }
 
   try {
     const msg = await twilioClient.messages.create({
       from,
-      to: payload.to,
+      to,
       body,
     });
 
     console.log("✅ Mensaje enviado por Twilio. SID:", msg.sid);
-    return { ok: true, sid: msg.sid };
-  } catch (err: any) {
+    return { ok: true as const, sid: msg.sid };
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : String(err);
     console.error(
       "[worker:whatsapp] Error enviando mensaje:",
-      err?.message || err
+      message
     );
     throw err;
   }
@@ -158,5 +167,7 @@ if (!worker) {
     "❌ No se pudo iniciar el worker (no hay REDIS_URL o Redis no conecta)."
   );
 } else {
-  console.log("✅ Worker WhatsApp escuchando jobs en la cola 'whatsapp'...");
+  console.log(
+    "✅ Worker WhatsApp escuchando jobs en la cola 'whatsapp'..."
+  );
 }

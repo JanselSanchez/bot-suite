@@ -1,36 +1,35 @@
-// src/app/server/whatsapp.ts
-import { whatsappQueue } from "@/server/queue";
+// src/server/whatsapp.ts
+import { whatsappQueue, type WhatsappJobPayload } from "@/server/queue";
 
-// Tipo de evento de negocio
+// Si quieres seguir usando el union para tener semántica clara:
 export type WhatsappEventType =
   | "booking_created"
   | "booking_rescheduled"
   | "booking_cancelled"
   | "generic";
 
-// Payload estándar de la cola
-export interface WhatsappJobPayload {
-  tenantId: string;              // negocio
-  to: string;                    // "whatsapp:+1829XXXXXXX"
-  event: WhatsappEventType;      // tipo de evento
-  body?: string;                 // texto directo (opcional)
-  templateKey?: string;          // plantilla interna, ej: "spa_recordatorio"
-  variables?: Record<string, string>; // datos para rellenar plantilla
-}
-
 /**
  * Encola un mensaje de WhatsApp para que lo procese el worker.
  * Se usa en APIs de reservas, recordatorios, cancelaciones, etc.
  */
 export async function enqueueWhatsappMessage(
-  payload: WhatsappJobPayload
+  payload: WhatsappJobPayload & {
+    tenantId: string;
+    to: string;
+    event: WhatsappEventType;
+    body?: string;
+    templateKey?: string;
+    variables?: Record<string, string>;
+  }
 ): Promise<void> {
   if (!whatsappQueue) {
-    console.warn("[whatsapp] Cola deshabilitada, mensaje NO encolado:", payload);
+    console.warn(
+      "[whatsapp] Cola deshabilitada, mensaje NO encolado:",
+      payload
+    );
     return;
   }
 
-  // Puedes tunear attempts/backoff si quieres
   await whatsappQueue.add("whatsapp_event", payload, {
     attempts: 3,
     backoff: {
@@ -41,3 +40,5 @@ export async function enqueueWhatsappMessage(
     removeOnFail: 50,
   });
 }
+export { WhatsappJobPayload };
+

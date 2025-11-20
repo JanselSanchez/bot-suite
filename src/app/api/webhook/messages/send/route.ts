@@ -1,8 +1,9 @@
 // src/app/api/webhook/messages/send/route.ts
 import { NextRequest } from "next/server";
-import { chatQueue } from "@/server/queue";
-import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
 import crypto from "crypto";
+
+import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
+import { enqueueWhatsapp } from "@/server/queue";
 
 export async function GET() {
   return Response.json({ ok: true, route: "/api/webhook/messages/send" });
@@ -32,13 +33,13 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Extrae campos (admite opcional externalId/metadata from Twilio u otro proveedor)
+  // Extrae campos (admite opcional externalId/metadata del proveedor)
   const {
     conversationId,
     text,
     externalId, // p.ej. Twilio MessageSid
-    provider,   // opcional, "twilio" | "whatsapp" | ...
-    meta,       // opcional: cualquier metadata del proveedor
+    provider, // opcional, "twilio" | "whatsapp" | ...
+    meta, // opcional: cualquier metadata del proveedor
   } = body ?? {};
 
   const debug = {
@@ -84,8 +85,10 @@ export async function POST(req: NextRequest) {
         .maybeSingle();
 
       if (selErr) {
-        // No bloquea: seguimos, pero lo registramos en debug
-        console.warn("[messages.select by external_id] warn:", selErr?.message || selErr);
+        console.warn(
+          "[messages.select by external_id] warn:",
+          selErr?.message || selErr
+        );
       }
 
       if (existing?.id) {
@@ -107,7 +110,7 @@ export async function POST(req: NextRequest) {
     };
     if (externalId) insertPayload.external_id = externalId;
     if (provider || meta) {
-      // si tienes columnas para metadata, puedes guardarlas aquí
+      // Si luego agregas columnas para metadata, puedes guardarlas aquí:
       // insertPayload.provider = provider ?? null;
       // insertPayload.meta = meta ?? null; // requiere columna jsonb opcional
     }
@@ -145,7 +148,10 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      return Response.json({ ok: false, error: "DB error", detail: insErr }, { status: 500 });
+      return Response.json(
+        { ok: false, error: "DB error", detail: insErr },
+        { status: 500 }
+      );
     }
 
     // 3) Encola job con jobId idempotente:
@@ -155,7 +161,7 @@ export async function POST(req: NextRequest) {
       ? `inbound:${provider || "ext"}:${externalId}`
       : fallbackJobId(conversationId, trimmedText);
 
-    await chatQueue.add(
+    await enqueueWhatsapp(
       "user-message",
       {
         conversationId,
@@ -165,8 +171,8 @@ export async function POST(req: NextRequest) {
         provider: provider ?? null,
       },
       {
-        jobId,                // 👈 evita duplicados en cola
-        attempts: 1,          // 👈 no reintentar mensajes del usuario (evita dobles respuestas)
+        jobId, // 👈 evita duplicados en cola
+        attempts: 1, // 👈 no reintentar mensajes del usuario (evita dobles respuestas)
         removeOnComplete: true,
         removeOnFail: false,
       }

@@ -1,5 +1,5 @@
 // src/server/queue.ts
-import { Queue, Worker, JobsOptions } from "bullmq";
+import { Queue, Worker, JobsOptions, Job } from "bullmq";
 import IORedis, { Redis } from "ioredis";
 
 const redisUrl = process.env.REDIS_URL;
@@ -8,7 +8,9 @@ const redisUrl = process.env.REDIS_URL;
 const QUEUE_NAME = "chat-queue";
 
 if (!redisUrl) {
-  console.warn("[queue] REDIS_URL no está definido. Las colas NO funcionarán.");
+  console.warn(
+    "[queue] REDIS_URL no está definido. Las colas NO funcionarán."
+  );
 }
 
 // Conexión Redis → puede ser null si no hay URL
@@ -19,9 +21,20 @@ export const redisConnection: Redis | null = redisUrl
     })
   : null;
 
+/**
+ * Tipo base para los jobs de WhatsApp.
+ * - conversationId y text SON OPCIONALES porque no todos los jobs son "user-message".
+ * - Permitimos campos extra sin usar `any`.
+ */
+export interface WhatsappJobPayload {
+  conversationId?: string;
+  text?: string;
+  [key: string]: unknown;
+}
+
 // Cola principal (la misma que usa botWorker: "chat-queue")
-export const whatsappQueue: Queue | null = redisConnection
-  ? new Queue(QUEUE_NAME, {
+export const whatsappQueue: Queue<WhatsappJobPayload> | null = redisConnection
+  ? new Queue<WhatsappJobPayload>(QUEUE_NAME, {
       connection: redisConnection,
       defaultJobOptions: {
         removeOnComplete: true,
@@ -36,7 +49,7 @@ export const whatsappQueue: Queue | null = redisConnection
  */
 export async function enqueueWhatsapp(
   name: string,
-  data: Record<string, any>,
+  data: WhatsappJobPayload,
   options?: JobsOptions
 ): Promise<void> {
   if (!whatsappQueue) {
@@ -61,14 +74,14 @@ export async function enqueueWhatsapp(
  * OJO: botWorker.ts ya crea su propio Worker("chat-queue"), esto es opcional.
  */
 export function createWhatsappWorker(
-  handler: (job: any) => Promise<any>
+  handler: (job: Job<WhatsappJobPayload>) => Promise<unknown>
 ) {
   if (!redisConnection) {
     console.warn("[queue] Worker no iniciado porque no hay conexión Redis.");
     return null;
   }
 
-  const worker = new Worker(QUEUE_NAME, handler, {
+  const worker = new Worker<WhatsappJobPayload>(QUEUE_NAME, handler, {
     connection: redisConnection,
     concurrency: 5,
   });

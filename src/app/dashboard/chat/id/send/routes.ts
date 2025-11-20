@@ -1,7 +1,6 @@
 // src/app/api/chat/send/route.ts
 import { NextRequest } from "next/server";
 import { supabaseAdmin } from "@/app/lib/superbase";
-import { chatQueue } from "@/server/queue";
 
 export async function POST(req: NextRequest) {
   try {

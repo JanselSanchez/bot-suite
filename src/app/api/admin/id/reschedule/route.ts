@@ -1,30 +1,74 @@
-import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
+// src/app/api/admin/id/reschedule/route.ts
+import { NextResponse } from "next/server";
+import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
 
-const sb = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
+type ReschedulePayload = {
+  tenantId?: string;
+  bookingId?: string;
+  newStartISO?: string;
+  newEndISO?: string | null;
+};
 
-export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
-  const { id } = params;
-  const body = await req.json();
-  const { tenantId, starts_at, ends_at } = body as {
-    tenantId: string;
-    starts_at: string;
-    ends_at: string;
-  };
+export async function POST(req: Request) {
+  try {
+    const body = (await req.json()) as ReschedulePayload;
 
-  if (!tenantId || !starts_at || !ends_at) {
-    return NextResponse.json({ error: "tenantId/starts_at/ends_at requeridos" }, { status: 400 });
+    const { tenantId, bookingId, newStartISO, newEndISO } = body ?? {};
+
+    if (!tenantId || !bookingId || !newStartISO) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "missing_fields",
+          detail: "tenantId, bookingId y newStartISO son requeridos",
+        },
+        { status: 400 }
+      );
+    }
+
+    const updates: { starts_at: string; ends_at?: string | null } = {
+      starts_at: newStartISO,
+    };
+    if (newEndISO) {
+      updates.ends_at = newEndISO;
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("bookings")
+      .update(updates)
+      .eq("id", bookingId)
+      .eq("tenant_id", tenantId)
+      .select("id, tenant_id, starts_at, ends_at, status")
+      .maybeSingle();
+
+    if (error) {
+      console.error("[api/admin/id/reschedule] supabase error:", error);
+      return NextResponse.json(
+        { ok: false, error: "db_error", detail: error.message },
+        { status: 500 }
+      );
+    }
+
+    if (!data) {
+      return NextResponse.json(
+        { ok: false, error: "not_found" },
+        { status: 404 }
+      );
+    }
+
+    return NextResponse.json({
+      ok: true,
+      data,
+    });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[api/admin/id/reschedule] unhandled:", msg);
+    return NextResponse.json(
+      { ok: false, error: "unhandled", detail: msg },
+      { status: 500 }
+    );
   }
-
-  const { error } = await sb
-    .from("bookings")
-    .update({ starts_at, ends_at, status: "confirmed" })
-    .eq("id", id)
-    .eq("tenant_id", tenantId);
-
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-  return NextResponse.json({ ok: true });
 }
+
+// Opcional, pero válido para el tipo RouteHandlerConfig
+export const dynamic = "force-dynamic";

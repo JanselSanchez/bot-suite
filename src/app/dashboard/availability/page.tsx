@@ -92,7 +92,7 @@ function generateOfferableSlots(
 ) {
   const slots: { start: Date; end: Date }[] = [];
   for (const w of windows) {
-    let cursor = new Date(w.start);
+    const cursor = new Date(w.start);
     while (+cursor < +w.end) {
       const end = new Date(cursor);
       end.setMinutes(end.getMinutes() + stepMin);

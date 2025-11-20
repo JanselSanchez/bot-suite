@@ -5,8 +5,6 @@ import crypto from "crypto";
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
 import { enqueueWhatsapp } from "@/server/queue";
 
-export const runtime = "nodejs";
-
 /* Utils */
 function toE164(s: string): string {
   const v = s.replace(/^whatsapp:/i, "").trim();
@@ -90,7 +88,7 @@ async function logMessage(
   role: "user" | "assistant",
   text: string
 ) {
-  const payload: any = { role, content: text }; // columna correcta: content
+  const payload: Record<string, unknown> = { role, content: text }; // columna correcta: content
   if (conversation_id) payload.conversation_id = conversation_id;
 
   const { error } = await supabaseAdmin.from("messages").insert(payload);
@@ -100,7 +98,7 @@ async function logMessage(
 async function findTenantByBotNumber(waTo: string) {
   const e164 = toE164(waTo);
 
-  let { data, error } = await supabaseAdmin
+  const { data, error } = await supabaseAdmin
     .from("tenants")
     .select("id, name, valid_until, grace_days, wa_number, phone")
     .eq("wa_number", e164)
@@ -108,7 +106,10 @@ async function findTenantByBotNumber(waTo: string) {
 
   if (error) console.error("[tenants wa_number] error:", error);
 
-  if (!data) {
+  // usamos una variable mutable separada para no romper prefer-const
+  let tenantData = data ?? null;
+
+  if (!tenantData) {
     const whatsappFmt = `whatsapp:${e164}`;
     const res = await supabaseAdmin
       .from("tenants")
@@ -116,11 +117,11 @@ async function findTenantByBotNumber(waTo: string) {
       .eq("phone", whatsappFmt)
       .maybeSingle();
 
-    if (!res.error) data = res.data ?? null;
+    if (!res.error) tenantData = res.data ?? null;
     else console.error("[tenants phone] error:", res.error);
   }
 
-  return data ?? null;
+  return tenantData ?? null;
 }
 
 function isBlockedByBilling(tenant: {
@@ -170,7 +171,6 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const raw = await req.text();
-    console.log("[twilio-webhook] POST hit, raw body length:", raw.length);
 
     if (!verifyTwilioSignature(req, raw)) {
       console.warn("⚠️ Twilio signature verification failed");
@@ -196,14 +196,6 @@ export async function POST(req: NextRequest) {
 
     const fromE164 = toE164(from);
     const botE164 = toE164(to);
-
-    console.log("[twilio-webhook] mensaje entrante:", {
-      from,
-      fromE164,
-      to,
-      botE164,
-      body,
-    });
 
     // Buscar tenant por número del bot
     const tenant = await findTenantByBotNumber(to);
@@ -248,8 +240,6 @@ export async function POST(req: NextRequest) {
       conversationId: convId,
       text: body,
     });
-
-    console.log("[twilio-webhook] job encolado user-message →", convId);
 
     // Twilio solo necesita 200 OK
     return new NextResponse("<Response/>", {
