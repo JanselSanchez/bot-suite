@@ -214,8 +214,15 @@ export async function POST(req: NextRequest) {
     // Loguear mensaje del usuario
     await logMessage(convId, "user", body);
 
+    // Si no hay tenant, para pruebas respondemos algo genérico
     if (!tenant) {
       console.warn("⚠️ Bot number not linked to any tenant:", botE164);
+
+      const fallbackText =
+        'Este número todavía no está vinculado a un negocio en el panel. (modo sandbox)';
+      await sendWhatsApp(from, fallbackText);
+      await logMessage(convId, "assistant", fallbackText);
+
       return new NextResponse("<Response/>", {
         headers: { "Content-Type": "text/xml" },
         status: 200,
@@ -235,11 +242,22 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Encolar para el worker: job "user-message" con conversationId + texto
-    await enqueueWhatsapp("user-message", {
-      conversationId: convId,
-      text: body,
-    });
+    // --- LÓGICA DE RESPUESTA ---
+    // Si no hay REDIS_URL (como ahora en Render), respondemos directo por Twilio.
+    if (!process.env.REDIS_URL) {
+      // Aquí por ahora hacemos un eco simple.
+      // Luego puedes reemplazar esto por tu lógica de IA / plantillas.
+      const replyText = `Recibido: "${body}"`;
+
+      await sendWhatsApp(from, replyText);
+      await logMessage(convId, "assistant", replyText);
+    } else {
+      // Encolar para el worker: job "user-message" con conversationId + texto
+      await enqueueWhatsapp("user-message", {
+        conversationId: convId,
+        text: body,
+      });
+    }
 
     // Twilio solo necesita 200 OK
     return new NextResponse("<Response/>", {
