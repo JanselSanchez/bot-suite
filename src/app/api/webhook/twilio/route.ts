@@ -40,6 +40,23 @@ function verifyTwilioSignature(req: NextRequest, rawBody: string) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+function escapeXml(unsafe: string) {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function twimlResponse(text: string) {
+  const xml = `<Response><Message>${escapeXml(text)}</Message></Response>`;
+  return new NextResponse(xml, {
+    status: 200,
+    headers: { "Content-Type": "text/xml" },
+  });
+}
+
 /* DB helpers */
 async function ensureConversation(phone: string, tenantId?: string | null) {
   const { data: sel, error: selErr } = await supabaseAdmin
@@ -137,29 +154,6 @@ function isBlockedByBilling(tenant: {
   return Date.now() > dueMs + graceMs;
 }
 
-async function sendWhatsApp(to: string, text: string) {
-  const sid = process.env.TWILIO_ACCOUNT_SID!;
-  const token = process.env.TWILIO_AUTH_TOKEN!;
-  const from = process.env.TWILIO_WHATSAPP_FROM!; // "whatsapp:+14155238886"
-  const auth = Buffer.from(`${sid}:${token}`).toString("base64");
-
-  await fetch(
-    `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${auth}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
-        From: from,
-        To: to,
-        Body: text,
-      }).toString(),
-    }
-  );
-}
-
 /* Routes */
 export async function GET() {
   return NextResponse.json({
@@ -174,6 +168,7 @@ export async function POST(req: NextRequest) {
 
     if (!verifyTwilioSignature(req, raw)) {
       console.warn("⚠️ Twilio signature verification failed");
+      // Respondemos vacío pero válido
       return new NextResponse("<Response/>", {
         headers: { "Content-Type": "text/xml" },
         status: 200,
@@ -214,19 +209,15 @@ export async function POST(req: NextRequest) {
     // Loguear mensaje del usuario
     await logMessage(convId, "user", body);
 
-    // Si no hay tenant, para pruebas respondemos algo genérico
+    // Si no hay tenant, respondemos algo genérico (modo sandbox)
     if (!tenant) {
       console.warn("⚠️ Bot number not linked to any tenant:", botE164);
 
       const fallbackText =
-        'Este número todavía no está vinculado a un negocio en el panel. (modo sandbox)';
-      await sendWhatsApp(from, fallbackText);
+        "Este número todavía no está vinculado a un negocio en el panel (modo sandbox).";
       await logMessage(convId, "assistant", fallbackText);
 
-      return new NextResponse("<Response/>", {
-        headers: { "Content-Type": "text/xml" },
-        status: 200,
-      });
+      return twimlResponse(fallbackText);
     }
 
     // Bloqueo por billing
@@ -234,32 +225,28 @@ export async function POST(req: NextRequest) {
       const msg =
         "⚠️ Servicio temporalmente suspendido por pago pendiente. " +
         "Por favor, contacta al negocio para reactivar.";
-      await sendWhatsApp(from, msg);
       await logMessage(convId, "assistant", msg);
-      return new NextResponse("<Response/>", {
-        headers: { "Content-Type": "text/xml" },
-        status: 200,
-      });
+      return twimlResponse(msg);
     }
 
     // --- LÓGICA DE RESPUESTA ---
-    // Si no hay REDIS_URL (como ahora en Render), respondemos directo por Twilio.
+    // Si no hay REDIS_URL (como ahora en Render), respondemos directo via TwiML.
     if (!process.env.REDIS_URL) {
       // Aquí por ahora hacemos un eco simple.
       // Luego puedes reemplazar esto por tu lógica de IA / plantillas.
       const replyText = `Recibido: "${body}"`;
 
-      await sendWhatsApp(from, replyText);
       await logMessage(convId, "assistant", replyText);
-    } else {
-      // Encolar para el worker: job "user-message" con conversationId + texto
-      await enqueueWhatsapp("user-message", {
-        conversationId: convId,
-        text: body,
-      });
+      return twimlResponse(replyText);
     }
 
-    // Twilio solo necesita 200 OK
+    // Si hay Redis configurado, usamos la cola como antes
+    await enqueueWhatsapp("user-message", {
+      conversationId: convId,
+      text: body,
+    });
+
+    // Twilio solo necesita 200 OK (sin respuesta inmediata)
     return new NextResponse("<Response/>", {
       headers: { "Content-Type": "text/xml" },
       status: 200,
