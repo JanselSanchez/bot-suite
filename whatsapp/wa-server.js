@@ -1,8 +1,13 @@
 // whatsapp/wa-server.js
-require("dotenv").config();
+require("dotenv").config({ path: ".env.local" }); // primero intenta leer .env.local
+require("dotenv").config(); // luego .env normal, por si acaso
+
+console.log("[WA] OPENAI_KEY cargada:", !!process.env.OPENAI_API_KEY);
+
 const qrcode = require("qrcode-terminal");
 const express = require("express");
 const P = require("pino");
+const OpenAI = require("openai");
 
 // ⚠️ Solo para entorno corporativo / dev:
 // ignora certificados self-signed (arregla SELF_SIGNED_CERT_IN_CHAIN)
@@ -24,6 +29,11 @@ const logger = P({
       ignore: "pid,hostname",
     },
   },
+});
+
+// Cliente OpenAI (IA)
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 // --------- Inicializar Baileys ---------
@@ -77,27 +87,99 @@ async function startWhatsApp() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // Mensajes entrantes
+  // --------- Mensajes entrantes ---------
   sock.ev.on("messages.upsert", async (m) => {
     try {
       const msg = m.messages && m.messages[0];
-      if (!msg || !msg.message || msg.key.fromMe) return;
+      if (!msg || !msg.message) return;
 
       const remoteJid = msg.key.remoteJid;
-      const content =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message?.ephemeralMessage?.message?.conversation ||
+      const isFromMe = msg.key.fromMe;
+
+      // ignorar estados, grupos y mensajes propios
+      if (!remoteJid) return;
+      if (remoteJid.endsWith("@status")) return; // estados
+      if (remoteJid.endsWith("@g.us")) return; // grupos
+      if (isFromMe) return; // lo que envía el mismo bot
+
+      const messageContent = msg.message;
+
+      const text =
+        messageContent.conversation ||
+        messageContent?.extendedTextMessage?.text ||
+        messageContent?.ephemeralMessage?.message?.conversation ||
+        messageContent?.ephemeralMessage?.message?.extendedTextMessage?.text ||
         "";
 
-      logger.info({ from: remoteJid, text: content }, "📩 Mensaje recibido");
+      const cleanText = (text || "").trim();
 
-      if (!content) return;
+      logger.info({ from: remoteJid, text: cleanText }, "📩 Mensaje recibido");
 
-      // 🔥 Aquí luego conectamos la IA.
-      const reply =
-        `Hola 👋, recibí tu mensaje:\n\n"${content}"\n\n` +
-        "Estoy en modo demo con Baileys.";
+      if (!cleanText) {
+        // nada útil que responder
+        return;
+      }
+
+      // ---------- IA COMERCIAL (OpenAI) ----------
+      let reply = "";
+
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4.1-mini",
+          messages: [
+            {
+              role: "system",
+              content: `
+Eres el asistente comercial de *Creativa Dominicana*, especialista en automatizar WhatsApp para negocios (barberías, salones, tiendas, clínicas, dealers, etc.) en República Dominicana.
+
+Estilo:
+- Habla en español dominicano neutral, profesional pero cercano.
+- Sé amable, cálido y directo, sin hablar mucho disparate.
+- No uses tecnicismos raros; habla como un humano real.
+- No parezcas un robot.
+
+Objetivo:
+- Entender qué tipo de negocio tiene la persona.
+- Explicar de forma simple que instalamos un asistente para WhatsApp que responde 24/7, agenda citas, envía precios y no deja visto.
+- Guiar a la persona a una decisión: activar el sistema o pedir un dato específico para completarlo.
+- No hables de "demos" ni "reuniones largas". La idea es rápido y sencillo.
+
+Precios (NO inventar otros):
+- Plan Profesional: instalación 10,000 RD$ + 4,500 RD$ mensual.
+- Plan Empresarial: instalación 15,000 RD$ + 7,000 RD$ mensual.
+
+Reglas:
+- Si la persona hace una pregunta muy rara, muy técnica o que no tengas clara, responde con calma y añade SIEMPRE al final:
+  "Si quieres, te paso con un asistente humano para explicarte mejor."
+- Si la persona muestra interés (pregunta cuánto, cómo se paga, cuándo se instala, dice que le interesa, etc.),
+  pídele:
+  1) Nombre del negocio
+  2) Tipo de negocio (barbería, salón, tienda, clínica, etc.)
+  3) Número de WhatsApp del negocio
+  y dile que con eso se puede dejar listo el sistema.
+- No des información falsa. Si no sabes algo, dilo de forma honesta y ofrece pasar con un asistente humano.
+              `.trim(),
+            },
+            {
+              role: "user",
+              content: cleanText,
+            },
+          ],
+          max_tokens: 250,
+          temperature: 0.7,
+        });
+
+        reply =
+          completion.choices?.[0]?.message?.content?.trim() ||
+          "Hola 👋, soy el asistente automático. Te ayudo a dejar tu WhatsApp atendido 24/7. Cuéntame qué tipo de negocio tienes.";
+      } catch (iaErr) {
+        logger.error({ iaErr }, "❌ Error generando respuesta IA");
+        reply =
+          "Hola 👋, soy el asistente automático. Ahora mismo tuve un error generando la respuesta, pero en breve un asistente humano te ayuda personalmente.";
+      }
+
+      if (!reply) return;
+
       await sock.sendMessage(remoteJid, { text: reply });
 
       logger.info({ to: remoteJid, reply }, "📤 Respuesta enviada");
