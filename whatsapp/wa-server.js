@@ -8,6 +8,7 @@ const qrcode = require("qrcode-terminal");
 const express = require("express");
 const P = require("pino");
 const OpenAI = require("openai");
+const { createClient } = require("@supabase/supabase-js");
 
 // ⚠️ Solo para entorno corporativo / dev:
 // ignora certificados self-signed (arregla SELF_SIGNED_CERT_IN_CHAIN)
@@ -30,6 +31,51 @@ const logger = P({
     },
   },
 });
+
+// ---- Supabase admin (para marcar estado por tenant) ----
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+const DEFAULT_TENANT_ID = process.env.WA_DEFAULT_TENANT_ID || null;
+
+// Helper para marcar estado WA del tenant
+async function markTenantWaStatus({ connected, phone }) {
+  if (!DEFAULT_TENANT_ID) {
+    logger.warn(
+      "WA_DEFAULT_TENANT_ID no definido; no se marca estado por tenant."
+    );
+    return;
+  }
+
+  const update = {
+    wa_connected: connected,
+    wa_last_connected_at: new Date().toISOString(),
+  };
+
+  if (phone) {
+    update.wa_phone = phone;
+  }
+
+  const { error } = await supabase
+    .from("tenants")
+    .update(update)
+    .eq("id", DEFAULT_TENANT_ID);
+
+  if (error) {
+    logger.error({ error }, "Error actualizando wa status del tenant");
+  } else {
+    logger.info(
+      {
+        tenant: DEFAULT_TENANT_ID,
+        connected,
+        phone: phone || undefined,
+      },
+      "WA status de tenant actualizado"
+    );
+  }
+}
 
 // Cliente OpenAI (IA)
 const openai = new OpenAI({
@@ -63,6 +109,22 @@ async function startWhatsApp() {
     if (connection === "open") {
       lastQr = null;
       logger.info("✅ Conectado a WhatsApp.");
+
+      // intentar inferir el número del JID de usuario
+      let phone = null;
+      try {
+        const jid = sock?.user?.id || ""; // ej "18099490457:1@s.whatsapp.net"
+        const raw = jid.split("@")[0].split(":")[0];
+        if (raw) {
+          phone = `whatsapp:+${raw}`;
+        }
+      } catch (e) {
+        logger.warn({ e }, "No se pudo inferir el número desde el JID");
+      }
+
+      markTenantWaStatus({ connected: true, phone }).catch((err) =>
+        logger.error({ err }, "Error marcando tenant como conectado")
+      );
     }
 
     if (connection === "close") {
@@ -72,14 +134,19 @@ async function startWhatsApp() {
 
       logger.warn(
         { reason: lastDisconnect?.error },
-        "❌ Conexión cerrada. ¿Reconnect?",
+        "❌ Conexión cerrada. ¿Reconnect?"
+      );
+
+      // marcar desconectado en la DB
+      markTenantWaStatus({ connected: false }).catch((err) =>
+        logger.error({ err }, "Error marcando tenant como desconectado")
       );
 
       if (shouldReconnect) {
         startWhatsApp();
       } else {
         logger.error(
-          "Sesión cerrada definitivamente. Borra la carpeta whatsapp_auth si quieres volver a vincular.",
+          "Sesión cerrada definitivamente. Borra la carpeta whatsapp_auth si quieres volver a vincular."
         );
       }
     }

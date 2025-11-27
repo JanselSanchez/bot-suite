@@ -1,36 +1,60 @@
-// app/api/health/route.ts
-import { NextResponse } from 'next/server'
-import { Queue } from 'bullmq'
-import IORedis from 'ioredis'
+// src/app/api/health/route.ts
+import { NextResponse } from "next/server";
+import Redis from "ioredis";
+import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
+
+export const dynamic = "force-dynamic";
 
 export async function GET() {
+  // --------- ENV FLAGS ----------
+  const env = {
+    NEXT_PUBLIC_SUPABASE_URL: !!process.env.NEXT_PUBLIC_SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    REDIS_URL: !!process.env.REDIS_URL,
+    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
+  };
+
+  // --------- CHEQUEO SUPABASE ----------
+  let supabaseOk = false;
   try {
-    const redis = new IORedis(process.env.REDIS_URL!)
-    const bot = new Queue('bot', { connection: redis })
-    const notifications = new Queue('notifications', { connection: redis })
-    const outbox = new Queue('outbox', { connection: redis })
-    const reminders = new Queue('reminders', { connection: redis })
-    const noshow = new Queue('noshow', { connection: redis })
-    
-
-    const [r1, r2, r3, r4, r5] = await Promise.all([
-      bot.getJobCounts(),
-      notifications.getJobCounts(),
-      outbox.getJobCounts(),
-      reminders.getJobCounts(),
-      noshow.getJobCounts(),
-    ])
-
-    return NextResponse.json({
-      bot: 'up',
-      notifications: 'up',
-      outbox: 'up',
-      reminders: 'up',
-      noshow: 'up',
-      queues: { bot: r1, notifications: r2, outbox: r3, reminders: r4, noshow: r5 },
-      version: process.env.VERCEL_GIT_COMMIT_SHA ?? 'local'
-    })
-  } catch (e) {
-    return NextResponse.json({ status: 'down', error: (e as Error).message }, { status: 500 })
+    const { error } = await supabaseAdmin
+      .from("tenants")
+      .select("id")
+      .limit(1);
+    supabaseOk = !error;
+  } catch {
+    supabaseOk = false;
   }
+
+  // --------- CHEQUEO REDIS ----------
+  let redisOk: boolean | undefined = undefined;
+
+  if (process.env.REDIS_URL) {
+    try {
+      const redis = new Redis(process.env.REDIS_URL, {
+        maxRetriesPerRequest: 1,
+        enableReadyCheck: false,
+      });
+      await redis.ping();
+      redisOk = true;
+      redis.disconnect();
+    } catch {
+      redisOk = false; // lo marcamos como error, pero no rompemos el endpoint
+    }
+  }
+
+  const services = {
+    supabase: { ok: supabaseOk },
+    redis: { ok: redisOk },
+    worker: { heartbeat: false },
+    twilio: { envs: false },
+  };
+
+  const ok = supabaseOk && (redisOk !== false);
+
+  return NextResponse.json({
+    ok,
+    env,
+    services,
+  });
 }

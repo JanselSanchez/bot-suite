@@ -44,6 +44,7 @@
     "react": "19.1.0",
     "react-big-calendar": "^1.19.4",
     "react-dom": "19.1.0",
+    "react-qr-code": "^2.0.18",
     "supabase": "^2.54.11",
     "tailwind-merge": "^3.3.1",
     "twilio": "^5.10.2",

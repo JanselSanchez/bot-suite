@@ -1,152 +1,165 @@
 "use client";
 
+import { Button } from "@/componentes/ui/button";
 import { useEffect, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
 
-type WaStatus = {
-  ok: boolean;
-  tenantId: string;
-  connected?: boolean;
-  hasQr?: boolean;
-  qr?: string | null;
-  message?: string;
-};
+type SessionStatus = "disconnected" | "qrcode" | "connecting" | "connected" | "error";
+
+interface SessionDTO {
+  id: string;
+  status: SessionStatus;
+  qr_svg?: string | null;
+  qr_data?: string | null;
+  phone_number?: string | null;
+  last_connected_at?: string | null;
+}
+
+// TODO: reemplazar por tu hook real de tenant actual
+function useCurrentTenant() {
+  // mock temporal
+  return { tenantId: "TENANT_ID", tenantName: "Negocio Demo" };
+}
 
 export default function WhatsappPage() {
-  const searchParams = useSearchParams();
-  const router = useRouter();
-
-  // por ahora, si no hay tenantId en la URL, usamos el default
-  const tenantId =
-    searchParams.get("tenantId") || process.env.NEXT_PUBLIC_WA_DEFAULT_TENANT_ID || "creativadominicana";
+  const { tenantId, tenantName } = useCurrentTenant();
 
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState<WaStatus | null>(null);
+  const [session, setSession] = useState<SessionDTO | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // polling del QR / estado
-  useEffect(() => {
-    let timer: NodeJS.Timeout | null = null;
-
-    async function fetchQr() {
-      try {
-        const res = await fetch(`/api/wa/qr?tenantId=${tenantId}`);
-        const data: WaStatus = await res.json();
-        setStatus(data);
-        setError(null);
-
-        // si todavía no está conectado y no hay error, seguimos preguntando
-        if (!data.connected) {
-          timer = setTimeout(fetchQr, 3000);
-        }
-      } catch (err: any) {
-        console.error(err);
-        setError("Error consultando el estado de WhatsApp.");
-      }
+  async function fetchSession() {
+    if (!tenantId) return;
+    try {
+      const res = await fetch(
+        `/api/whatsapp/session?tenantId=${encodeURIComponent(tenantId)}`,
+      );
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error || "Error al cargar sesión");
+      setSession(json.session ?? null);
+      setError(null);
+    } catch (e: any) {
+      console.error("[WhatsappPage] fetchSession error:", e);
+      setError(e?.message || "Error al cargar sesión");
     }
+  }
 
-    fetchQr();
-    return () => {
-      if (timer) clearTimeout(timer);
-    };
+  useEffect(() => {
+    fetchSession();
+    const interval = setInterval(fetchSession, 5000); // polling cada 5s
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId]);
 
-  async function handleStart() {
+  async function handleAction(action: "connect" | "disconnect") {
+    if (!tenantId) return;
+    setLoading(true);
     try {
-      setLoading(true);
-      setError(null);
-
-      const res = await fetch("/api/wa/session/start", {
+      const res = await fetch("/api/whatsapp/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tenantId }),
+        body: JSON.stringify({ tenantId, action }),
       });
-
-      const data: WaStatus = await res.json();
-      if (!res.ok || !data.ok) {
-        throw new Error(data?.message || "Error iniciando sesión de WhatsApp");
-      }
-
-      setStatus(data);
-    } catch (err: any) {
-      console.error(err);
-      setError(err?.message || "Error iniciando sesión de WhatsApp.");
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error || "Error al ejecutar acción");
+      await fetchSession();
+    } catch (e: any) {
+      console.error("[WhatsappPage] handleAction error:", e);
+      setError(e?.message || "Error al ejecutar acción");
     } finally {
       setLoading(false);
     }
   }
 
-  const qrValue = status?.qr || null;
-  const connected = status?.connected;
-
-  // usamos un servicio externo para convertir el texto del QR en imagen
-  const qrImageUrl = qrValue
-    ? `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
-        qrValue,
-      )}`
-    : null;
+  const status: SessionStatus = session?.status ?? "disconnected";
 
   return (
-    <div className="max-w-2xl mx-auto py-10 space-y-6">
-      <div className="space-y-2">
-        <h1 className="text-2xl font-semibold">Conectar WhatsApp</h1>
+    <div className="max-w-xl mx-auto mt-8 space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold">WhatsApp del negocio</h1>
         <p className="text-sm text-muted-foreground">
-          Tenant actual: <span className="font-medium">{tenantId}</span>
+          Negocio seleccionado: <span className="font-medium">{tenantName}</span>
         </p>
       </div>
 
-      <div className="border rounded-xl p-6 space-y-4 bg-white/5">
-        <p className="text-sm">
-          Aquí conectas el número de WhatsApp de tu negocio. Solo tienes que
-          pulsar el botón, escanear el QR desde WhatsApp &gt; Dispositivos
-          vinculados y listo.
-        </p>
+      {error && (
+        <div className="text-sm text-red-500 border border-red-500/30 rounded-md p-2">
+          {error}
+        </div>
+      )}
 
-        <button
-          onClick={handleStart}
-          disabled={loading}
-          className="px-4 py-2 rounded-lg bg-violet-600 text-white text-sm font-medium hover:bg-violet-700 disabled:opacity-50"
-        >
-          {loading ? "Iniciando..." : "Iniciar / refrescar sesión"}
-        </button>
-
-        {error && (
-          <p className="text-sm text-red-500">
-            {error}
-          </p>
-        )}
-
-        {connected && !qrValue && (
-          <p className="text-sm text-emerald-500 font-medium">
-            ✅ WhatsApp conectado correctamente. El bot ya puede responder.
-          </p>
-        )}
-
-        {!connected && (
-          <p className="text-sm text-yellow-500">
-            Esperando conexión... si es la primera vez, escanea el QR desde tu
-            WhatsApp.
-          </p>
-        )}
-
-        {qrImageUrl && (
-          <div className="mt-4 flex flex-col items-center gap-2">
-            <img
-              src={qrImageUrl}
-              alt="QR de WhatsApp"
-              className="rounded-xl border bg-white"
-            />
-            <p className="text-xs text-muted-foreground text-center max-w-xs">
-              Abre WhatsApp en tu teléfono &gt; Dispositivos vinculados &gt;
-              Vincular un dispositivo, y escanea este código.
+      <div className="border rounded-xl p-4 space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium">Estado de WhatsApp</p>
+            <p className="text-xs text-muted-foreground">
+              {status === "connected" && "Conectado ✅"}
+              {status === "disconnected" && "No conectado"}
+              {status === "connecting" && "Conectando…"}
+              {status === "qrcode" && "Escanea el código para conectar"}
+              {status === "error" && "Error en la sesión"}
             </p>
+          </div>
+
+          <div className="flex gap-2">
+            {status !== "connected" && (
+              <Button
+                size="sm"
+                disabled={loading || !tenantId}
+                onClick={() => handleAction("connect")}
+              >
+                {loading ? "Conectando..." : "Conectar WhatsApp"}
+              </Button>
+            )}
+            {status === "connected" && (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={loading}
+                onClick={() => handleAction("disconnect")}
+              >
+                Desconectar
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {status === "connected" && (
+          <div className="text-sm text-muted-foreground border-t pt-3">
+            <p>
+              Número conectado:{" "}
+              <span className="font-medium">{session?.phone_number || "N/D"}</span>
+            </p>
+            {session?.last_connected_at && (
+              <p className="text-xs">
+                Última conexión:{" "}
+                {new Date(session.last_connected_at).toLocaleString()}
+              </p>
+            )}
           </div>
         )}
 
-        {status?.message && (
-          <p className="text-xs text-muted-foreground mt-2">
-            {status.message}
-          </p>
+        {status === "qrcode" && (
+          <div className="flex flex-col items-center justify-center gap-3 border-t pt-3">
+            <p className="text-sm text-muted-foreground">
+              Abre WhatsApp en tu teléfono &gt; Dispositivos vinculados &gt; Vincular
+              dispositivo.
+            </p>
+
+            {session?.qr_svg ? (
+              <div
+                className="bg-white p-2 rounded-md"
+                dangerouslySetInnerHTML={{ __html: session.qr_svg }}
+              />
+            ) : session?.qr_data ? (
+              <div className="text-xs text-center text-muted-foreground">
+                QR recibido (usar componente de QR en el frontend).
+              </div>
+            ) : (
+              <div className="text-xs text-muted-foreground">
+                Generando código QR…
+              </div>
+            )}
+          </div>
         )}
       </div>
     </div>

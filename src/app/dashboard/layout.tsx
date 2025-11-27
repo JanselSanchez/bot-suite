@@ -17,6 +17,7 @@ import {
   Activity,
   LogOut,
   Bell,
+  MessageCircle,
 } from "lucide-react";
 
 import Logo from "@/img/logo4.png";
@@ -35,6 +36,8 @@ const LINKS = [
   { href: "/dashboard/reschedule", label: "Reprogramar", icon: RefreshCw },
   { href: "/dashboard/availability", label: "Disponibilidad", icon: Clock },
   { href: "/dashboard/templates", label: "Plantillas", icon: Layers },
+  // 👇 LINK NUEVO CORREGIDO
+  { href: "/dashboard/connect-whatsapp", label: "QR WhatsApp", icon: MessageCircle },
   { href: "/dashboard/status", label: "Estado", icon: Activity },
   { href: "/dashboard/settings", label: "Configuración", icon: Settings },
 ];
