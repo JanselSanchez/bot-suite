@@ -1,10 +1,11 @@
 // src/app/dashboard/connect-whatsapp/page.tsx
 "use client";
 
-import { Button } from "@/componentes/ui/button";
-import { Separator } from "@radix-ui/react-separator";
 import { useEffect, useState } from "react";
 import QRCode from "react-qr-code";
+import { Separator } from "@radix-ui/react-separator";
+import { Button } from "@/componentes/ui/button";
+import { useActiveTenant } from "@/app/providers/active-tenant";
 
 type ServerStatus = {
   ok: boolean;
@@ -38,7 +39,6 @@ type ActiveTenantResponse = {
   tenantId: string | null;
   tenantName?: string | null;
 
-  // NUEVOS CAMPOS (venir de la API /api/admin/tenants/activate)
   waConnected?: boolean;
   waPhone?: string | null;
   waLastConnectedAt?: string | null;
@@ -47,13 +47,12 @@ type ActiveTenantResponse = {
 };
 
 export default function ConnectWhatsAppPage() {
+  const { tenantId, loading: loadingTenant } = useActiveTenant();
+
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [serverLoading, setServerLoading] = useState(true);
 
-  const [tenantId, setTenantId] = useState<string | null>(null);
   const [tenantName, setTenantName] = useState<string | null>(null);
-
-  // estado de WhatsApp a nivel de tenant (columna tenants.wa_connected, etc.)
   const [tenantWaConnected, setTenantWaConnected] = useState(false);
   const [tenantWaPhone, setTenantWaPhone] = useState<string | null>(null);
   const [tenantWaLastConnectedAt, setTenantWaLastConnectedAt] = useState<
@@ -69,7 +68,6 @@ export default function ConnectWhatsAppPage() {
   // 1) Estado global del servidor WA
   async function fetchServerStatus() {
     try {
-      // ahora usamos el endpoint interno que arranca Baileys
       const res = await fetch("/api/wa/status", { cache: "no-store" });
       const json = await res.json();
 
@@ -86,8 +84,17 @@ export default function ConnectWhatsAppPage() {
     }
   }
 
-  // 2) Tenant activo (cookie pyme.active_tenant)
+  // 2) Datos del tenant (nombre + estado WA guardado en BD)
   async function fetchActiveTenant() {
+    // si aún no sabemos qué tenant está activo, reseteamos y salimos
+    if (!tenantId) {
+      setTenantName(null);
+      setTenantWaConnected(false);
+      setTenantWaPhone(null);
+      setTenantWaLastConnectedAt(null);
+      return;
+    }
+
     try {
       const res = await fetch("/api/admin/tenants/activate", {
         cache: "no-store",
@@ -95,15 +102,11 @@ export default function ConnectWhatsAppPage() {
       const json = (await res.json()) as ActiveTenantResponse;
 
       if (json.ok && json.tenantId) {
-        setTenantId(json.tenantId);
         setTenantName(json.tenantName ?? json.tenantId);
-
-        // 👉 aquí leemos el estado real de WhatsApp del tenant
         setTenantWaConnected(!!json.waConnected);
         setTenantWaPhone(json.waPhone ?? null);
         setTenantWaLastConnectedAt(json.waLastConnectedAt ?? null);
       } else {
-        setTenantId(null);
         setTenantName(null);
         setTenantWaConnected(false);
         setTenantWaPhone(null);
@@ -111,7 +114,6 @@ export default function ConnectWhatsAppPage() {
       }
     } catch (err) {
       console.error("[ConnectWhatsApp] fetchActiveTenant error:", err);
-      setTenantId(null);
       setTenantName(null);
       setTenantWaConnected(false);
       setTenantWaPhone(null);
@@ -162,7 +164,6 @@ export default function ConnectWhatsAppPage() {
       }
 
       await fetchSession();
-      // después de conectar/desconectar, refrescamos también el tenant
       await fetchActiveTenant();
     } catch (err: any) {
       console.error("[ConnectWhatsApp] handleAction error:", err);
@@ -172,43 +173,41 @@ export default function ConnectWhatsAppPage() {
     }
   }
 
-  // Cargar servidor + tenant al montar
+  // Cargar servidor + tenant + sesión cuando cambia el tenant activo
   useEffect(() => {
+    if (loadingTenant) return;
+
+    // al cambiar de negocio limpiamos la sesión previa
+    setSession(null);
+    setSessionError(null);
+
     fetchServerStatus();
     fetchActiveTenant();
+    fetchSession();
 
+    // polling cada 5s SOLO para el tenant actual
     const id = setInterval(() => {
       fetchServerStatus();
-      fetchSession();
       fetchActiveTenant();
+      fetchSession();
     }, 5000);
 
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [tenantId, loadingTenant]);
 
-  // Cuando cambie el tenant → cargar su sesión
-  useEffect(() => {
-    if (!tenantId) return;
-    fetchSession();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenantId]);
-
-  // 🟣 ahora considerar "servidor online" = la API responde ok,
-  // aunque la sesión de WhatsApp esté en waiting_qr / starting.
   const isServerOnline = !!serverStatus?.ok;
 
   const rawStatus: SessionStatus = session?.status ?? "disconnected";
+  const hasQr = !!session?.qr_data;
 
-  // 👉 verdad absoluta de conexión:
-  // - si el tenant dice que está conectado, creemos al tenant
-  // - si no, miramos el status de la sesión
-  const isConnected = tenantWaConnected || rawStatus === "connected";
+  // Si hay QR disponible, asumimos que aún NO está conectado aunque waConnected
+  const isConnected =
+    !hasQr && (tenantWaConnected || rawStatus === "connected");
 
-  // mostrar QR solo si NO está conectado
-  const showQr = !isConnected && rawStatus === "qrcode" && !!session?.qr_data;
+  // Mostrar QR siempre que exista qr_data y no esté conectado
+  const showQr = hasQr && !isConnected;
 
-  // datos del número conectado (primero tenant, luego sesión)
   const connectedPhone = tenantWaPhone || session?.phone_number || null;
   const connectedAt =
     tenantWaLastConnectedAt || session?.last_connected_at || null;
@@ -287,9 +286,10 @@ export default function ConnectWhatsAppPage() {
                   </p>
                 )}
 
-                {/* 👉 SOLO mostramos el texto de "no tiene WhatsApp" si REALMENTE no está conectado */}
+                {/* negocio sin WhatsApp y sin QR todavía */}
                 {!sessionLoading &&
                   !isConnected &&
+                  !showQr &&
                   rawStatus === "disconnected" && (
                     <div className="text-center">
                       <p className="text-slate-300 text-sm mb-2">
@@ -309,20 +309,23 @@ export default function ConnectWhatsAppPage() {
                     </div>
                   )}
 
+                {/* mientras Baileys está creando la sesión */}
                 {!sessionLoading &&
                   !isConnected &&
+                  !showQr &&
                   rawStatus === "connecting" && (
                     <div className="text-center">
                       <p className="text-slate-300 text-sm mb-2">
                         Inicializando conexión con WhatsApp...
                       </p>
                       <p className="text-xs text-slate-500">
-                        Si esto tarda más de 30 segundos, reinicia el servidor
-                        de WhatsApp o contacta soporte.
+                        Puede tardar unos segundos mientras se genera el código
+                        QR para este negocio.
                       </p>
                     </div>
                   )}
 
+                {/* QR listo para este negocio */}
                 {!sessionLoading && showQr && (
                   <>
                     <p className="text-sm text-slate-300 mb-3 text-center">
@@ -343,7 +346,7 @@ export default function ConnectWhatsAppPage() {
                   </>
                 )}
 
-                {/* 👉 Bloque para negocio ya conectado (usa tenant.wa_connected) */}
+                {/* negocio ya conectado */}
                 {!sessionLoading && isConnected && (
                   <div className="text-center">
                     <p className="text-emerald-400 font-medium mb-2">
@@ -368,6 +371,7 @@ export default function ConnectWhatsAppPage() {
                   </div>
                 )}
 
+                {/* error de sesión */}
                 {!sessionLoading &&
                   !showQr &&
                   !isConnected &&
@@ -425,8 +429,8 @@ export default function ConnectWhatsAppPage() {
               className="mt-2 border-slate-700 text-slate-200 hover:bg-slate-800"
               onClick={() => {
                 fetchServerStatus();
-                fetchSession();
                 fetchActiveTenant();
+                fetchSession();
               }}
             >
               Refrescar ahora
