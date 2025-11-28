@@ -8,7 +8,7 @@ import QRCode from "react-qr-code";
 
 type ServerStatus = {
   ok: boolean;
-  status: "online" | "offline";
+  status: "online" | "waiting_qr" | "starting" | "offline" | string;
 };
 
 type SessionStatus =
@@ -69,9 +69,14 @@ export default function ConnectWhatsAppPage() {
   // 1) Estado global del servidor WA
   async function fetchServerStatus() {
     try {
-      const res = await fetch("/api/wa", { cache: "no-store" });
-      const json = (await res.json()) as ServerStatus;
-      setServerStatus(json);
+      // ahora usamos el endpoint interno que arranca Baileys
+      const res = await fetch("/api/wa/status", { cache: "no-store" });
+      const json = await res.json();
+
+      setServerStatus({
+        ok: json.ok ?? false,
+        status: (json.status as ServerStatus["status"]) ?? "offline",
+      });
     } catch (err) {
       console.error("[ConnectWhatsApp] fetchServerStatus error:", err);
       setServerStatus({ ok: false, status: "offline" });
@@ -189,8 +194,9 @@ export default function ConnectWhatsAppPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId]);
 
-  const isServerOnline =
-    !!serverStatus?.ok && serverStatus.status === "online";
+  // 🟣 ahora considerar "servidor online" = la API responde ok,
+  // aunque la sesión de WhatsApp esté en waiting_qr / starting.
+  const isServerOnline = !!serverStatus?.ok;
 
   const rawStatus: SessionStatus = session?.status ?? "disconnected";
 
@@ -282,36 +288,40 @@ export default function ConnectWhatsAppPage() {
                 )}
 
                 {/* 👉 SOLO mostramos el texto de "no tiene WhatsApp" si REALMENTE no está conectado */}
-                {!sessionLoading && !isConnected && rawStatus === "disconnected" && (
-                  <div className="text-center">
-                    <p className="text-slate-300 text-sm mb-2">
-                      Este negocio aún no tiene WhatsApp vinculado.
-                    </p>
-                    <p className="text-xs text-slate-500 mb-3">
-                      Pulsa el botón para iniciar la vinculación y generar un
-                      código QR único para este negocio.
-                    </p>
-                    <Button
-                      size="sm"
-                      disabled={!isServerOnline}
-                      onClick={() => handleAction("connect")}
-                    >
-                      Conectar WhatsApp
-                    </Button>
-                  </div>
-                )}
+                {!sessionLoading &&
+                  !isConnected &&
+                  rawStatus === "disconnected" && (
+                    <div className="text-center">
+                      <p className="text-slate-300 text-sm mb-2">
+                        Este negocio aún no tiene WhatsApp vinculado.
+                      </p>
+                      <p className="text-xs text-slate-500 mb-3">
+                        Pulsa el botón para iniciar la vinculación y generar un
+                        código QR único para este negocio.
+                      </p>
+                      <Button
+                        size="sm"
+                        disabled={!isServerOnline}
+                        onClick={() => handleAction("connect")}
+                      >
+                        Conectar WhatsApp
+                      </Button>
+                    </div>
+                  )}
 
-                {!sessionLoading && !isConnected && rawStatus === "connecting" && (
-                  <div className="text-center">
-                    <p className="text-slate-300 text-sm mb-2">
-                      Inicializando conexión con WhatsApp...
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      Si esto tarda más de 30 segundos, reinicia el servidor de
-                      WhatsApp o contacta soporte.
-                    </p>
-                  </div>
-                )}
+                {!sessionLoading &&
+                  !isConnected &&
+                  rawStatus === "connecting" && (
+                    <div className="text-center">
+                      <p className="text-slate-300 text-sm mb-2">
+                        Inicializando conexión con WhatsApp...
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        Si esto tarda más de 30 segundos, reinicia el servidor
+                        de WhatsApp o contacta soporte.
+                      </p>
+                    </div>
+                  )}
 
                 {!sessionLoading && showQr && (
                   <>
