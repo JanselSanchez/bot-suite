@@ -14,28 +14,54 @@ const sb = createClient(
 // Canal fijo (solo WhatsApp)
 const DEFAULT_CHANNEL = "whatsapp" as const;
 
-// Eventos “modo empleado”
+// Eventos (clave que se guarda en message_templates.event)
 type EventKey =
   | "booking_confirmed"
   | "booking_rescheduled"
   | "booking_cancelled"
   | "reminder"
-  | "payment_required";
+  | "payment_pending"
+  | "pricing_pitch"; // 👈 NUEVO
 
 const EVENT_OPTS: ReadonlyArray<{
   value: EventKey;
   label: string;
   hint: string;
 }> = [
-  { value: "booking_confirmed",   label: "Cita CONFIRMADA",   hint: "Se envía cuando la cita queda confirmada." },
-  { value: "booking_rescheduled", label: "Cita REPROGRAMADA", hint: "Se envía cuando cambias fecha/hora de una cita." },
-  { value: "booking_cancelled",   label: "Cita CANCELADA",    hint: "Se envía cuando se cancela una cita." },
-  { value: "reminder",            label: "Recordatorio",      hint: "Se envía horas antes de la cita (automático)." },
-  { value: "payment_required",    label: "Pago pendiente",    hint: "Se envía para cobrar antes o después del servicio." },
+  {
+    value: "booking_confirmed",
+    label: "Cita CONFIRMADA",
+    hint: "Se envía cuando la cita queda confirmada.",
+  },
+  {
+    value: "booking_rescheduled",
+    label: "Cita REPROGRAMADA",
+    hint: "Se envía cuando se mueve una cita.",
+  },
+  {
+    value: "booking_cancelled",
+    label: "Cita CANCELADA",
+    hint: "Se envía cuando se cancela una cita.",
+  },
+  {
+    value: "reminder",
+    label: "Recordatorio",
+    hint: "Recordatorio antes de la cita.",
+  },
+  {
+    value: "payment_pending",
+    label: "Pago pendiente",
+    hint: "Cuando falta completar el pago.",
+  },
+  {
+    value: "pricing_pitch",
+    label: "Info de planes / precios",
+    hint: "Se envía cuando el bot explica tus planes y precios.",
+  }, // 👈 NUEVO
 ];
 
 const VERTICALS = ["general", "restaurante", "salon", "peluqueria", "clinica"] as const;
-type Vertical = typeof VERTICALS[number];
+type Vertical = (typeof VERTICALS)[number];
 
 const PRESETS: Record<Vertical, Partial<Record<EventKey, string>>> = {
   general: {
@@ -229,7 +255,9 @@ export default function TemplatesPage() {
       .eq("id", row.id)
       .eq("tenant_id", row.tenant_id);
     if (!error) {
-      setRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, active: !r.active } : r)));
+      setRows((prev) =>
+        prev.map((r) => (r.id === row.id ? { ...r, active: !r.active } : r))
+      );
     }
   }
 
@@ -243,9 +271,8 @@ export default function TemplatesPage() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  const currentEventMeta = EVENT_OPTS.find((o) => o.value === event)!;
-  const labelFromValue = (val: string) =>
-    EVENT_OPTS.find((o) => o.value === (val as EventKey))?.label ?? val;
+  const currentEventMeta =
+    EVENT_OPTS.find((o) => o.value === event) ?? EVENT_OPTS[0];
 
   return (
     <div className="p-6 md:p-8 space-y-6">
@@ -279,7 +306,9 @@ export default function TemplatesPage() {
                 onClick={() => setVertical(v)}
                 className={[
                   "px-3 py-1.5 rounded-full border text-sm transition",
-                  vertical === v ? "bg-black text-white border-black" : "hover:bg-gray-50",
+                  vertical === v
+                    ? "bg-black text-white border-black"
+                    : "hover:bg-gray-50",
                 ].join(" ")}
               >
                 {v}
@@ -356,7 +385,11 @@ export default function TemplatesPage() {
 
         <div className="flex items-center justify-between">
           <label className="inline-flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={active} onChange={(e) => setActive(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={active}
+              onChange={(e) => setActive(e.target.checked)}
+            />
             Activo
           </label>
 
@@ -392,7 +425,9 @@ export default function TemplatesPage() {
                 onClick={async () => {
                   try {
                     await navigator.clipboard.writeText(preview);
-                  } catch {}
+                  } catch {
+                    // ignore
+                  }
                 }}
                 className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 hover:bg-gray-50"
               >
@@ -401,12 +436,14 @@ export default function TemplatesPage() {
             </div>
           </>
         ) : (
-          <p className="text-sm text-gray-500">Genera un preview para ver el resultado.</p>
+          <p className="text-sm text-gray-500">
+            Genera un preview para ver el resultado.
+          </p>
         )}
       </div>
 
       {/* Listado */}
-      <div className="rounded-2xl border bg-white/70 backdrop-blur p-5 shadow-sm">
+      <div className="rounded-2xl border bg_WHITE/70 backdrop-blur p-5 shadow-sm">
         <div className="flex items-center justify-between mb-3">
           <h2 className="font-semibold">Plantillas guardadas</h2>
           <span className="text-xs text-gray-500">
@@ -436,7 +473,11 @@ export default function TemplatesPage() {
               {rows.map((r) => (
                 <tr key={r.id} className="border-t hover:bg-gray-50/60">
                   <td className="p-3">
-                    {EVENT_OPTS.find((o) => o.value === (r.event as EventKey))?.label ?? r.event}
+                    {
+                      EVENT_OPTS.find(
+                        (o) => o.value === (r.event as EventKey)
+                      )?.label ?? r.event
+                    }
                   </td>
                   <td className="p-3">{r.name ?? "—"}</td>
                   <td className="p-3">
@@ -444,17 +485,23 @@ export default function TemplatesPage() {
                       onClick={() => toggleActive(r)}
                       className={[
                         "inline-flex items-center gap-1 rounded-full px-2.5 py-1 border text-xs",
-                        r.active ? "bg-emerald-600 text-white border-emerald-600" : "bg-white",
+                        r.active
+                          ? "bg-emerald-600 text-white border-emerald-600"
+                          : "bg-white",
                       ].join(" ")}
                       title="Activar/Desactivar"
                     >
-                      {r.active ? <Check className="w-3.5 h-3.5" /> : null}
+                      {r.active ? (
+                        <Check className="w-3.5 h-3.5" />
+                      ) : null}
                       {r.active ? "Activo" : "—"}
                     </button>
                   </td>
                   <td className="p-3">
                     <div className="text-gray-700">
-                      {r.body.length > 140 ? `${r.body.slice(0, 140)}…` : r.body}
+                      {r.body.length > 140
+                        ? `${r.body.slice(0, 140)}…`
+                        : r.body}
                     </div>
                   </td>
                   <td className="p-3">
@@ -466,7 +513,9 @@ export default function TemplatesPage() {
                         Editar
                       </button>
                       <button
-                        onClick={() => setPreview(renderTemplate(r.body || "", sampleData))}
+                        onClick={() =>
+                          setPreview(renderTemplate(r.body || "", sampleData))
+                        }
                         className="text-xs rounded-xl border px-2.5 py-1.5 hover:bg-gray-50"
                       >
                         Ver
@@ -488,8 +537,9 @@ export default function TemplatesPage() {
         </div>
 
         <p className="text-xs text-gray-500 mt-3">
-          Tip: crea una plantilla por evento. Para mensajes iniciados fuera de la ventana de 24 h
-          de WhatsApp, usa plantillas aprobadas en tu proveedor.
+          Tip: crea una plantilla por evento. Para mensajes iniciados fuera de
+          la ventana de 24 h de WhatsApp, usa plantillas aprobadas en tu
+          proveedor.
         </p>
       </div>
     </div>

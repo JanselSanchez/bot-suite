@@ -1,9 +1,18 @@
 // src/server/intents.ts
 import { createClient } from "@supabase/supabase-js";
 
-export type Intent = "book" | "cancel" | "reschedule" | "confirm" | "unknown";
+export type Intent =
+  | "book"
+  | "cancel"
+  | "reschedule"
+  | "confirm"
+  | "pricing"   // 👈 NUEVO: preguntar por planes / precios
+  | "unknown";
 
-export async function detectIntentBasic(text: string, tenantId?: string): Promise<Intent> {
+export async function detectIntentBasic(
+  text: string,
+  tenantId?: string
+): Promise<Intent> {
   const clean = text
     .toLowerCase()
     .normalize("NFD")
@@ -21,13 +30,19 @@ export async function detectIntentBasic(text: string, tenantId?: string): Promis
     .or(`tenant_id.eq.${tenantId ?? "null"},tenant_id.is.null`);
 
   if (error) {
-    console.error("[detectIntent] error:", error);
+    console.error("[detectIntentBasic] error:", error);
     return "unknown";
   }
 
   for (const row of data ?? []) {
-    const term = row.term.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-    if (clean.includes(term)) return row.intent as Intent;
+    const term = row.term
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/\p{Diacritic}/gu, "");
+
+    if (clean.includes(term)) {
+      return row.intent as Intent;
+    }
   }
 
   return "unknown";
