@@ -57,7 +57,7 @@ const EVENT_OPTS: ReadonlyArray<{
     value: "pricing_pitch",
     label: "Info de planes / precios",
     hint: "Se envía cuando el bot explica tus planes y precios.",
-  }, // 👈 NUEVO
+  },
 ];
 
 const VERTICALS = ["general", "restaurante", "salon", "peluqueria", "clinica"] as const;
@@ -135,25 +135,14 @@ export default function TemplatesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId, loadingTenant]);
 
-  // 🔧 Resuelve tenant en caliente (arregla el botón Refrescar)
-  async function resolveTenantId(): Promise<string | null> {
-    if (tenantId) return tenantId;
-    const { data: auth } = await sb.auth.getUser();
-    const user = auth?.user;
-    if (!user) return null;
-    const { data: tu } = await sb
-      .from("tenant_users")
-      .select("tenant_id")
-      .eq("user_id", user.id)
-      .order("role", { ascending: true })
-      .limit(1)
-      .maybeSingle();
-    return tu?.tenant_id ?? null;
+  /** 🔧 Usar SIEMPRE el tenant del contexto */
+  function resolveTenantId(): string | null {
+    return tenantId ?? null;
   }
 
   async function load() {
     setLoading(true);
-    const tId = await resolveTenantId();
+    const tId = resolveTenantId();
     if (!tId) {
       setRows([]);
       setLoading(false);
@@ -221,8 +210,11 @@ export default function TemplatesPage() {
   }
 
   async function save() {
-    const tId = await resolveTenantId();
-    if (!tId) return;
+    const tId = resolveTenantId();
+    if (!tId) {
+      alert("No hay tenant activo.");
+      return;
+    }
 
     const payload = {
       id: idEditing ?? undefined,
@@ -236,14 +228,16 @@ export default function TemplatesPage() {
 
     const { data, error } = await sb
       .from("message_templates")
-      .upsert(payload as any, { onConflict: "tenant_id,channel,event" })
+      .upsert(payload, { onConflict: "id" })
       .select("id")
       .single();
 
     if (error) {
+      console.error("[templates/save] error:", error);
       alert("No se pudo guardar la plantilla.");
       return;
     }
+
     setIdEditing(data?.id ?? null);
     await load();
   }
@@ -254,6 +248,7 @@ export default function TemplatesPage() {
       .update({ active: !row.active })
       .eq("id", row.id)
       .eq("tenant_id", row.tenant_id);
+
     if (!error) {
       setRows((prev) =>
         prev.map((r) => (r.id === row.id ? { ...r, active: !r.active } : r))
@@ -443,7 +438,7 @@ export default function TemplatesPage() {
       </div>
 
       {/* Listado */}
-      <div className="rounded-2xl border bg_WHITE/70 backdrop-blur p-5 shadow-sm">
+      <div className="rounded-2xl border bg-white/70 backdrop-blur p-5 shadow-sm">
         <div className="flex items-center justify-between mb-3">
           <h2 className="font-semibold">Plantillas guardadas</h2>
           <span className="text-xs text-gray-500">
