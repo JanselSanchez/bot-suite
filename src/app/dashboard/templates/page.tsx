@@ -79,7 +79,7 @@ const PRESETS: Record<Vertical, Partial<Record<EventKey, string>>> = {
   salon: {
     booking_confirmed:
       "¡Cita lista! {{customer_name}}, te esperamos el {{date}} a las {{time}} con {{resource_name}} ✨",
-    reminder:
+     reminder:
       "Beauty reminder: {{date}} {{time}} con {{resource_name}}. ¿Reprogramar? {{payment_link}}",
   },
   peluqueria: {
@@ -94,7 +94,6 @@ const PRESETS: Record<Vertical, Partial<Record<EventKey, string>>> = {
   },
 };
 
-// Estructura real de la tabla message_templates (con tenant)
 type TemplateRow = {
   id: string;
   tenant_id: string;
@@ -104,8 +103,6 @@ type TemplateRow = {
   body: string;
   active: boolean;
   created_at: string;
-  vertical?: string | null;
-  created_by?: string | null;
 };
 
 const VARIABLE_HINTS = [
@@ -130,6 +127,7 @@ export default function TemplatesPage() {
   const [body, setBody] = useState<string>("");
   const [active, setActive] = useState<boolean>(true);
   const [preview, setPreview] = useState<string>("");
+  const [success, setSuccess] = useState<string | null>(null);
 
   const bodyRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -138,7 +136,7 @@ export default function TemplatesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId, loadingTenant]);
 
-  /** Siempre usamos el tenant del contexto */
+  /** 🔧 Usar SIEMPRE el tenant del contexto */
   function resolveTenantId(): string | null {
     return tenantId ?? null;
   }
@@ -151,24 +149,14 @@ export default function TemplatesPage() {
       setLoading(false);
       return;
     }
-
     const { data, error } = await sb
       .from("message_templates")
-      .select(
-        "id, tenant_id, channel, event, name, body, active, created_at, vertical, created_by"
-      )
+      .select("id, tenant_id, channel, event, name, body, active, created_at")
       .eq("tenant_id", tId)
       .eq("channel", DEFAULT_CHANNEL)
       .order("event", { ascending: true });
 
-    if (error) {
-      console.error("[templates/load] error:", error);
-      setRows([]);
-      setLoading(false);
-      return;
-    }
-
-    setRows((data ?? []) as TemplateRow[]);
+    if (!error && data) setRows(data as TemplateRow[]);
     setLoading(false);
   }
 
@@ -228,29 +216,23 @@ export default function TemplatesPage() {
       alert("No hay tenant activo.");
       return;
     }
-    if (!body.trim()) {
-      alert("El mensaje no puede estar vacío.");
-      return;
-    }
 
-    // Payload base con tenant obligatorio
-    const basePayload = {
+    setSuccess(null);
+    const isNew = !idEditing;
+
+    const payload = {
+      id: idEditing ?? undefined,
       tenant_id: tId,
       channel: DEFAULT_CHANNEL,
       event,
       name: name || null,
       body,
       active,
-      vertical,
-      created_by: "dashboard",
     };
-
-    const payload = idEditing ? { ...basePayload, id: idEditing } : basePayload;
 
     const { data, error } = await sb
       .from("message_templates")
-      // único por tenant+channel+event
-      .upsert(payload as any, { onConflict: "tenant_id,channel,event" })
+      .upsert(payload, { onConflict: "id" })
       .select("id")
       .single();
 
@@ -261,6 +243,15 @@ export default function TemplatesPage() {
     }
 
     setIdEditing(data?.id ?? null);
+
+    // Si es nueva, limpiamos el formulario
+    if (isNew) {
+      resetForm();
+    }
+
+    setSuccess("Plantilla guardada correctamente.");
+    setTimeout(() => setSuccess(null), 3000);
+
     await load();
   }
 
@@ -283,12 +274,8 @@ export default function TemplatesPage() {
     setName(row.name ?? "");
     setBody(row.body);
     setActive(row.active);
-    setEvent(row.event as EventKey);
-    if (row.vertical && (VERTICALS as readonly string[]).includes(row.vertical)) {
-      setVertical(row.vertical as Vertical);
-    } else {
-      setVertical("general");
-    }
+    const ev = EVENT_OPTS.find((e) => e.value === (row.event as EventKey))?.value;
+    if (ev) setEvent(ev);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -356,7 +343,7 @@ export default function TemplatesPage() {
             <span>{currentEventMeta.hint}</span>
           </div>
 
-          <div className="mt-3">
+          <div className="mt-3 flex items-center gap-3">
             <button
               onClick={applyPreset}
               className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 hover:bg-gray-50"
@@ -365,6 +352,11 @@ export default function TemplatesPage() {
               <Wand2 className="w-4 h-4" />
               Aplicar sugerencia
             </button>
+            {success && (
+              <span className="text-xs text-emerald-600">
+                {success}
+              </span>
+            )}
           </div>
         </div>
       </div>
@@ -512,7 +504,9 @@ export default function TemplatesPage() {
                       ].join(" ")}
                       title="Activar/Desactivar"
                     >
-                      {r.active ? <Check className="w-3.5 h-3.5" /> : null}
+                      {r.active ? (
+                        <Check className="w-3.5 h-3.5" />
+                      ) : null}
                       {r.active ? "Activo" : "—"}
                     </button>
                   </td>
