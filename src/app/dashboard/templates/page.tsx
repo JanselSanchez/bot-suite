@@ -3,7 +3,6 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
-import { useActiveTenant } from "@/app/providers/active-tenant";
 import { RefreshCcw, Wand2, Save, Eye, Copy, Check, Info } from "lucide-react";
 
 const sb = createClient(
@@ -11,17 +10,14 @@ const sb = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-// Canal fijo (solo WhatsApp)
-const DEFAULT_CHANNEL = "whatsapp" as const;
-
-// Eventos (clave que se guarda en message_templates.event)
+// Eventos lógicos que usaremos EN LA UI
 type EventKey =
   | "booking_confirmed"
   | "booking_rescheduled"
   | "booking_cancelled"
   | "reminder"
   | "payment_pending"
-  | "pricing_pitch"; // 👈 NUEVO
+  | "pricing_pitch";
 
 const EVENT_OPTS: ReadonlyArray<{
   value: EventKey;
@@ -63,6 +59,7 @@ const EVENT_OPTS: ReadonlyArray<{
 const VERTICALS = ["general", "restaurante", "salon", "peluqueria", "clinica"] as const;
 type Vertical = (typeof VERTICALS)[number];
 
+// Usamos PRESETS igual que antes (solo para rellenar rápido el body)
 const PRESETS: Record<Vertical, Partial<Record<EventKey, string>>> = {
   general: {
     booking_confirmed:
@@ -94,15 +91,14 @@ const PRESETS: Record<Vertical, Partial<Record<EventKey, string>>> = {
   },
 };
 
+// 👇 ESTA INTERFAZ AHORA COINCIDE 1:1 CON TU TABLA REAL
 type TemplateRow = {
   id: string;
-  tenant_id: string;
-  channel: string;
-  event: string;
-  name: string | null;
   body: string;
   active: boolean;
   created_at: string;
+  vertical: string | null;
+  created_by: string | null;
 };
 
 const VARIABLE_HINTS = [
@@ -114,16 +110,15 @@ const VARIABLE_HINTS = [
 ] as const;
 
 export default function TemplatesPage() {
-  const { tenantId, loading: loadingTenant } = useActiveTenant();
-
   const [rows, setRows] = useState<TemplateRow[]>([]);
   const [loading, setLoading] = useState(false);
 
+  // estado de la UI
   const [vertical, setVertical] = useState<Vertical>("general");
   const [event, setEvent] = useState<EventKey>("booking_confirmed");
 
   const [idEditing, setIdEditing] = useState<string | null>(null);
-  const [name, setName] = useState<string>("");
+  const [name, setName] = useState<string>(""); // nombre interno SOLO en UI
   const [body, setBody] = useState<string>("");
   const [active, setActive] = useState<boolean>(true);
   const [preview, setPreview] = useState<string>("");
@@ -131,31 +126,24 @@ export default function TemplatesPage() {
   const bodyRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
-    if (!loadingTenant) void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenantId, loadingTenant]);
-
-  /** 🔧 Usar SIEMPRE el tenant del contexto */
-  function resolveTenantId(): string | null {
-    return tenantId ?? null;
-  }
+    void load();
+  }, []);
 
   async function load() {
     setLoading(true);
-    const tId = resolveTenantId();
-    if (!tId) {
+    const { data, error } = await sb
+      .from("message_templates")
+      .select("id, body, active, created_at, vertical, created_by")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("[templates/load] error:", error);
       setRows([]);
       setLoading(false);
       return;
     }
-    const { data, error } = await sb
-      .from("message_templates")
-      .select("id, tenant_id, channel, event, name, body, active, created_at")
-      .eq("tenant_id", tId)
-      .eq("channel", DEFAULT_CHANNEL)
-      .order("event", { ascending: true });
 
-    if (!error && data) setRows(data as TemplateRow[]);
+    setRows((data ?? []) as TemplateRow[]);
     setLoading(false);
   }
 
@@ -210,20 +198,19 @@ export default function TemplatesPage() {
   }
 
   async function save() {
-    const tId = resolveTenantId();
-    if (!tId) {
-      alert("No hay tenant activo.");
+    if (!body.trim()) {
+      alert("El mensaje no puede estar vacío.");
       return;
     }
 
+    // Guardamos TODO en la tabla simple:
+    // id, body, active, vertical, created_by
     const payload = {
       id: idEditing ?? undefined,
-      tenant_id: tId,
-      channel: DEFAULT_CHANNEL,
-      event,
-      name: name || null,
       body,
       active,
+      vertical, // usamos vertical para agrupar por tipo de negocio
+      created_by: "dashboard", // marca de quién creó la plantilla
     };
 
     const { data, error } = await sb
@@ -246,8 +233,7 @@ export default function TemplatesPage() {
     const { error } = await sb
       .from("message_templates")
       .update({ active: !row.active })
-      .eq("id", row.id)
-      .eq("tenant_id", row.tenant_id);
+      .eq("id", row.id);
 
     if (!error) {
       setRows((prev) =>
@@ -258,11 +244,15 @@ export default function TemplatesPage() {
 
   function startEdit(row: TemplateRow) {
     setIdEditing(row.id);
-    setName(row.name ?? "");
     setBody(row.body);
     setActive(row.active);
-    const ev = EVENT_OPTS.find((e) => e.value === (row.event as EventKey))?.value;
-    if (ev) setEvent(ev);
+    setVertical(
+      (row.vertical as Vertical | null) && VERTICALS.includes(row.vertical as Vertical)
+        ? (row.vertical as Vertical)
+        : "general"
+    );
+    // name solo vive en la UI, no lo guardamos aún en DB
+    setName(row.created_by ?? "");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -276,7 +266,7 @@ export default function TemplatesPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Plantillas</h1>
           <p className="text-sm text-gray-500">
-            Define mensajes por <b>evento</b> (canal fijo: WhatsApp).
+            Define mensajes por <b>evento</b> (usa esta pantalla solo tú).
           </p>
         </div>
         <button
@@ -313,7 +303,7 @@ export default function TemplatesPage() {
         </div>
 
         <div>
-          <label className="text-sm text-gray-700">Evento</label>
+          <label className="text-sm text-gray-700">Evento (solo referencia mental)</label>
           <select
             className="mt-1 border rounded-xl px-3 py-2 w-full"
             value={event}
@@ -349,7 +339,7 @@ export default function TemplatesPage() {
 
         <input
           className="border rounded-xl px-3 py-2 w-full"
-          placeholder="Nombre interno (opcional)"
+          placeholder="Nombre interno (solo para ti, no se guarda aún)"
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
@@ -450,8 +440,8 @@ export default function TemplatesPage() {
           <table className="w-full text-sm">
             <thead className="bg-gray-50 text-gray-600">
               <tr>
-                <th className="text-left p-3">Evento</th>
-                <th className="text-left p-3">Nombre</th>
+                <th className="text-left p-3">Vertical</th>
+                <th className="text-left p-3">Creado por</th>
                 <th className="text-left p-3">Activo</th>
                 <th className="text-left p-3">Body</th>
                 <th className="text-left p-3 w-28">Acciones</th>
@@ -467,14 +457,8 @@ export default function TemplatesPage() {
               )}
               {rows.map((r) => (
                 <tr key={r.id} className="border-t hover:bg-gray-50/60">
-                  <td className="p-3">
-                    {
-                      EVENT_OPTS.find(
-                        (o) => o.value === (r.event as EventKey)
-                      )?.label ?? r.event
-                    }
-                  </td>
-                  <td className="p-3">{r.name ?? "—"}</td>
+                  <td className="p-3">{r.vertical ?? "general"}</td>
+                  <td className="p-3">{r.created_by ?? "—"}</td>
                   <td className="p-3">
                     <button
                       onClick={() => toggleActive(r)}
@@ -486,17 +470,13 @@ export default function TemplatesPage() {
                       ].join(" ")}
                       title="Activar/Desactivar"
                     >
-                      {r.active ? (
-                        <Check className="w-3.5 h-3.5" />
-                      ) : null}
+                      {r.active ? <Check className="w-3.5 h-3.5" /> : null}
                       {r.active ? "Activo" : "—"}
                     </button>
                   </td>
                   <td className="p-3">
                     <div className="text-gray-700">
-                      {r.body.length > 140
-                        ? `${r.body.slice(0, 140)}…`
-                        : r.body}
+                      {r.body.length > 140 ? `${r.body.slice(0, 140)}…` : r.body}
                     </div>
                   </td>
                   <td className="p-3">
@@ -532,9 +512,8 @@ export default function TemplatesPage() {
         </div>
 
         <p className="text-xs text-gray-500 mt-3">
-          Tip: crea una plantilla por evento. Para mensajes iniciados fuera de
-          la ventana de 24 h de WhatsApp, usa plantillas aprobadas en tu
-          proveedor.
+          Tip: usa esta pantalla solo tú para definir los textos que luego el bot de WhatsApp
+          va a reutilizar.
         </p>
       </div>
     </div>
