@@ -10,7 +10,7 @@ const sb = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-// Eventos lógicos que usaremos EN LA UI
+// Eventos lógicos solo para la UI (no están en la tabla)
 type EventKey =
   | "booking_confirmed"
   | "booking_rescheduled"
@@ -59,7 +59,7 @@ const EVENT_OPTS: ReadonlyArray<{
 const VERTICALS = ["general", "restaurante", "salon", "peluqueria", "clinica"] as const;
 type Vertical = (typeof VERTICALS)[number];
 
-// Usamos PRESETS igual que antes (solo para rellenar rápido el body)
+// Solo para sugerencias
 const PRESETS: Record<Vertical, Partial<Record<EventKey, string>>> = {
   general: {
     booking_confirmed:
@@ -91,7 +91,7 @@ const PRESETS: Record<Vertical, Partial<Record<EventKey, string>>> = {
   },
 };
 
-// 👇 ESTA INTERFAZ AHORA COINCIDE 1:1 CON TU TABLA REAL
+// 👇 Estructura REAL de tu tabla message_templates
 type TemplateRow = {
   id: string;
   body: string;
@@ -109,16 +109,30 @@ const VARIABLE_HINTS = [
   "payment_link",
 ] as const;
 
+// Generar un uuid en el front (para cuando la tabla no tiene default)
+function generateId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  // fallback simple
+  return (
+    Math.random().toString(36).slice(2) +
+    "-" +
+    Date.now().toString(36) +
+    "-" +
+    Math.random().toString(36).slice(2)
+  );
+}
+
 export default function TemplatesPage() {
   const [rows, setRows] = useState<TemplateRow[]>([]);
   const [loading, setLoading] = useState(false);
 
-  // estado de la UI
   const [vertical, setVertical] = useState<Vertical>("general");
   const [event, setEvent] = useState<EventKey>("booking_confirmed");
 
   const [idEditing, setIdEditing] = useState<string | null>(null);
-  const [name, setName] = useState<string>(""); // nombre interno SOLO en UI
+  const [name, setName] = useState<string>(""); // solo UI
   const [body, setBody] = useState<string>("");
   const [active, setActive] = useState<boolean>(true);
   const [preview, setPreview] = useState<string>("");
@@ -203,19 +217,20 @@ export default function TemplatesPage() {
       return;
     }
 
-    // Guardamos TODO en la tabla simple:
-    // id, body, active, vertical, created_by
+    const isNew = !idEditing;
+    const finalId = isNew ? generateId() : idEditing!;
+
     const payload = {
-      id: idEditing ?? undefined,
+      id: finalId,        // 👈 siempre mandamos un id válido
       body,
       active,
-      vertical, // usamos vertical para agrupar por tipo de negocio
-      created_by: "dashboard", // marca de quién creó la plantilla
+      vertical,
+      created_by: "dashboard", // marca simple
     };
 
     const { data, error } = await sb
       .from("message_templates")
-      .upsert(payload, { onConflict: "id" })
+      .upsert(payload) // ya no usamos onConflict, PK de id se encarga
       .select("id")
       .single();
 
@@ -225,7 +240,7 @@ export default function TemplatesPage() {
       return;
     }
 
-    setIdEditing(data?.id ?? null);
+    setIdEditing(data?.id ?? finalId);
     await load();
   }
 
@@ -251,7 +266,6 @@ export default function TemplatesPage() {
         ? (row.vertical as Vertical)
         : "general"
     );
-    // name solo vive en la UI, no lo guardamos aún en DB
     setName(row.created_by ?? "");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -303,7 +317,7 @@ export default function TemplatesPage() {
         </div>
 
         <div>
-          <label className="text-sm text-gray-700">Evento (solo referencia mental)</label>
+          <label className="text-sm text-gray-700">Evento (referencia mental)</label>
           <select
             className="mt-1 border rounded-xl px-3 py-2 w-full"
             value={event}
@@ -339,7 +353,7 @@ export default function TemplatesPage() {
 
         <input
           className="border rounded-xl px-3 py-2 w-full"
-          placeholder="Nombre interno (solo para ti, no se guarda aún)"
+          placeholder="Nombre interno (solo para ti, no afecta al bot)"
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
@@ -512,8 +526,8 @@ export default function TemplatesPage() {
         </div>
 
         <p className="text-xs text-gray-500 mt-3">
-          Tip: usa esta pantalla solo tú para definir los textos que luego el bot de WhatsApp
-          va a reutilizar.
+          Tip: usa esta pantalla solo tú para definir los textos que luego el bot
+          de WhatsApp reutiliza.
         </p>
       </div>
     </div>
