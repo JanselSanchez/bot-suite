@@ -1,7 +1,10 @@
-// src/server/whatsapp/baileysManager.ts
+// src/app/server/whatsapp/baileysManager.ts
 
 /************************************************************
- * TLS: lo mantengo como lo tenías para no romper nada.
+ * ATENCIÓN:
+ * - En Render NO deberías necesitar este FIX TLS.
+ * - Pero como tu entorno a veces mete certificados raros,
+ *   lo mantenemos para no romper nada de Supabase/HTTP.
  ************************************************************/
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
@@ -9,6 +12,7 @@ import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   WASocket,
+  fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
@@ -28,12 +32,12 @@ interface SessionInfo {
   lastQr?: string;
 }
 
-// Sesiones vivas en memoria (por proceso)
+// Sesiones vivas en memoria (por proceso de Node)
 const sessions = new Map<string, SessionInfo>();
 const key = (sessionId: string) => sessionId;
 
 /**
- * Obtener info de sesión en memoria
+ * Obtener info de sesión en memoria (por si quieres debuggear)
  */
 export function getSessionInfo(sessionId: string): SessionInfo | null {
   return sessions.get(key(sessionId)) ?? null;
@@ -44,11 +48,14 @@ export function getSessionInfo(sessionId: string): SessionInfo | null {
  * y un tenantId.
  *
  * IMPORTANTE:
- * - Úsalo SOLO desde el endpoint de "conectar / iniciar sesión".
- * - El endpoint de "status" debe leer estado desde la tabla whatsapp_sessions,
- *   NO debe llamar a esta función.
+ * - Llama a esto SOLO desde el endpoint de "connect" (POST).
+ * - El endpoint de "status" NO debe llamar a esto, solo leer
+ *   de la tabla `whatsapp_sessions`.
  */
-export async function getOrCreateSession(sessionId: string, tenantId: string) {
+export async function getOrCreateSession(
+  sessionId: string,
+  tenantId: string
+): Promise<SessionInfo> {
   const k = key(sessionId);
   const existing = sessions.get(k);
   if (existing) {
@@ -75,14 +82,20 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
     throw new Error("Session not found");
   }
 
-  // 2) Auth de Baileys en disco (session por negocio)
+  // 2) Estado de auth por negocio (multi device)
   const sessionPath = `./.wa_sessions/${sessionId}`;
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-  // 3) Crear socket
+  // 3) Usar SIEMPRE la versión más reciente de WA
+  const { version } = await fetchLatestBaileysVersion();
+  console.log("[baileysManager] Usando versión WA:", version);
+
+  // 4) Crear socket con config "sana" (igual que wa-test.mjs)
   const sock = makeWASocket({
+    version,
     auth: state,
     printQRInTerminal: false,
+    browser: ["Desktop", "Chrome", "121.0.0"], // importante para pairing moderno
   });
 
   const info: SessionInfo = {
@@ -93,15 +106,6 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
   };
 
   sessions.set(k, info);
-
-  // Marcar DB como "connecting"
-  await supabaseAdmin
-    .from("whatsapp_sessions")
-    .update({
-      status: "connecting",
-      last_error: null,
-    })
-    .eq("id", sessionId);
 
   /**************************************
    * EVENTOS DE BAILEYS
@@ -116,11 +120,11 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
         sessionId,
         "connection=",
         connection,
-        "qr?=",
+        "qr?",
         !!qr
       );
 
-      // --- QR recibido ---
+      // Cuando hay un QR nuevo → lo guardamos en Supabase
       if (qr) {
         info.status = "qrcode";
         info.lastQr = qr;
@@ -137,7 +141,7 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           .eq("id", sessionId);
       }
 
-      // --- Conectado ---
+      /*********** Conectado ***********/
       if (connection === "open") {
         info.status = "connected";
 
@@ -181,11 +185,9 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           "tel:",
           phone
         );
-
-        return;
       }
 
-      // --- Cerrado ---
+      /*********** Cerrado ***********/
       if (connection === "close") {
         const statusCode = (lastDisconnect?.error as Boom | undefined)?.output
           ?.statusCode;
@@ -211,6 +213,7 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           })
           .eq("id", sessionId);
 
+        // Marcar tenant como desconectado
         await supabaseAdmin
           .from("tenants")
           .update({
@@ -218,8 +221,7 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           })
           .eq("id", tenantId);
 
-        // Limpia siempre la sesión en memoria;
-        // si se debe reconectar, se creará en el próximo getOrCreateSession.
+        // Si cerró por logout desde el celular → no reconectamos
         sessions.delete(k);
       }
     }
