@@ -1,37 +1,42 @@
-// src/app/api/wa/status/route.ts
+// src/app/api/admin/whatsapp/status/route.ts
 import { NextResponse } from "next/server";
-import { ensureWaClient, getWaStatus } from "@/server/whatsapp/runtime";
+import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
 
-export const runtime = "nodejs";
-
-export async function GET() {
+export async function GET(req: Request) {
   try {
-    // Arranca Baileys la primera vez que se llama
-    await ensureWaClient();
+    const { searchParams } = new URL(req.url);
+    const tenantId = searchParams.get("tenantId");
 
-    const status = getWaStatus();
+    if (!tenantId) {
+      return NextResponse.json(
+        { ok: false, error: "missing_tenant" },
+        { status: 400 }
+      );
+    }
 
+    const { data: session, error } = await supabaseAdmin
+      .from("whatsapp_sessions")
+      .select("id, status, qr_data, phone_number, last_connected_at")
+      .eq("tenant_id", tenantId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("[wa/status] error:", error);
+      return NextResponse.json(
+        { ok: false, error: "db_error" },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({
+      ok: true,
+      session: session ?? null,
+    });
+  } catch (e) {
+    console.error("[wa/status] exception:", e);
     return NextResponse.json(
-      {
-        ok: true,
-        online: status.ready,                 // true = conectado
-        status: status.ready ? "online" : "waiting_qr",
-        qr: status.qr,                        // si hay QR disponible
-        updatedAt: status.lastUpdate,         // ISO string
-      },
-      { status: 200 },
-    );
-  } catch (err: any) {
-    console.error("[api/wa/status] internal_error:", err);
-    return NextResponse.json(
-      {
-        ok: false,
-        online: false,
-        status: "offline",
-        error: "internal_error",
-        details: String(err?.message || err),
-      },
-      { status: 500 },
+      { ok: false, error: "internal_error" },
+      { status: 500 }
     );
   }
 }

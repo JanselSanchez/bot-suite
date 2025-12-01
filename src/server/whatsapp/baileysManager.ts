@@ -1,17 +1,18 @@
-// src/app/server/whatsapp/baileysManager.ts
+// src/server/whatsapp/baileysManager.ts
 
 /************************************************************
- * ATENCIÓN:
- * - En Render NO deberías necesitar este FIX TLS.
- * - Pero como tu entorno a veces mete certificados raros,
- *   lo mantenemos para no romper nada de Supabase/HTTP.
+ * IMPORTANTE
+ * - Este manager se usa SOLO en el backend (Next API routes).
+ * - Cada tenant tiene SU PROPIA sesión (sessionId en whatsapp_sessions).
+ * - El QR se emite UNA sola vez por sesión activa y se actualiza
+ *   sólo cuando Baileys lo renueva.
  ************************************************************/
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   WASocket,
+  Browsers,
   fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
@@ -32,12 +33,35 @@ interface SessionInfo {
   lastQr?: string;
 }
 
-// Sesiones vivas en memoria (por proceso de Node)
+/**
+ * En PRODUCCIÓN (Render) NO deberías necesitar esto.
+ * Si lo necesitas por un proxy raro, configura la var de entorno
+ * en Render: NODE_TLS_REJECT_UNAUTHORIZED=0
+ * y borra esta línea.
+ */
+// process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+// Sesiones vivas en memoria (por proceso)
 const sessions = new Map<string, SessionInfo>();
 const key = (sessionId: string) => sessionId;
 
+// Cache de versión WA para no llamar a fetchLatestBaileysVersion muchas veces
+let waVersionPromise: Promise<{ version: [number, number, number] }> | null =
+  null;
+
+async function getWaVersion() {
+  if (!waVersionPromise) {
+    waVersionPromise = fetchLatestBaileysVersion().catch((err) => {
+      console.error("[baileysManager] Error obteniendo versión WA:", err);
+      // fallback a una versión estable conocida
+      return { version: [2, 3000, 1027934701] as [number, number, number] };
+    });
+  }
+  return waVersionPromise;
+}
+
 /**
- * Obtener info de sesión en memoria (por si quieres debuggear)
+ * Obtener info de sesión en memoria (por si quieres leer estado desde otro sitio)
  */
 export function getSessionInfo(sessionId: string): SessionInfo | null {
   return sessions.get(key(sessionId)) ?? null;
@@ -47,15 +71,16 @@ export function getSessionInfo(sessionId: string): SessionInfo | null {
  * Crea o recupera una sesión Baileys asociada a un sessionId (uuid)
  * y un tenantId.
  *
- * IMPORTANTE:
- * - Llama a esto SOLO desde el endpoint de "connect" (POST).
- * - El endpoint de "status" NO debe llamar a esto, solo leer
- *   de la tabla `whatsapp_sessions`.
+ * ⚠️ USAR SOLO DESDE:
+ *   - /api/admin/whatsapp/connect  (cuando el user hace click en "Conectar")
+ *
+ * ❌ NO USAR DESDE:
+ *   - /status
+ *   - ningún polling
+ *
+ * El status debe leerse SIEMPRE desde la tabla whatsapp_sessions.
  */
-export async function getOrCreateSession(
-  sessionId: string,
-  tenantId: string
-): Promise<SessionInfo> {
+export async function getOrCreateSession(sessionId: string, tenantId: string) {
   const k = key(sessionId);
   const existing = sessions.get(k);
   if (existing) {
@@ -82,20 +107,20 @@ export async function getOrCreateSession(
     throw new Error("Session not found");
   }
 
-  // 2) Estado de auth por negocio (multi device)
+  // 2) Auth de Baileys en disco (session por negocio)
+  //    En Render es disco efímero, pero suficiente para mantener sesión
+  //    mientras el proceso está vivo.
   const sessionPath = `./.wa_sessions/${sessionId}`;
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-  // 3) Usar SIEMPRE la versión más reciente de WA
-  const { version } = await fetchLatestBaileysVersion();
-  console.log("[baileysManager] Usando versión WA:", version);
+  const { version } = await getWaVersion();
 
-  // 4) Crear socket con config "sana" (igual que wa-test.mjs)
+  // 3) Crear socket
   const sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: false,
-    browser: ["Desktop", "Chrome", "121.0.0"], // importante para pairing moderno
+    browser: Browsers.appropriate("Desktop"),
+    printQRInTerminal: false, // el QR lo manejamos via DB + dashboard
   });
 
   const info: SessionInfo = {
@@ -120,28 +145,35 @@ export async function getOrCreateSession(
         sessionId,
         "connection=",
         connection,
-        "qr?",
+        "qr? ",
         !!qr
       );
 
-      // Cuando hay un QR nuevo → lo guardamos en Supabase
+      // 📲 Nuevo QR recibido
       if (qr) {
         info.status = "qrcode";
         info.lastQr = qr;
 
-        await supabaseAdmin
-          .from("whatsapp_sessions")
-          .update({
-            status: "qrcode",
-            qr_data: qr,
-            qr_svg: null,
-            qr_expires_at: new Date(Date.now() + 60_000),
-            last_error: null,
-          })
-          .eq("id", sessionId);
+        try {
+          await supabaseAdmin
+            .from("whatsapp_sessions")
+            .update({
+              status: "qrcode",
+              qr_data: qr,
+              qr_svg: null,
+              qr_expires_at: new Date(Date.now() + 60_000), // ~60s
+              last_error: null,
+            })
+            .eq("id", sessionId);
+        } catch (e) {
+          console.error(
+            "[baileysManager] Error actualizando QR en whatsapp_sessions:",
+            e
+          );
+        }
       }
 
-      /*********** Conectado ***********/
+      // ✅ Conectado
       if (connection === "open") {
         info.status = "connected";
 
@@ -155,39 +187,46 @@ export async function getOrCreateSession(
           phone = null;
         }
 
-        // Actualizar sesión en DB
-        await supabaseAdmin
-          .from("whatsapp_sessions")
-          .update({
-            status: "connected",
-            qr_data: null,
-            qr_svg: null,
-            phone_number: phone,
-            last_connected_at: new Date(),
-            last_seen_at: new Date(),
-            last_error: null,
-          })
-          .eq("id", sessionId);
+        try {
+          // Actualizar sesión en DB
+          await supabaseAdmin
+            .from("whatsapp_sessions")
+            .update({
+              status: "connected",
+              qr_data: null,
+              qr_svg: null,
+              phone_number: phone,
+              last_connected_at: new Date(),
+              last_seen_at: new Date(),
+              last_error: null,
+            })
+            .eq("id", sessionId);
 
-        // Actualizar tenant para que el panel lo lea
-        await supabaseAdmin
-          .from("tenants")
-          .update({
-            wa_connected: true,
-            wa_phone: phone,
-            wa_last_connected_at: new Date(),
-          })
-          .eq("id", tenantId);
+          // Actualizar tenant para que el panel lo lea
+          await supabaseAdmin
+            .from("tenants")
+            .update({
+              wa_connected: true,
+              wa_phone: phone,
+              wa_last_connected_at: new Date(),
+            })
+            .eq("id", tenantId);
 
-        console.log(
-          "[baileysManager] ✅ Conectado sesión",
-          sessionId,
-          "tel:",
-          phone
-        );
+          console.log(
+            "[baileysManager] ✅ Conectado sesión",
+            sessionId,
+            "tel:",
+            phone
+          );
+        } catch (e) {
+          console.error(
+            "[baileysManager] Error actualizando estado 'connected':",
+            e
+          );
+        }
       }
 
-      /*********** Cerrado ***********/
+      // ❌ Cerrado
       if (connection === "close") {
         const statusCode = (lastDisconnect?.error as Boom | undefined)?.output
           ?.statusCode;
@@ -204,31 +243,44 @@ export async function getOrCreateSession(
           shouldReconnect
         );
 
-        await supabaseAdmin
-          .from("whatsapp_sessions")
-          .update({
-            status: "disconnected",
-            last_seen_at: new Date(),
-            last_error: lastDisconnect?.error?.toString() ?? null,
-          })
-          .eq("id", sessionId);
+        try {
+          await supabaseAdmin
+            .from("whatsapp_sessions")
+            .update({
+              status: "disconnected",
+              last_seen_at: new Date(),
+              last_error: lastDisconnect?.error?.toString() ?? null,
+            })
+            .eq("id", sessionId);
 
-        // Marcar tenant como desconectado
-        await supabaseAdmin
-          .from("tenants")
-          .update({
-            wa_connected: false,
-          })
-          .eq("id", tenantId);
+          // Marcar tenant como desconectado
+          await supabaseAdmin
+            .from("tenants")
+            .update({
+              wa_connected: false,
+            })
+            .eq("id", tenantId);
+        } catch (e) {
+          console.error(
+            "[baileysManager] Error actualizando estado 'disconnected':",
+            e
+          );
+        }
 
-        // Si cerró por logout desde el celular → no reconectamos
+        // Si WhatsApp dijo "cerrar sesión en este dispositivo" (loggedOut),
+        // NO intentamos reconectar con estas creds → se borra de memoria y
+        // tendrás que reconectar desde el panel.
         sessions.delete(k);
       }
     }
 
     /*********** Credenciales ***********/
     if (events["creds.update"]) {
-      await saveCreds();
+      try {
+        await saveCreds();
+      } catch (e) {
+        console.error("[baileysManager] Error guardando creds:", e);
+      }
     }
   });
 
@@ -249,13 +301,17 @@ export async function disconnectSession(sessionId: string) {
     sessions.delete(key(sessionId));
   }
 
-  await supabaseAdmin
-    .from("whatsapp_sessions")
-    .update({
-      status: "disconnected",
-      qr_data: null,
-      qr_svg: null,
-      last_seen_at: new Date(),
-    })
-    .eq("id", sessionId);
+  try {
+    await supabaseAdmin
+      .from("whatsapp_sessions")
+      .update({
+        status: "disconnected",
+        qr_data: null,
+        qr_svg: null,
+        last_seen_at: new Date(),
+      })
+      .eq("id", sessionId);
+  } catch (e) {
+    console.error("[baileysManager] Error marcando sesión desconectada:", e);
+  }
 }

@@ -72,7 +72,7 @@ export default function ConnectWhatsAppPage() {
       const json = await res.json();
 
       setServerStatus({
-        ok: json.ok ?? false,
+        ok: !!json.ok,
         status: (json.status as ServerStatus["status"]) ?? "offline",
       });
     } catch (err) {
@@ -86,7 +86,6 @@ export default function ConnectWhatsAppPage() {
 
   // 2) Datos del tenant (nombre + estado WA guardado en BD)
   async function fetchActiveTenant() {
-    // si aún no sabemos qué tenant está activo, reseteamos y salimos
     if (!tenantId) {
       setTenantName(null);
       setTenantWaConnected(false);
@@ -128,7 +127,7 @@ export default function ConnectWhatsAppPage() {
     try {
       const res = await fetch(
         `/api/wa/session?tenantId=${encodeURIComponent(tenantId)}`,
-        { cache: "no-store" },
+        { cache: "no-store" }
       );
       const json = (await res.json()) as SessionResponse;
 
@@ -151,6 +150,8 @@ export default function ConnectWhatsAppPage() {
   async function handleAction(action: "connect" | "disconnect") {
     if (!tenantId) return;
     setSessionLoading(true);
+    setSessionError(null);
+
     try {
       const res = await fetch("/api/wa/session", {
         method: "POST",
@@ -177,19 +178,17 @@ export default function ConnectWhatsAppPage() {
   useEffect(() => {
     if (loadingTenant) return;
 
-    // al cambiar de negocio limpiamos la sesión previa
     setSession(null);
     setSessionError(null);
 
-    fetchServerStatus();
-    fetchActiveTenant();
-    fetchSession();
+    void fetchServerStatus();
+    void fetchActiveTenant();
+    void fetchSession();
 
-    // polling cada 5s SOLO para el tenant actual
     const id = setInterval(() => {
-      fetchServerStatus();
-      fetchActiveTenant();
-      fetchSession();
+      void fetchServerStatus();
+      void fetchActiveTenant();
+      void fetchSession();
     }, 5000);
 
     return () => clearInterval(id);
@@ -337,8 +336,12 @@ export default function ConnectWhatsAppPage() {
                       </span>{" "}
                       y escanea este código:
                     </p>
-                    <div className="bg.white p-4 rounded-xl">
-                      <QRCode value={session?.qr_data || ""} size={220} />
+                    <div className="bg-white p-4 rounded-xl">
+                      <QRCode
+                        key={session?.qr_data || "qr"}
+                        value={session?.qr_data || ""}
+                        size={220}
+                      />
                     </div>
                     <p className="text-xs text-slate-400 mt-3 text-center">
                       Si el QR expira, se actualizará solo en unos segundos.
@@ -428,9 +431,9 @@ export default function ConnectWhatsAppPage() {
               size="sm"
               className="mt-2 border-slate-700 text-slate-200 hover:bg-slate-800"
               onClick={() => {
-                fetchServerStatus();
-                fetchActiveTenant();
-                fetchSession();
+                void fetchServerStatus();
+                void fetchActiveTenant();
+                void fetchSession();
               }}
             >
               Refrescar ahora

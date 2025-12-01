@@ -3,19 +3,10 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
 import { getOrCreateSession } from "@/server/whatsapp/baileysManager";
 
-/**
- * POST /api/admin/whatsapp/connect
- *
- * Body: { tenantId: string }
- *
- * - Busca (o crea) una fila en whatsapp_sessions para ese tenant.
- * - Llama a Baileys para iniciar la sesión y generar el QR.
- * - El panel solo tiene que hacer polling a /status para leer el QR desde la DB.
- */
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
-    const { tenantId } = body as { tenantId?: string };
+    const tenantId = body?.tenantId as string | undefined;
 
     if (!tenantId) {
       return NextResponse.json(
@@ -24,57 +15,52 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1) Buscar sesión existente de ese tenant
-    const { data: existing, error: findError } = await supabaseAdmin
+    // 1) Buscar sesión ya creada para este tenant
+    let { data: session, error } = await supabaseAdmin
       .from("whatsapp_sessions")
-      .select("id, tenant_id, status")
+      .select("*")
       .eq("tenant_id", tenantId)
       .maybeSingle();
 
-    if (findError) {
-      console.error("[wa-connect] error buscando sesión:", findError);
+    if (error) {
+      console.error("[wa/connect] error select:", error);
       return NextResponse.json(
-        { ok: false, error: "db_error_find" },
+        { ok: false, error: "db_error" },
         { status: 500 }
       );
     }
 
-    let sessionId: string;
-
-    if (existing?.id) {
-      sessionId = existing.id;
-    } else {
-      // 2) Crear fila nueva para este tenant
-      const { data: created, error: insertError } = await supabaseAdmin
+    // 2) Si no existe, crear una nueva fila
+    if (!session) {
+      const { data: inserted, error: insertError } = await supabaseAdmin
         .from("whatsapp_sessions")
         .insert({
           tenant_id: tenantId,
           status: "starting",
         })
-        .select("id")
+        .select("*")
         .single();
 
-      if (insertError || !created) {
-        console.error("[wa-connect] error creando sesión:", insertError);
+      if (insertError || !inserted) {
+        console.error("[wa/connect] error insert:", insertError);
         return NextResponse.json(
-          { ok: false, error: "db_error_insert" },
+          { ok: false, error: "db_insert_error" },
           { status: 500 }
         );
       }
 
-      sessionId = created.id;
+      session = inserted;
     }
 
-    // 3) Lanzar (o reutilizar) la sesión de Baileys → esto genera QR
-    await getOrCreateSession(sessionId, tenantId);
+    // 3) Iniciar / reutilizar la sesión Baileys (esto dispara los QR)
+    await getOrCreateSession(session.id, tenantId);
 
-    // 4) Devolver datos mínimos al frontend
     return NextResponse.json({
       ok: true,
-      sessionId,
+      sessionId: session.id,
     });
-  } catch (err) {
-    console.error("[wa-connect] error inesperado:", err);
+  } catch (e) {
+    console.error("[wa/connect] exception:", e);
     return NextResponse.json(
       { ok: false, error: "internal_error" },
       { status: 500 }
