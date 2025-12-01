@@ -71,9 +71,12 @@ export default function ConnectWhatsAppPage() {
       const res = await fetch("/api/wa/status", { cache: "no-store" });
       const json = await res.json();
 
+      // console.log para debug si hace falta
+      console.log("[ConnectWhatsApp] /api/wa/status =>", json);
+
       setServerStatus({
-        ok: !!json.ok,
-        status: (json.status as ServerStatus["status"]) ?? "offline",
+        ok: json.ok ?? true,
+        status: (json.status as ServerStatus["status"]) ?? "online",
       });
     } catch (err) {
       console.error("[ConnectWhatsApp] fetchServerStatus error:", err);
@@ -120,7 +123,7 @@ export default function ConnectWhatsAppPage() {
     }
   }
 
-  // 3) Sesión WA por negocio (usa /api/wa/session)
+  // 3) Sesión WA por negocio
   async function fetchSession() {
     if (!tenantId) return;
     setSessionLoading(true);
@@ -150,8 +153,6 @@ export default function ConnectWhatsAppPage() {
   async function handleAction(action: "connect" | "disconnect") {
     if (!tenantId) return;
     setSessionLoading(true);
-    setSessionError(null);
-
     try {
       const res = await fetch("/api/wa/session", {
         method: "POST",
@@ -181,30 +182,30 @@ export default function ConnectWhatsAppPage() {
     setSession(null);
     setSessionError(null);
 
-    void fetchServerStatus();
-    void fetchActiveTenant();
-    void fetchSession();
+    fetchServerStatus();
+    fetchActiveTenant();
+    fetchSession();
 
     const id = setInterval(() => {
-      void fetchServerStatus();
-      void fetchActiveTenant();
-      void fetchSession();
+      fetchServerStatus();
+      fetchActiveTenant();
+      fetchSession();
     }, 5000);
 
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId, loadingTenant]);
 
-  const isServerOnline = !!serverStatus?.ok;
+  // 🔑 CAMBIO IMPORTANTE: consideramos "online" por status, no por ok
+  const isServerOnline =
+    !serverStatus || serverStatus.status === "online" || serverStatus.ok;
 
   const rawStatus: SessionStatus = session?.status ?? "disconnected";
   const hasQr = !!session?.qr_data;
 
-  // Si hay QR disponible, asumimos que aún NO está conectado aunque waConnected
   const isConnected =
     !hasQr && (tenantWaConnected || rawStatus === "connected");
 
-  // Mostrar QR siempre que exista qr_data y no esté conectado
   const showQr = hasQr && !isConnected;
 
   const connectedPhone = tenantWaPhone || session?.phone_number || null;
@@ -285,7 +286,6 @@ export default function ConnectWhatsAppPage() {
                   </p>
                 )}
 
-                {/* negocio sin WhatsApp y sin QR todavía */}
                 {!sessionLoading &&
                   !isConnected &&
                   !showQr &&
@@ -308,7 +308,6 @@ export default function ConnectWhatsAppPage() {
                     </div>
                   )}
 
-                {/* mientras Baileys está creando la sesión */}
                 {!sessionLoading &&
                   !isConnected &&
                   !showQr &&
@@ -324,7 +323,6 @@ export default function ConnectWhatsAppPage() {
                     </div>
                   )}
 
-                {/* QR listo para este negocio */}
                 {!sessionLoading && showQr && (
                   <>
                     <p className="text-sm text-slate-300 mb-3 text-center">
@@ -336,12 +334,8 @@ export default function ConnectWhatsAppPage() {
                       </span>{" "}
                       y escanea este código:
                     </p>
-                    <div className="bg-white p-4 rounded-xl">
-                      <QRCode
-                        key={session?.qr_data || "qr"}
-                        value={session?.qr_data || ""}
-                        size={220}
-                      />
+                    <div className="bg.white p-4 rounded-xl">
+                      <QRCode value={session?.qr_data || ""} size={220} />
                     </div>
                     <p className="text-xs text-slate-400 mt-3 text-center">
                       Si el QR expira, se actualizará solo en unos segundos.
@@ -349,7 +343,6 @@ export default function ConnectWhatsAppPage() {
                   </>
                 )}
 
-                {/* negocio ya conectado */}
                 {!sessionLoading && isConnected && (
                   <div className="text-center">
                     <p className="text-emerald-400 font-medium mb-2">
@@ -374,7 +367,6 @@ export default function ConnectWhatsAppPage() {
                   </div>
                 )}
 
-                {/* error de sesión */}
                 {!sessionLoading &&
                   !showQr &&
                   !isConnected &&
@@ -431,9 +423,9 @@ export default function ConnectWhatsAppPage() {
               size="sm"
               className="mt-2 border-slate-700 text-slate-200 hover:bg-slate-800"
               onClick={() => {
-                void fetchServerStatus();
-                void fetchActiveTenant();
-                void fetchSession();
+                fetchServerStatus();
+                fetchActiveTenant();
+                fetchSession();
               }}
             >
               Refrescar ahora

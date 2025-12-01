@@ -1,41 +1,38 @@
-// src/app/api/admin/whatsapp/status/route.ts
+// src/app/api/wa/status/route.ts
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
 
-export async function GET(req: Request) {
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+/**
+ * Healthcheck muy simple del servidor de WhatsApp.
+ *
+ * NOTA:
+ * - Ya no usamos el runtime viejo de Baileys aquí.
+ * - Solo comprobamos que la API responde; la lógica real de sesiones
+ *   y QR la maneja /api/wa/session + baileysManager.
+ */
+export async function GET() {
   try {
-    const { searchParams } = new URL(req.url);
-    const tenantId = searchParams.get("tenantId");
-
-    if (!tenantId) {
-      return NextResponse.json(
-        { ok: false, error: "missing_tenant" },
-        { status: 400 }
-      );
-    }
-
-    const { data: session, error } = await supabaseAdmin
-      .from("whatsapp_sessions")
-      .select("id, status, qr_data, phone_number, last_connected_at")
-      .eq("tenant_id", tenantId)
-      .maybeSingle();
-
-    if (error) {
-      console.error("[wa/status] error:", error);
-      return NextResponse.json(
-        { ok: false, error: "db_error" },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json({
-      ok: true,
-      session: session ?? null,
-    });
-  } catch (e) {
-    console.error("[wa/status] exception:", e);
     return NextResponse.json(
-      { ok: false, error: "internal_error" },
+      {
+        ok: true,
+        online: true,
+        status: "online",
+        ts: new Date().toISOString(),
+      },
+      { status: 200 }
+    );
+  } catch (err: any) {
+    console.error("[api/wa/status] internal_error:", err);
+    return NextResponse.json(
+      {
+        ok: false,
+        online: false,
+        status: "offline",
+        error: "internal_error",
+        details: String(err?.message || err),
+      },
       { status: 500 }
     );
   }
