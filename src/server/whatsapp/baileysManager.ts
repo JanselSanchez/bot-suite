@@ -1,8 +1,7 @@
-// src/app/server/whatsapp/baileysManager.ts
+// src/server/whatsapp/baileysManager.ts
 
 /************************************************************
- * FIX TLS (lo tenías así para dev; en Render normalmente no hace falta,
- * pero lo mantengo para no romper nada que ya te funcione con Supabase).
+ * TLS: lo mantengo como lo tenías para no romper nada.
  ************************************************************/
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
@@ -95,7 +94,7 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
 
   sessions.set(k, info);
 
-  // Marcar en DB como "connecting" al levantar el socket
+  // Marcar DB como "connecting"
   await supabaseAdmin
     .from("whatsapp_sessions")
     .update({
@@ -183,7 +182,6 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           phone
         );
 
-        // no seguimos al bloque de "close" en este ciclo
         return;
       }
 
@@ -220,8 +218,8 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           })
           .eq("id", tenantId);
 
-        // Limpiamos la sesión en memoria para que un nuevo getOrCreate
-        // pueda levantar un socket limpio si hace falta.
+        // Limpia siempre la sesión en memoria;
+        // si se debe reconectar, se creará en el próximo getOrCreateSession.
         sessions.delete(k);
       }
     }

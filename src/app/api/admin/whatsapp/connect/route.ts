@@ -1,7 +1,7 @@
 // src/app/api/admin/whatsapp/connect/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
-import { getOrCreateSession } from "@/app/server/whatsapp/baileysManager";
+import { getOrCreateSession } from "@/server/whatsapp/baileysManager";
 
 export async function POST(req: Request) {
   try {
