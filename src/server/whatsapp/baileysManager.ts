@@ -34,7 +34,7 @@ const sessions = new Map<string, SessionInfo>();
 const key = (sessionId: string) => sessionId;
 
 /**
- * Obtener info de sesión en memoria (por si quieres leer estado desde otro sitio)
+ * Obtener info de sesión en memoria
  */
 export function getSessionInfo(sessionId: string): SessionInfo | null {
   return sessions.get(key(sessionId)) ?? null;
@@ -47,7 +47,7 @@ export function getSessionInfo(sessionId: string): SessionInfo | null {
  * IMPORTANTE:
  * - Úsalo SOLO desde el endpoint de "conectar / iniciar sesión".
  * - El endpoint de "status" debe leer estado desde la tabla whatsapp_sessions,
- *   NO debe llamar a esta función, para no tocar la sesión innecesariamente.
+ *   NO debe llamar a esta función.
  */
 export async function getOrCreateSession(sessionId: string, tenantId: string) {
   const k = key(sessionId);
@@ -95,6 +95,15 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
 
   sessions.set(k, info);
 
+  // Marcar en DB como "connecting" al levantar el socket
+  await supabaseAdmin
+    .from("whatsapp_sessions")
+    .update({
+      status: "connecting",
+      last_error: null,
+    })
+    .eq("id", sessionId);
+
   /**************************************
    * EVENTOS DE BAILEYS
    **************************************/
@@ -108,10 +117,11 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
         sessionId,
         "connection=",
         connection,
-        "qr?",
+        "qr?=",
         !!qr
       );
 
+      // --- QR recibido ---
       if (qr) {
         info.status = "qrcode";
         info.lastQr = qr;
@@ -128,7 +138,7 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           .eq("id", sessionId);
       }
 
-      /*********** Conectado ***********/
+      // --- Conectado ---
       if (connection === "open") {
         info.status = "connected";
 
@@ -172,9 +182,12 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           "tel:",
           phone
         );
+
+        // no seguimos al bloque de "close" en este ciclo
+        return;
       }
 
-      /*********** Cerrado ***********/
+      // --- Cerrado ---
       if (connection === "close") {
         const statusCode = (lastDisconnect?.error as Boom | undefined)?.output
           ?.statusCode;
@@ -200,7 +213,6 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           })
           .eq("id", sessionId);
 
-        // Marcar tenant como desconectado
         await supabaseAdmin
           .from("tenants")
           .update({
@@ -208,15 +220,9 @@ export async function getOrCreateSession(sessionId: string, tenantId: string) {
           })
           .eq("id", tenantId);
 
-        if (!shouldReconnect) {
-          // Sesión cerrada definitivamente (p.ej. desde el celular → cerrar sesión)
-          sessions.delete(k);
-        } else {
-          // Dejas que se vuelva a conectar en un próximo getOrCreateSession,
-          // o aquí mismo podrías reintentar:
-          // setTimeout(() => getOrCreateSession(sessionId, tenantId).catch(console.error), 2000);
-          sessions.delete(k); // para que el próximo getOrCreate cree una nueva
-        }
+        // Limpiamos la sesión en memoria para que un nuevo getOrCreate
+        // pueda levantar un socket limpio si hace falta.
+        sessions.delete(k);
       }
     }
 
