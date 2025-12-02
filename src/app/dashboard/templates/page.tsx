@@ -1,20 +1,22 @@
-// app/(dashboard)/templates/page.tsx
+// src/app/(dashboard)/templates/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { useActiveTenant } from "@/app/providers/active-tenant";
 import { RefreshCcw, Wand2, Save, Eye, Copy, Check, Info } from "lucide-react";
+import { VERTICALS } from "@/app/lib/constants";
 
 const sb = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-// Canal fijo (solo WhatsApp)
 const DEFAULT_CHANNEL = "whatsapp" as const;
 
-// Eventos (clave que se guarda en message_templates.event)
+// Tipos derivados de tus constantes
+type VerticalValue = (typeof VERTICALS)[number]["value"];
+
 type EventKey =
   | "booking_confirmed"
   | "booking_rescheduled"
@@ -31,66 +33,77 @@ const EVENT_OPTS: ReadonlyArray<{
   {
     value: "booking_confirmed",
     label: "Cita CONFIRMADA",
-    hint: "Se envía cuando la cita queda confirmada.",
+    hint: "Se envía automáticamente cuando se crea una cita.",
   },
   {
     value: "booking_rescheduled",
     label: "Cita REPROGRAMADA",
-    hint: "Se envía cuando se mueve una cita.",
+    hint: "Se envía cuando cambia la fecha/hora.",
   },
   {
     value: "booking_cancelled",
     label: "Cita CANCELADA",
-    hint: "Se envía cuando se cancela una cita.",
+    hint: "Se envía al cancelar.",
   },
   {
     value: "reminder",
     label: "Recordatorio",
-    hint: "Recordatorio antes de la cita.",
-  },
-  {
-    value: "payment_pending",
-    label: "Pago pendiente",
-    hint: "Cuando falta completar el pago.",
+    hint: "Recordatorio programado antes de la cita.",
   },
   {
     value: "pricing_pitch",
     label: "Info de planes / precios",
-    hint: "Se envía cuando el bot explica tus planes y precios.",
+    hint: "⚠️ IMPORTANTE: El bot usará este texto EXACTO cuando pregunten precios.",
   },
 ];
 
-const VERTICALS = ["general", "restaurante", "salon", "peluqueria", "clinica"] as const;
-type Vertical = (typeof VERTICALS)[number];
-
-const PRESETS: Record<Vertical, Partial<Record<EventKey, string>>> = {
+// 🧠 CEREBRO DE SUGERENCIAS: Textos adaptados a cada negocio
+const PRESETS: Record<string, Partial<Record<EventKey, string>>> = {
   general: {
     booking_confirmed:
-      "Hola {{customer_name}}, tu cita del {{date}} a las {{time}} con {{resource_name}} fue confirmada. Si deseas pagar antes, usa este enlace: {{payment_link}}.",
-    reminder:
-      "Recordatorio: {{date}} {{time}} con {{resource_name}}. Si no podrás asistir, reprograma a tiempo.",
+      "Hola {{customer_name}}, tu cita del {{date}} a las {{time}} con {{resource_name}} fue confirmada. Si deseas pagar antes: {{payment_link}}.",
+    pricing_pitch:
+      "Nuestros servicios van desde $500 hasta $5,000 dependiendo de lo que necesites. ¿Te gustaría agendar una evaluación?",
   },
-  restaurante: {
+  barbershop: {
     booking_confirmed:
-      "¡Reserva confirmada! {{customer_name}}, te esperamos el {{date}} a las {{time}}. Ver ubicación y menú: {{payment_link}}",
+      "¡Todo listo, líder! 💈 {{customer_name}}, tu corte quedó para el {{date}} a las {{time}} con {{resource_name}}. Llega 5 min antes.",
     reminder:
-      "Nos vemos hoy a las {{time}} 🍽️. Si cambias de plan, avísanos con tiempo.",
+      "Un saludo {{customer_name}}, recuerda tu recorte hoy a las {{time}}. Confírmanos si vienes.",
+    pricing_pitch:
+      "El corte regular cuesta $500, barba $300 y el servicio completo $800. ¿Te agendo uno para hoy?",
   },
   salon: {
     booking_confirmed:
-      "¡Cita lista! {{customer_name}}, te esperamos el {{date}} a las {{time}} con {{resource_name}} ✨",
-     reminder:
-      "Beauty reminder: {{date}} {{time}} con {{resource_name}}. ¿Reprogramar? {{payment_link}}",
+      "Hola bella ✨ {{customer_name}}, tu cita de belleza es el {{date}} a las {{time}} con {{resource_name}}. ¡Te esperamos!",
+    pricing_pitch:
+      "El lavado y secado empieza en $800. Tintes desde $2,500. Para un precio exacto necesitamos evaluarte el cabello. ¿Pasas hoy?",
   },
-  peluqueria: {
+  clinic: {
     booking_confirmed:
-      "Barbería: cita confirmada para {{customer_name}} el {{date}} a las {{time}} con {{resource_name}} 💈",
-  },
-  clinica: {
-    booking_confirmed:
-      "Confirmación: consulta el {{date}} a las {{time}} con Dr(a). {{resource_name}}. Llegar 10 min antes.",
+      "Estimado(a) {{customer_name}}, su consulta médica está confirmada para el {{date}} a las {{time}} con el Dr(a). {{resource_name}}.",
     reminder:
-      "Recordatorio médico: {{date}} {{time}} con Dr(a). {{resource_name}}. Indicaciones: {{payment_link}}",
+      "Recordatorio de cita médica: Paciente {{customer_name}}, hoy a las {{time}}. Favor traer su seguro.",
+    pricing_pitch:
+      "La consulta general tiene un costo de $2,000 (o diferencia de seguro). Especialidades varían. ¿Desea ver disponibilidad?",
+  },
+  restaurant: {
+    booking_confirmed:
+      "¡Mesa reservada! 🍽️ {{customer_name}}, los esperamos el {{date}} a las {{time}}. Ver menú: {{payment_link}}",
+    pricing_pitch:
+      "Nuestro plato del día cuesta $450. El menú a la carta varía entre $600 y $1,500 por persona. ¡Tenemos Happy Hour de 5 a 8!",
+  },
+  real_estate: {
+    booking_confirmed:
+      "Visita confirmada 🏠. {{customer_name}}, nos vemos el {{date}} a las {{time}} para ver la propiedad.",
+    pricing_pitch:
+      "Manejamos propiedades desde US$80,000 en planos hasta listas para entrega. ¿Buscas para vivir o inversión?",
+  },
+  store: {
+    booking_confirmed:
+      "¡Pedido recibido! 🛍️ {{customer_name}}, puedes pasar a recogerlo el {{date}} a las {{time}}.",
+    pricing_pitch:
+      "Tenemos artículos desde $200. Revisa nuestro catálogo completo aquí: {{payment_link}}",
   },
 };
 
@@ -119,9 +132,10 @@ export default function TemplatesPage() {
   const [rows, setRows] = useState<TemplateRow[]>([]);
   const [loading, setLoading] = useState(false);
 
-  const [vertical, setVertical] = useState<Vertical>("general");
+  // Estado del vertical seleccionado (para sugerencias)
+  const [vertical, setVertical] = useState<string>("general");
+  
   const [event, setEvent] = useState<EventKey>("booking_confirmed");
-
   const [idEditing, setIdEditing] = useState<string | null>(null);
   const [name, setName] = useState<string>("");
   const [body, setBody] = useState<string>("");
@@ -131,17 +145,36 @@ export default function TemplatesPage() {
 
   const bodyRef = useRef<HTMLTextAreaElement | null>(null);
 
+  // 1. Cargar Plantillas + Detectar Tipo de Negocio
   useEffect(() => {
-    if (!loadingTenant) void load();
+    if (!loadingTenant && tenantId) {
+      void loadTemplates();
+      void detectVertical();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId, loadingTenant]);
 
-  /** 🔧 Usar SIEMPRE el tenant del contexto */
   function resolveTenantId(): string | null {
     return tenantId ?? null;
   }
 
-  async function load() {
+  // Detectar qué tipo de negocio es este Tenant para poner el botón correcto activo
+  async function detectVertical() {
+    const tId = resolveTenantId();
+    if (!tId) return;
+    
+    const { data } = await sb
+      .from("tenants")
+      .select("vertical")
+      .eq("id", tId)
+      .single();
+
+    if (data?.vertical) {
+      setVertical(data.vertical);
+    }
+  }
+
+  async function loadTemplates() {
     setLoading(true);
     const tId = resolveTenantId();
     if (!tId) {
@@ -151,7 +184,7 @@ export default function TemplatesPage() {
     }
     const { data, error } = await sb
       .from("message_templates")
-      .select("id, tenant_id, channel, event, name, body, active, created_at")
+      .select("*")
       .eq("tenant_id", tId)
       .eq("channel", DEFAULT_CHANNEL)
       .order("event", { ascending: true });
@@ -170,13 +203,14 @@ export default function TemplatesPage() {
       date: "15/10/2025",
       time: "10:30 a. m.",
       resource_name: "Laura",
-      payment_link: "https://tudominio.com/pagar",
+      payment_link: "https://link.pago...",
     }),
     []
   );
 
   function applyPreset() {
-    const preset = PRESETS[vertical]?.[event];
+    // Busca el preset exacto, si no, busca en 'general'
+    const preset = PRESETS[vertical]?.[event] || PRESETS["general"]?.[event];
     if (preset) setBody(preset);
   }
 
@@ -228,6 +262,8 @@ export default function TemplatesPage() {
       name: name || null,
       body,
       active,
+      // Guardamos el vertical actual como metadato (opcional, pero útil)
+      vertical: vertical 
     };
 
     const { data, error } = await sb
@@ -243,24 +279,18 @@ export default function TemplatesPage() {
     }
 
     setIdEditing(data?.id ?? null);
-
-    // Si es nueva, limpiamos el formulario
-    if (isNew) {
-      resetForm();
-    }
+    if (isNew) resetForm();
 
     setSuccess("Plantilla guardada correctamente.");
     setTimeout(() => setSuccess(null), 3000);
-
-    await load();
+    await loadTemplates();
   }
 
   async function toggleActive(row: TemplateRow) {
     const { error } = await sb
       .from("message_templates")
       .update({ active: !row.active })
-      .eq("id", row.id)
-      .eq("tenant_id", row.tenant_id);
+      .eq("id", row.id);
 
     if (!error) {
       setRows((prev) =>
@@ -274,13 +304,14 @@ export default function TemplatesPage() {
     setName(row.name ?? "");
     setBody(row.body);
     setActive(row.active);
-    const ev = EVENT_OPTS.find((e) => e.value === (row.event as EventKey))?.value;
-    if (ev) setEvent(ev);
+    // Intentar encontrar el evento en la lista, si no existe (legacy), mantenerlo
+    const evFound = EVENT_OPTS.find((e) => e.value === row.event)?.value;
+    if (evFound) setEvent(evFound as EventKey);
+    
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  const currentEventMeta =
-    EVENT_OPTS.find((o) => o.value === event) ?? EVENT_OPTS[0];
+  const currentEventMeta = EVENT_OPTS.find((o) => o.value === event) ?? EVENT_OPTS[0];
 
   return (
     <div className="p-6 md:p-8 space-y-6">
@@ -289,98 +320,107 @@ export default function TemplatesPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Plantillas</h1>
           <p className="text-sm text-gray-500">
-            Define mensajes por <b>evento</b> (canal fijo: WhatsApp).
+            Define los mensajes que el Bot usará para responder.
           </p>
         </div>
         <button
-          onClick={() => void load()}
+          onClick={() => void loadTemplates()}
           disabled={loading}
           className="inline-flex items-center gap-2 rounded-xl px-4 py-2 border hover:bg-gray-50 transition disabled:opacity-60"
-          title="Refrescar"
         >
           <RefreshCcw className="w-4 h-4" />
           Refrescar
         </button>
       </div>
 
-      {/* Tipo de negocio + Evento */}
+      {/* Selector de Vertical (Contexto) */}
       <div className="rounded-2xl border bg-white/60 backdrop-blur p-4 shadow-sm space-y-4">
         <div>
-          <h2 className="font-semibold">Tipo de negocio (texto sugerido)</h2>
-          <div className="mt-2 flex flex-wrap gap-2">
+          <h2 className="font-semibold text-sm">Estilo de Negocio (Sugerencias)</h2>
+          <p className="text-xs text-gray-400 mb-2">Selecciona uno para ver ejemplos de redacción:</p>
+          <div className="flex flex-wrap gap-2">
             {VERTICALS.map((v) => (
               <button
-                key={v}
-                onClick={() => setVertical(v)}
+                key={v.value}
+                onClick={() => setVertical(v.value)}
                 className={[
-                  "px-3 py-1.5 rounded-full border text-sm transition",
-                  vertical === v
-                    ? "bg-black text-white border-black"
-                    : "hover:bg-gray-50",
+                  "px-3 py-1.5 rounded-full border text-xs transition",
+                  vertical === v.value
+                    ? "bg-gray-900 text-white border-gray-900"
+                    : "hover:bg-gray-50 bg-white text-gray-600",
                 ].join(" ")}
               >
-                {v}
+                {v.label}
               </button>
             ))}
           </div>
         </div>
 
-        <div>
-          <label className="text-sm text-gray-700">Evento</label>
-          <select
-            className="mt-1 border rounded-xl px-3 py-2 w-full"
-            value={event}
-            onChange={(e) => setEvent(e.target.value as EventKey)}
-          >
-            {EVENT_OPTS.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
-          <div className="mt-2 text-xs text-gray-500 flex items-start gap-2">
-            <Info className="w-4 h-4 mt-0.5" />
+        <div className="border-t pt-4">
+          <label className="text-sm font-medium text-gray-700">Evento (¿Cuándo se envía?)</label>
+          <div className="flex flex-col md:flex-row gap-3 mt-1">
+            <select
+              className="border rounded-xl px-3 py-2 w-full md:w-1/2 bg-white"
+              value={event}
+              onChange={(e) => setEvent(e.target.value as EventKey)}
+            >
+              {EVENT_OPTS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            
+            <button
+              onClick={applyPreset}
+              className="inline-flex justify-center items-center gap-2 rounded-xl border px-4 py-2 hover:bg-violet-50 hover:border-violet-200 hover:text-violet-700 transition bg-white"
+              title="Pegar redacción sugerida"
+            >
+              <Wand2 className="w-4 h-4" />
+              <span>Usar sugerencia para {VERTICALS.find(v => v.value === vertical)?.label}</span>
+            </button>
+          </div>
+          
+          <div className="mt-2 text-xs text-gray-500 flex items-start gap-2 bg-blue-50 p-2 rounded-lg text-blue-700">
+            <Info className="w-4 h-4 mt-0.5 shrink-0" />
             <span>{currentEventMeta.hint}</span>
           </div>
 
-          <div className="mt-3 flex items-center gap-3">
-            <button
-              onClick={applyPreset}
-              className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 hover:bg-gray-50"
-              title="Pegar redacción sugerida según tipo de negocio + evento"
-            >
-              <Wand2 className="w-4 h-4" />
-              Aplicar sugerencia
-            </button>
-            {success && (
-              <span className="text-xs text-emerald-600">
-                {success}
-              </span>
-            )}
-          </div>
+          {success && (
+            <div className="mt-2 text-xs text-emerald-600 font-medium flex items-center gap-1">
+              <Check className="w-3 h-3" /> {success}
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Editor */}
-      <div className="rounded-2xl border bg-white/70 backdrop-blur p-5 shadow-sm space-y-3">
-        <h2 className="font-semibold">Nueva / Editar</h2>
+      {/* Editor Principal */}
+      <div className="rounded-2xl border bg-white/80 backdrop-blur p-5 shadow-sm space-y-4">
+        <div className="flex justify-between items-center">
+            <h2 className="font-semibold">Editor de Mensaje</h2>
+            {idEditing && (
+                <span className="text-xs bg-amber-100 text-amber-700 px-2 py-1 rounded-full">
+                    Editando plantilla existente
+                </span>
+            )}
+        </div>
 
         <input
-          className="border rounded-xl px-3 py-2 w-full"
-          placeholder="Nombre interno (opcional)"
+          className="border rounded-xl px-3 py-2 w-full text-sm"
+          placeholder="Nombre interno (opcional, ej: Confirmación Barbería)"
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
 
         <div>
-          <label className="text-xs text-gray-500">Variables rápidas</label>
-          <div className="flex flex-wrap gap-2 mt-1">
+          <label className="text-xs text-gray-500 font-medium">Variables dinámicas (Click para insertar)</label>
+          <div className="flex flex-wrap gap-2 mt-1.5">
             {VARIABLE_HINTS.map((v) => (
               <button
                 key={v}
                 type="button"
                 onClick={() => insertVariable(v)}
-                className="text-xs border rounded-full px-2 py-1 hover:bg-gray-50"
+                className="text-xs border border-dashed border-gray-300 rounded-md px-2 py-1 hover:bg-gray-100 hover:border-gray-400 transition bg-gray-50"
               >
                 {`{{${v}}}`}
               </button>
@@ -390,170 +430,114 @@ export default function TemplatesPage() {
 
         <textarea
           ref={bodyRef}
-          className="border rounded-2xl w-full min-h-[160px] p-3"
-          placeholder="Escribe el mensaje. Ej: Hola {{customer_name}}..."
+          className="border rounded-2xl w-full min-h-[120px] p-4 text-sm leading-relaxed focus:ring-2 focus:ring-violet-500/20 outline-none transition"
+          placeholder="Escribe el mensaje aquí..."
           value={body}
           onChange={(e) => setBody(e.target.value)}
         />
 
-        <div className="flex items-center justify-between">
-          <label className="inline-flex items-center gap-2 text-sm">
+        <div className="flex items-center justify-between pt-2">
+          <label className="inline-flex items-center gap-2 text-sm cursor-pointer select-none">
             <input
               type="checkbox"
+              className="w-4 h-4 rounded border-gray-300 text-violet-600 focus:ring-violet-500"
               checked={active}
               onChange={(e) => setActive(e.target.checked)}
             />
-            Activo
+            <span>Activar plantilla</span>
           </label>
 
           <div className="flex gap-2">
             <button
-              onClick={save}
-              className="inline-flex items-center gap-2 rounded-xl bg-black text-white px-4 py-2"
-            >
-              <Save className="w-4 h-4" />
-              Guardar
-            </button>
-            <button
               onClick={() => doPreview()}
-              className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 hover:bg-gray-50"
+              className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 hover:bg-gray-50 text-sm font-medium transition"
             >
               <Eye className="w-4 h-4" />
-              Preview
+              Ver Preview
+            </button>
+            <button
+              onClick={save}
+              className="inline-flex items-center gap-2 rounded-xl bg-gray-900 text-white px-5 py-2 text-sm font-medium hover:bg-black transition shadow-sm"
+            >
+              <Save className="w-4 h-4" />
+              Guardar Cambios
             </button>
           </div>
         </div>
       </div>
 
-      {/* Preview */}
-      <div className="rounded-2xl border bg-white/70 backdrop-blur p-5 shadow-sm">
-        <h3 className="font-semibold mb-3">Preview</h3>
-        {preview ? (
-          <>
-            <div className="bg-[#e7ffd6] rounded-2xl p-4 text-sm shadow-inner max-w-[680px]">
-              <div className="whitespace-pre-wrap leading-6">{preview}</div>
+      {/* Preview Box */}
+      {preview && (
+        <div className="rounded-2xl border bg-white/70 backdrop-blur p-5 shadow-sm animate-in fade-in slide-in-from-top-2">
+            <h3 className="font-semibold mb-3 text-sm">Vista Previa (WhatsApp)</h3>
+            <div className="bg-[#DCF8C6] rounded-lg p-3 text-sm shadow-sm max-w-[80%] text-gray-800 relative">
+                 <div className="whitespace-pre-wrap leading-snug">{preview}</div>
+                 <div className="text-[10px] text-gray-500 text-right mt-1">10:30 AM</div>
             </div>
-            <div className="mt-3">
-              <button
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(preview);
-                  } catch {
-                    // ignore
-                  }
-                }}
-                className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 hover:bg-gray-50"
-              >
-                <Copy className="w-4 h-4" /> Copiar
-              </button>
-            </div>
-          </>
-        ) : (
-          <p className="text-sm text-gray-500">
-            Genera un preview para ver el resultado.
-          </p>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* Listado */}
       <div className="rounded-2xl border bg-white/70 backdrop-blur p-5 shadow-sm">
         <div className="flex items-center justify-between mb-3">
-          <h2 className="font-semibold">Plantillas guardadas</h2>
+          <h2 className="font-semibold">Mis Plantillas</h2>
           <span className="text-xs text-gray-500">
-            {loading ? "Cargando…" : `${rows.length} resultado(s)`}
+            {loading ? "Cargando..." : `${rows.length} guardadas`}
           </span>
         </div>
 
-        <div className="overflow-auto rounded-xl border">
+        <div className="overflow-hidden rounded-xl border">
           <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-gray-600">
+            <thead className="bg-gray-50 text-gray-600 font-medium">
               <tr>
                 <th className="text-left p-3">Evento</th>
-                <th className="text-left p-3">Nombre</th>
-                <th className="text-left p-3">Activo</th>
-                <th className="text-left p-3">Body</th>
-                <th className="text-left p-3 w-28">Acciones</th>
+                <th className="text-left p-3">Contenido</th>
+                <th className="text-left p-3 w-24">Estado</th>
+                <th className="text-right p-3 w-24">Editar</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className="divide-y">
               {!loading && rows.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="p-6 text-center text-gray-500">
-                    No hay plantillas aún. Crea la primera arriba.
+                  <td colSpan={4} className="p-8 text-center text-gray-500">
+                    No tienes plantillas configuradas. ¡Crea una arriba!
                   </td>
                 </tr>
               )}
               {rows.map((r) => (
-                <tr key={r.id} className="border-t hover:bg-gray-50/60">
-                  <td className="p-3">
-                    {
-                      EVENT_OPTS.find(
-                        (o) => o.value === (r.event as EventKey)
-                      )?.label ?? r.event
-                    }
+                <tr key={r.id} className="hover:bg-gray-50/60 transition group">
+                  <td className="p-3 font-medium text-gray-900">
+                    {EVENT_OPTS.find((o) => o.value === r.event)?.label || r.event}
+                    {r.name && <div className="text-xs text-gray-500 font-normal">{r.name}</div>}
                   </td>
-                  <td className="p-3">{r.name ?? "—"}</td>
+                  <td className="p-3 text-gray-600 max-w-md truncate" title={r.body}>
+                    {r.body}
+                  </td>
                   <td className="p-3">
                     <button
                       onClick={() => toggleActive(r)}
-                      className={[
-                        "inline-flex items-center gap-1 rounded-full px-2.5 py-1 border text-xs",
+                      className={`text-xs px-2 py-1 rounded-full border transition ${
                         r.active
-                          ? "bg-emerald-600 text-white border-emerald-600"
-                          : "bg-white",
-                      ].join(" ")}
-                      title="Activar/Desactivar"
+                          ? "bg-emerald-100 text-emerald-700 border-emerald-200"
+                          : "bg-gray-100 text-gray-500 border-gray-200"
+                      }`}
                     >
-                      {r.active ? (
-                        <Check className="w-3.5 h-3.5" />
-                      ) : null}
-                      {r.active ? "Activo" : "—"}
+                      {r.active ? "Activo" : "Inactivo"}
                     </button>
                   </td>
-                  <td className="p-3">
-                    <div className="text-gray-700">
-                      {r.body.length > 140
-                        ? `${r.body.slice(0, 140)}…`
-                        : r.body}
-                    </div>
-                  </td>
-                  <td className="p-3">
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => startEdit(r)}
-                        className="text-xs rounded-xl border px-2.5 py-1.5 hover:bg-gray-50"
-                      >
-                        Editar
-                      </button>
-                      <button
-                        onClick={() =>
-                          setPreview(renderTemplate(r.body || "", sampleData))
-                        }
-                        className="text-xs rounded-xl border px-2.5 py-1.5 hover:bg-gray-50"
-                      >
-                        Ver
-                      </button>
-                    </div>
+                  <td className="p-3 text-right">
+                    <button
+                      onClick={() => startEdit(r)}
+                      className="text-xs font-medium text-violet-600 hover:text-violet-800 hover:underline px-2 py-1"
+                    >
+                      Editar
+                    </button>
                   </td>
                 </tr>
               ))}
-              {loading && (
-                <tr>
-                  <td colSpan={5} className="p-6">
-                    <div className="animate-pulse h-4 bg-gray-200 rounded w-1/3 mb-3" />
-                    <div className="animate-pulse h-4 bg-gray-200 rounded w-2/3" />
-                  </td>
-                </tr>
-              )}
             </tbody>
           </table>
         </div>
-
-        <p className="text-xs text-gray-500 mt-3">
-          Tip: crea una plantilla por evento. Para mensajes iniciados fuera de
-          la ventana de 24 h de WhatsApp, usa plantillas aprobadas en tu
-          proveedor.
-        </p>
       </div>
     </div>
   );
