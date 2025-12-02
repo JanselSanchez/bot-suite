@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev --turbopack",
+    "dev": "cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 next dev --turbopack",
     "build": "next build --turbopack",
-    "start": "next start",
+    "start": "cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 next start",
     "lint": "eslint",
     "bot:worker": "cross-env DOTENV_CONFIG_PATH=.env.local tsx -r dotenv/config worker/botWorker.ts",
     "worker:notifications": "tsx workers/notifications.ts",
@@ -13,7 +13,7 @@
     "worker:reminders": "tsx workers/reminders.ts",
     "worker:outbox": "tsx workers/outbox.ts",
     "worker:whatsapp": "cross-env DOTENV_CONFIG_PATH=.env.local tsx -r dotenv/config worker/whatsappWorker.ts",
-    "wa:dev": "node whatsapp/wa-server.js"
+    "wa:dev": "cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 node whatsapp/wa-server.js"
   },
   "dependencies": {
     "@radix-ui/react-separator": "^1.1.7",
@@ -28,7 +28,6 @@
     "bullmq": "^5.61.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "cross-env": "^10.1.0",
     "date-fns": "^4.1.0",
     "date-fns-tz": "^3.2.0",
     "dotenv": "^17.2.3",
@@ -61,6 +60,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "autoprefixer": "^10.4.21",
+    "cross-env": "^10.1.0",
     "eslint": "^9",
     "eslint-config-next": "15.5.4",
     "postcss": "^8.5.6",

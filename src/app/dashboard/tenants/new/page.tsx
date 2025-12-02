@@ -3,12 +3,12 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Building2, ShieldCheck, Phone } from "lucide-react";
+import { Building2, ShieldCheck, Phone, Store, FileText } from "lucide-react";
 import { Button } from "@/componentes/ui/button";
+import { VERTICALS } from "@/app/lib/constants";
 
 const DEFAULT_TZ = "America/Santo_Domingo";
 
-// Normaliza a "whatsapp:+1XXXXXXXXXX" para RD, o respeta "whatsapp:+..."
 function normalizePhone(raw: string) {
   const s = (raw || "").trim();
   if (!s) return null;
@@ -22,7 +22,11 @@ function normalizePhone(raw: string) {
 
 export default function NewTenantPage() {
   const router = useRouter();
+  
+  // Estados del formulario
   const [name, setName] = useState("");
+  const [vertical, setVertical] = useState("general"); // 👈 Nuevo estado
+  const [description, setDescription] = useState("");  // 👈 Nuevo estado
   const [phone, setPhone] = useState("");
   const [timezone, setTimezone] = useState(DEFAULT_TZ);
   const [loading, setLoading] = useState(false);
@@ -36,15 +40,18 @@ export default function NewTenantPage() {
     try {
       const payload: any = {
         name: name.trim(),
+        vertical,        // 👈 Enviamos el tipo
+        description: description.trim() || null, // 👈 Enviamos la descripción
         timezone: timezone || DEFAULT_TZ,
       };
+      
       const normalized = normalizePhone(phone);
       if (normalized) payload.phone = normalized;
 
       const r = await fetch("/api/admin/new-business", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        credentials: "include", // IMPORTANTÍSIMO: envía la cookie de sesión
+        credentials: "include",
         body: JSON.stringify(payload),
       });
 
@@ -59,7 +66,6 @@ export default function NewTenantPage() {
         return;
       }
 
-      // opcional: j.tenantId queda como activo vía cookie
       router.push("/dashboard");
     } catch (e) {
       console.error(e);
@@ -71,7 +77,7 @@ export default function NewTenantPage() {
 
   return (
     <div className="relative">
-      {/* halo violeta suave */}
+      {/* Fondo decorativo */}
       <div className="pointer-events-none absolute inset-0 mx-auto max-w-5xl blur-3xl" aria-hidden>
         <div className="h-64 w-full rounded-full bg-gradient-to-r from-fuchsia-400/15 via-violet-400/15 to-indigo-400/15" />
       </div>
@@ -86,42 +92,84 @@ export default function NewTenantPage() {
             <div className="flex-1">
               <h1 className="text-2xl font-semibold tracking-tight text-gray-900">Crear negocio</h1>
               <p className="mt-1 text-sm text-gray-500">
-                Este será tu espacio de trabajo para <span className="font-medium text-gray-700">citas, plantillas y bot</span>.
+                Define la identidad de tu negocio para configurar <span className="font-medium text-gray-700">la IA y el Bot</span>.
               </p>
             </div>
           </div>
 
           {/* Body */}
-          <div className="p-6 md:p-8">
-            <label className="block text-sm font-medium text-gray-700">Nombre</label>
-            <input
-              className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
-              placeholder="Ej. Barbería Luis"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
+          <div className="p-6 md:p-8 space-y-6">
+            
+            {/* 1. Nombre */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Nombre del Negocio</label>
+              <input
+                className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
+                placeholder="Ej. Barbería Luis"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </div>
 
-            <div className="mt-5">
+            {/* 2. Tipo de Negocio (Vertical) - NUEVO */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Tipo de Negocio</label>
+              <p className="text-xs text-gray-400 mb-2">Esto ayuda a la IA a saber cómo hablar (ej. citas vs reservas).</p>
+              <div className="flex items-center gap-2">
+                <div className="grid h-11 w-11 place-items-center rounded-2xl border border-gray-200 bg-white shadow-sm shrink-0">
+                   <Store className="h-5 w-5 text-gray-500" />
+                </div>
+                <select
+                  className="flex-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200 cursor-pointer"
+                  value={vertical}
+                  onChange={(e) => setVertical(e.target.value)}
+                >
+                  {VERTICALS.map((v) => (
+                    <option key={v.value} value={v.value}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* 3. Descripción (Contexto IA) - NUEVO */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Descripción breve</label>
+              <p className="text-xs text-gray-400 mb-2">Dale contexto al bot: ¿Qué servicios principales ofreces?</p>
+              <div className="flex items-start gap-2">
+                 <div className="grid h-11 w-11 place-items-center rounded-2xl border border-gray-200 bg-white shadow-sm shrink-0 mt-0.5">
+                   <FileText className="h-5 w-5 text-gray-500" />
+                </div>
+                <textarea
+                  className="flex-1 rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200 min-h-[80px] resize-none"
+                  placeholder="Ej. Especialistas en cortes modernos, barbas y faciales. Ubicados en el centro."
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {/* 4. WhatsApp */}
+            <div>
               <label className="block text-sm font-medium text-gray-700">
                 WhatsApp / Teléfono <span className="text-gray-400">(opcional)</span>
               </label>
               <div className="mt-1 flex items-center gap-2">
-                <div className="grid h-11 w-11 place-items-center rounded-2xl border border-gray-200 bg-white shadow-sm">
+                <div className="grid h-11 w-11 place-items-center rounded-2xl border border-gray-200 bg-white shadow-sm shrink-0">
                   <Phone className="h-5 w-5 text-gray-500" />
                 </div>
                 <input
                   className="flex-1 rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
-                  placeholder="+1829XXXXXXX o 829-XXX-XXXX"
+                  placeholder="+1829XXXXXXX"
                   value={phone}
                   onChange={(e) => setPhone(e.target.value)}
                 />
               </div>
-              <p className="mt-1 text-xs text-gray-400">
-                Se guardará como <code>whatsapp:+1XXXXXXXXXX</code> si es RD.
-              </p>
             </div>
 
-            <div className="mt-5">
+            {/* 5. Zona Horaria */}
+            <div>
               <label className="block text-sm font-medium text-gray-700">Zona horaria</label>
               <select
                 className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
@@ -135,8 +183,8 @@ export default function NewTenantPage() {
               </select>
             </div>
 
-            {/* CTA */}
-            <div className="mt-8 flex items-center justify-between gap-4">
+            {/* Botón Guardar */}
+            <div className="pt-4 flex items-center justify-between gap-4">
               <div className="hidden items-center gap-2 text-sm text-gray-500 md:flex">
                 <ShieldCheck className="h-4 w-4 text-violet-500" />
                 <span>Podrás cambiar esto luego en Configuración.</span>

@@ -7,8 +7,6 @@ import {
   disconnectSession,
 } from "@/server/whatsapp/baileysManager";
 
-export const runtime = "nodejs";
-
 type SessionStatus =
   | "disconnected"
   | "qrcode"
@@ -19,332 +17,241 @@ type SessionStatus =
 interface SessionDTO {
   id: string;
   status: SessionStatus;
-  qr_svg?: string | null;
   qr_data?: string | null;
+  qr_svg?: string | null;
   phone_number?: string | null;
   last_connected_at?: string | null;
 }
 
-interface TenantMeta {
-  id: string;
-  name?: string | null;
-  wa_connected?: boolean | null;
-  wa_phone?: string | null;
-  wa_last_connected_at?: string | null;
-}
-
-/**
- * Carga los datos básicos del tenant, incluyendo flags de WhatsApp.
- */
-async function fetchTenantMeta(tenantId: string): Promise<TenantMeta> {
-  const { data, error } = await supabaseAdmin
-    .from("tenants")
-    .select("id, name, wa_connected, wa_phone, wa_last_connected_at")
-    .eq("id", tenantId)
-    .maybeSingle();
-
-  if (error || !data) {
-    throw new Error(
-      `TENANT_NOT_FOUND: ${error?.message ?? "no se encontró el tenant"}`,
-    );
-  }
-
-  return data;
-}
-
-/**
- * Asegura que exista una fila de whatsapp_sessions para un tenant.
- * Si ya existe, la devuelve; si no, crea una nueva básica.
- *
- * IMPORTANTE: si el tenant ya tiene wa_connected = TRUE, la fila nueva
- * se crea marcando status = 'connected' y copiando wa_phone/wa_last_connected_at.
- */
-async function ensureSessionRow(tenant: TenantMeta) {
-  const tenantId = tenant.id;
-
-  // 1) ¿Ya existe una sesión para este tenant?
-  const { data: existing, error } = await supabaseAdmin
-    .from("whatsapp_sessions")
-    .select(
-      "id, tenant_id, status, qr_data, qr_svg, phone_number, last_connected_at",
-    )
-    .eq("tenant_id", tenantId)
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) {
-    throw new Error(
-      `ERROR_LOADING_SESSION_ROW: ${error.message ?? String(error)}`,
-    );
-  }
-
-  if (existing) return existing;
-
-  // 2) Crear una nueva sesión
-  const id = randomUUID();
-
-  const initialStatus: SessionStatus = tenant.wa_connected ? "connected" : "disconnected";
-
-  const { data: inserted, error: insertError } = await supabaseAdmin
-    .from("whatsapp_sessions")
-    .insert({
-      id,
-      tenant_id: tenantId,
-      status: initialStatus,
-      is_active: true,
-      label: "Principal",
-      phone_number: tenant.wa_phone ?? null,
-      last_connected_at: tenant.wa_last_connected_at ?? null,
-    })
-    .select(
-      "id, tenant_id, status, qr_data, qr_svg, phone_number, last_connected_at",
-    )
-    .single();
-
-  if (insertError || !inserted) {
-    throw new Error(
-      `ERROR_CREATING_SESSION_ROW: ${
-        insertError?.message ?? "sin detalles"
-      }`,
-    );
-  }
-
-  return inserted;
-}
-
-/**
- * Mapea la fila de BD al DTO que espera el frontend.
- * Si el tenant tiene wa_connected = TRUE, forzamos status = "connected"
- * y usamos wa_phone / wa_last_connected_at como fuente de verdad.
- */
-function mapRowToSessionDTO(row: any, tenant?: TenantMeta): SessionDTO {
-  const tenantConnected = !!tenant?.wa_connected;
-
-  const status: SessionStatus = tenantConnected
-    ? "connected"
-    : ((row?.status as SessionStatus) || "disconnected");
-
-  const phone =
-    (tenantConnected ? tenant?.wa_phone : undefined) ??
-    row?.phone_number ??
-    null;
-
-  const lastConnected =
-    (tenantConnected ? tenant?.wa_last_connected_at : undefined) ??
-    row?.last_connected_at ??
-    null;
-
-  return {
-    id: row.id,
-    status,
-    qr_data: tenantConnected ? null : row.qr_data ?? null,
-    qr_svg: tenantConnected ? null : row.qr_svg ?? null,
-    phone_number: phone,
-    last_connected_at: lastConnected,
-  };
-}
+type SessionResponse =
+  | {
+      ok: true;
+      session: SessionDTO | null;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
 
 /**
  * GET /api/wa/session?tenantId=...
- * - Lee el tenant (incluye wa_connected/wa_phone).
- * - Asegura que exista whatsapp_sessions para ese tenant.
- * - Si el tenant NO está conectado (wa_connected = false),
- *   levanta/recupera la sesión de Baileys y genera QR si hace falta.
- * - Devuelve estado + QR de ese negocio.
+ *
+ * SOLO LEE de la tabla whatsapp_sessions.
+ * No toca Baileys, no crea sockets, no genera QR.
  */
 export async function GET(req: Request) {
-  try {
-    const url = new URL(req.url);
-    const tenantId = url.searchParams.get("tenantId");
+  const { searchParams } = new URL(req.url);
+  const tenantId = searchParams.get("tenantId");
 
-    if (!tenantId) {
-      return NextResponse.json(
-        { ok: false, session: null, error: "TENANT_ID_REQUIRED" },
-        { status: 400 },
+  if (!tenantId) {
+    return NextResponse.json<SessionResponse>(
+      { ok: false, error: "Falta tenantId" },
+      { status: 400 }
+    );
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("whatsapp_sessions")
+      .select(
+        "id, status, qr_data, qr_svg, phone_number, last_connected_at"
+      )
+      .eq("tenant_id", tenantId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error("[wa/session][GET] error:", error);
+      return NextResponse.json<SessionResponse>(
+        { ok: false, error: "Error leyendo sesión" },
+        { status: 500 }
       );
     }
 
-    // 0) Cargamos info del tenant
-    const tenant = await fetchTenantMeta(tenantId);
-
-    // 1) Aseguramos fila de sesión en BD
-    let row = await ensureSessionRow(tenant);
-
-    // 2) Si el tenant NO está conectado por el servidor central
-    //    entonces sí levantamos Baileys multi-sesión.
-    if (!tenant.wa_connected) {
-      try {
-        await getOrCreateSession(row.id, tenantId);
-      } catch (e: any) {
-        console.error("[api/wa/session:GET] getOrCreateSession error:", e);
-        // Marcamos error de backend WA pero no tiramos el server abajo
-        return NextResponse.json(
-          {
-            ok: false,
-            session: mapRowToSessionDTO(row, tenant),
-            error: "WA_SESSION_ERROR",
-            details: String(e?.message || e),
-          },
-          { status: 502 },
-        );
-      }
-
-      // 3) Volvemos a leer la fila para coger status/qr actualizados
-      const { data: refreshed, error: refreshError } = await supabaseAdmin
-        .from("whatsapp_sessions")
-        .select(
-          "id, tenant_id, status, qr_data, qr_svg, phone_number, last_connected_at",
-        )
-        .eq("id", row.id)
-        .maybeSingle();
-
-      if (refreshError || !refreshed) {
-        console.error(
-          "[api/wa/session:GET] error refrescando fila:",
-          refreshError,
-        );
-      } else {
-        row = refreshed;
-      }
+    if (!data) {
+      // El negocio aún no tiene sesión creada
+      return NextResponse.json<SessionResponse>({
+        ok: true,
+        session: null,
+      });
     }
 
-    const session = mapRowToSessionDTO(row, tenant);
+    const session: SessionDTO = {
+      id: data.id,
+      status: data.status as SessionStatus,
+      qr_data: data.qr_data,
+      qr_svg: data.qr_svg,
+      phone_number: data.phone_number,
+      last_connected_at: data.last_connected_at,
+    };
 
-    return NextResponse.json(
-      {
-        ok: true,
-        session,
-        error: null,
-      },
-      { status: 200 },
-    );
-  } catch (err: any) {
-    console.error("[api/wa/session:GET] internal error:", err);
-    return NextResponse.json(
-      {
-        ok: false,
-        session: null,
-        error: "internal_error",
-        details: String(err?.message || err),
-      },
-      { status: 500 },
+    return NextResponse.json<SessionResponse>({
+      ok: true,
+      session,
+    });
+  } catch (err) {
+    console.error("[wa/session][GET] unexpected error:", err);
+    return NextResponse.json<SessionResponse>(
+      { ok: false, error: "Error inesperado" },
+      { status: 500 }
     );
   }
 }
 
 /**
  * POST /api/wa/session
- * Body: { tenantId, action: "connect" | "disconnect" }
+ *
+ * body: { tenantId: string, action: "connect" | "disconnect" }
  */
 export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({} as any));
-    const tenantId: string | undefined = body?.tenantId;
-    const action: "connect" | "disconnect" | undefined = body?.action;
+    const body = await req.json().catch(() => ({}));
+    const { tenantId, action } = body as {
+      tenantId?: string;
+      action?: "connect" | "disconnect";
+    };
 
-    if (!tenantId) {
-      return NextResponse.json(
-        { ok: false, session: null, error: "TENANT_ID_REQUIRED" },
-        { status: 400 },
+    if (!tenantId || !action) {
+      return NextResponse.json<SessionResponse>(
+        { ok: false, error: "Faltan tenantId o action" },
+        { status: 400 }
       );
     }
-
-    if (!action) {
-      return NextResponse.json(
-        { ok: false, session: null, error: "ACTION_REQUIRED" },
-        { status: 400 },
-      );
-    }
-
-    // 0) Info del tenant
-    const tenant = await fetchTenantMeta(tenantId);
-
-    // 1) Aseguramos fila de sesión
-    const row = await ensureSessionRow(tenant);
 
     if (action === "connect") {
-      // Si ya está conectado por el servidor central (wa_server.js),
-      // no intentamos levantar otra sesión por Baileys multi-sesión.
-      if (!tenant.wa_connected) {
+      // 1) Buscar sesión existente del tenant
+      const { data: existing, error: queryError } = await supabaseAdmin
+        .from("whatsapp_sessions")
+        .select("id, status")
+        .eq("tenant_id", tenantId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (queryError) {
+        console.error("[wa/session][POST][connect] query error:", queryError);
+        return NextResponse.json<SessionResponse>(
+          { ok: false, error: "Error buscando sesión" },
+          { status: 500 }
+        );
+      }
+
+      let sessionId = existing?.id ?? randomUUID();
+
+      // 2) UPSERT de la fila en whatsapp_sessions
+      const { error: upsertError } = await supabaseAdmin
+        .from("whatsapp_sessions")
+        .upsert(
+          {
+            id: sessionId,
+            tenant_id: tenantId,
+            status: "connecting",
+            qr_data: null,
+            qr_svg: null,
+            last_error: null,
+          },
+          { onConflict: "id" }
+        );
+
+      if (upsertError) {
+        console.error("[wa/session][POST][connect] upsert error:", upsertError);
+        return NextResponse.json<SessionResponse>(
+          { ok: false, error: "Error creando sesión" },
+          { status: 500 }
+        );
+      }
+
+      // 3) Llamar a Baileys para iniciar / reutilizar la sesión
+      //    Esto dispara los connection.update (incluyendo el QR).
+      try {
+        await getOrCreateSession(sessionId, tenantId);
+      } catch (err) {
+        console.error("[wa/session][POST][connect] Baileys error:", err);
+        return NextResponse.json<SessionResponse>(
+          { ok: false, error: "Error inicializando Baileys" },
+          { status: 500 }
+        );
+      }
+
+      return NextResponse.json<SessionResponse>({
+        ok: true,
+        session: {
+          id: sessionId,
+          status: "connecting",
+        },
+      });
+    }
+
+    if (action === "disconnect") {
+      // 1) Buscar sesión actual del tenant
+      const { data: existing, error: queryError } = await supabaseAdmin
+        .from("whatsapp_sessions")
+        .select("id")
+        .eq("tenant_id", tenantId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (queryError) {
+        console.error("[wa/session][POST][disconnect] query error:", queryError);
+        return NextResponse.json<SessionResponse>(
+          { ok: false, error: "Error buscando sesión" },
+          { status: 500 }
+        );
+      }
+
+      if (existing?.id) {
         try {
-          await getOrCreateSession(row.id, tenantId);
-        } catch (e: any) {
-          console.error("[api/wa/session:POST] getOrCreateSession error:", e);
-          return NextResponse.json(
-            {
-              ok: false,
-              session: mapRowToSessionDTO(row, tenant),
-              error: "WA_SESSION_ERROR",
-              details: String(e?.message || e),
-            },
-            { status: 502 },
+          await disconnectSession(existing.id);
+        } catch (err) {
+          console.error(
+            "[wa/session][POST][disconnect] disconnectSession error:",
+            err
           );
         }
       }
-    } else if (action === "disconnect") {
-      // Desconectamos solo la sesión local de Baileys.
-      // El flag tenants.wa_connected lo gestiona el servidor WA central.
-      try {
-        await disconnectSession(row.id);
-      } catch (e: any) {
-        console.error("[api/wa/session:POST] disconnectSession error:", e);
-        return NextResponse.json(
-          {
-            ok: false,
-            session: mapRowToSessionDTO(row, tenant),
-            error: "WA_DISCONNECT_ERROR",
-            details: String(e?.message || e),
-          },
-          { status: 502 },
+
+      // 2) Marcar en BD como desconectada
+      const { error: updateError } = await supabaseAdmin
+        .from("whatsapp_sessions")
+        .update({
+          status: "disconnected",
+          qr_data: null,
+          qr_svg: null,
+          last_seen_at: new Date(),
+        })
+        .eq("tenant_id", tenantId);
+
+      if (updateError) {
+        console.error(
+          "[wa/session][POST][disconnect] update error:",
+          updateError
         );
       }
-    }
 
-    // 2) Leemos estado actualizado (puede haber cambiado whatsapp_sessions)
-    const { data: refreshed, error } = await supabaseAdmin
-      .from("whatsapp_sessions")
-      .select(
-        "id, tenant_id, status, qr_data, qr_svg, phone_number, last_connected_at",
-      )
-      .eq("id", row.id)
-      .maybeSingle();
+      // Marcar también el tenant como desconectado
+      await supabaseAdmin
+        .from("tenants")
+        .update({ wa_connected: false })
+        .eq("id", tenantId);
 
-    const effectiveRow = refreshed ?? row;
-
-    if (error && !refreshed) {
-      console.error("[api/wa/session:POST] error refrescando fila:", error);
-      return NextResponse.json(
-        {
-          ok: false,
-          session: null,
-          error: "SESSION_REFRESH_ERROR",
-          details: error?.message ?? null,
-        },
-        { status: 500 },
-      );
-    }
-
-    const session = mapRowToSessionDTO(effectiveRow, tenant);
-
-    return NextResponse.json(
-      {
+      return NextResponse.json<SessionResponse>({
         ok: true,
-        session,
-        error: null,
-      },
-      { status: 200 },
-    );
-  } catch (err: any) {
-    console.error("[api/wa/session:POST] internal error:", err);
-    return NextResponse.json(
-      {
-        ok: false,
         session: null,
-        error: "internal_error",
-        details: String(err?.message || err),
-      },
-      { status: 500 },
+      });
+    }
+
+    // Acción no soportada
+    return NextResponse.json<SessionResponse>(
+      { ok: false, error: "Acción no soportada" },
+      { status: 400 }
+    );
+  } catch (err) {
+    console.error("[wa/session][POST] unexpected error:", err);
+    return NextResponse.json<SessionResponse>(
+      { ok: false, error: "Error inesperado" },
+      { status: 500 }
     );
   }
 }
