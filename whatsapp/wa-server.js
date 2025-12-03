@@ -481,7 +481,7 @@ app.get("/api/v1/availability", async (req, res) => {
   res.json({
     ok: true,
     available_slots_count: slots.length,
-    available_slots: formattedSlots.slice(0, 10),
+    available_slots: formattedSlots.slice(0, 40),
   });
 });
 
