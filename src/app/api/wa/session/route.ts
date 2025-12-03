@@ -1,256 +1,111 @@
 // src/app/api/wa/session/route.ts
 import { NextResponse } from "next/server";
-import { randomUUID } from "crypto";
-import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
-import {
-  getOrCreateSession,
-  disconnectSession,
-} from "@/server/whatsapp/baileysManager";
 
-type SessionStatus =
-  | "disconnected"
-  | "qrcode"
-  | "connecting"
-  | "connected"
-  | "error";
+// 1. URL del Servidor de Bots (Lee la variable de entorno que configuraste en Vercel/Render)
+const WA_BOT_URL = process.env.NEXT_PUBLIC_WA_SERVER_URL || "http://localhost:4001";
 
-interface SessionDTO {
-  id: string;
-  status: SessionStatus;
-  qr_data?: string | null;
-  qr_svg?: string | null;
-  phone_number?: string | null;
-  last_connected_at?: string | null;
-}
-
-type SessionResponse =
-  | {
-      ok: true;
-      session: SessionDTO | null;
-    }
-  | {
-      ok: false;
-      error: string;
-    };
+// Configuraciones para evitar caché en Vercel
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 /**
- * GET /api/wa/session?tenantId=...
- *
- * SOLO LEE de la tabla whatsapp_sessions.
- * No toca Baileys, no crea sockets, no genera QR.
+ * GET: Obtener estado actual de la sesión
+ * El Frontend llama aquí -> Este archivo llama a Render -> Render responde
  */
 export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const tenantId = searchParams.get("tenantId");
-
-  if (!tenantId) {
-    return NextResponse.json<SessionResponse>(
-      { ok: false, error: "Falta tenantId" },
-      { status: 400 }
-    );
-  }
-
   try {
-    const { data, error } = await supabaseAdmin
-      .from("whatsapp_sessions")
-      .select(
-        "id, status, qr_data, qr_svg, phone_number, last_connected_at"
-      )
-      .eq("tenant_id", tenantId)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const { searchParams } = new URL(req.url);
+    const tenantId = searchParams.get("tenantId");
 
-    if (error) {
-      console.error("[wa/session][GET] error:", error);
-      return NextResponse.json<SessionResponse>(
-        { ok: false, error: "Error leyendo sesión" },
-        { status: 500 }
-      );
+    if (!tenantId) {
+      return NextResponse.json({ ok: false, error: "Falta tenantId" }, { status: 400 });
     }
 
-    if (!data) {
-      // El negocio aún no tiene sesión creada
-      return NextResponse.json<SessionResponse>({
-        ok: true,
-        session: null,
-      });
-    }
+    console.log(`[Proxy] Consultando estado a: ${WA_BOT_URL}/sessions/${tenantId}`);
 
-    const session: SessionDTO = {
-      id: data.id,
-      status: data.status as SessionStatus,
-      qr_data: data.qr_data,
-      qr_svg: data.qr_svg,
-      phone_number: data.phone_number,
-      last_connected_at: data.last_connected_at,
-    };
-
-    return NextResponse.json<SessionResponse>({
-      ok: true,
-      session,
+    // Llamada al Servidor de Bots (Render)
+    const res = await fetch(`${WA_BOT_URL}/sessions/${tenantId}`, {
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" }
     });
-  } catch (err) {
-    console.error("[wa/session][GET] unexpected error:", err);
-    return NextResponse.json<SessionResponse>(
-      { ok: false, error: "Error inesperado" },
-      { status: 500 }
+
+    if (!res.ok) {
+      // Si el servidor de bots está apagado o da error
+      console.warn("[Proxy] El servidor de bots devolvió error o está offline");
+      return NextResponse.json({ 
+        ok: true, 
+        session: { status: "disconnected" } // Asumimos desconectado si falla
+      }); 
+    }
+
+    const data = await res.json(); 
+    // Data viene del bot así: { ok: true, status: '...', qr: '...', phone: '...' }
+
+    // Transformamos la respuesta para que tu Frontend la entienda (SessionDTO)
+    return NextResponse.json({
+      ok: true,
+      session: {
+        id: tenantId,
+        status: data.status,
+        qr_data: data.qr || null, // Mapeamos 'qr' del bot a 'qr_data' del frontend
+        phone_number: data.phone || null,
+      },
+    });
+
+  } catch (error) {
+    console.error("[Proxy] Error de conexión con wa-server:", error);
+    return NextResponse.json(
+      { ok: false, error: "No se pudo conectar con el servidor de WhatsApp" },
+      { status: 502 }
     );
   }
 }
 
 /**
- * POST /api/wa/session
- *
- * body: { tenantId: string, action: "connect" | "disconnect" }
+ * POST: Conectar (Generar QR) o Desconectar
  */
 export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({}));
-    const { tenantId, action } = body as {
-      tenantId?: string;
-      action?: "connect" | "disconnect";
-    };
+    const body = await req.json();
+    const { tenantId, action } = body; // action: 'connect' | 'disconnect'
 
     if (!tenantId || !action) {
-      return NextResponse.json<SessionResponse>(
-        { ok: false, error: "Faltan tenantId o action" },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "Faltan datos (tenantId o action)" }, { status: 400 });
     }
 
-    if (action === "connect") {
-      // 1) Buscar sesión existente del tenant
-      const { data: existing, error: queryError } = await supabaseAdmin
-        .from("whatsapp_sessions")
-        .select("id, status")
-        .eq("tenant_id", tenantId)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+    // Definimos a qué endpoint del bot llamar
+    const endpoint = action === "disconnect" 
+        ? `${WA_BOT_URL}/sessions/${tenantId}/disconnect`
+        : `${WA_BOT_URL}/sessions/${tenantId}/connect`;
 
-      if (queryError) {
-        console.error("[wa/session][POST][connect] query error:", queryError);
-        return NextResponse.json<SessionResponse>(
-          { ok: false, error: "Error buscando sesión" },
-          { status: 500 }
-        );
-      }
+    console.log(`[Proxy] Enviando acción '${action}' a: ${endpoint}`);
 
-      let sessionId = existing?.id ?? randomUUID();
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    
+    // Si el bot responde, devolvemos su respuesta
+    const data = await res.json();
 
-      // 2) UPSERT de la fila en whatsapp_sessions
-      const { error: upsertError } = await supabaseAdmin
-        .from("whatsapp_sessions")
-        .upsert(
-          {
-            id: sessionId,
-            tenant_id: tenantId,
-            status: "connecting",
-            qr_data: null,
-            qr_svg: null,
-            last_error: null,
-          },
-          { onConflict: "id" }
-        );
+    if (!res.ok) {
+      return NextResponse.json({ ok: false, error: data.error || "Error en el servidor de bots" }, { status: 500 });
+    }
 
-      if (upsertError) {
-        console.error("[wa/session][POST][connect] upsert error:", upsertError);
-        return NextResponse.json<SessionResponse>(
-          { ok: false, error: "Error creando sesión" },
-          { status: 500 }
-        );
-      }
-
-      // 3) Llamar a Baileys para iniciar / reutilizar la sesión
-      //    Esto dispara los connection.update (incluyendo el QR).
-      try {
-        await getOrCreateSession(sessionId, tenantId);
-      } catch (err) {
-        console.error("[wa/session][POST][connect] Baileys error:", err);
-        return NextResponse.json<SessionResponse>(
-          { ok: false, error: "Error inicializando Baileys" },
-          { status: 500 }
-        );
-      }
-
-      return NextResponse.json<SessionResponse>({
+    // Respuesta exitosa
+    return NextResponse.json({
         ok: true,
         session: {
-          id: sessionId,
-          status: "connecting",
-        },
-      });
-    }
-
-    if (action === "disconnect") {
-      // 1) Buscar sesión actual del tenant
-      const { data: existing, error: queryError } = await supabaseAdmin
-        .from("whatsapp_sessions")
-        .select("id")
-        .eq("tenant_id", tenantId)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (queryError) {
-        console.error("[wa/session][POST][disconnect] query error:", queryError);
-        return NextResponse.json<SessionResponse>(
-          { ok: false, error: "Error buscando sesión" },
-          { status: 500 }
-        );
-      }
-
-      if (existing?.id) {
-        try {
-          await disconnectSession(existing.id);
-        } catch (err) {
-          console.error(
-            "[wa/session][POST][disconnect] disconnectSession error:",
-            err
-          );
+            id: tenantId,
+            status: data.status,
+            qr_data: data.qr || null,
         }
-      }
+    });
 
-      // 2) Marcar en BD como desconectada
-      const { error: updateError } = await supabaseAdmin
-        .from("whatsapp_sessions")
-        .update({
-          status: "disconnected",
-          qr_data: null,
-          qr_svg: null,
-          last_seen_at: new Date(),
-        })
-        .eq("tenant_id", tenantId);
-
-      if (updateError) {
-        console.error(
-          "[wa/session][POST][disconnect] update error:",
-          updateError
-        );
-      }
-
-      // Marcar también el tenant como desconectado
-      await supabaseAdmin
-        .from("tenants")
-        .update({ wa_connected: false })
-        .eq("id", tenantId);
-
-      return NextResponse.json<SessionResponse>({
-        ok: true,
-        session: null,
-      });
-    }
-
-    // Acción no soportada
-    return NextResponse.json<SessionResponse>(
-      { ok: false, error: "Acción no soportada" },
-      { status: 400 }
-    );
-  } catch (err) {
-    console.error("[wa/session][POST] unexpected error:", err);
-    return NextResponse.json<SessionResponse>(
-      { ok: false, error: "Error inesperado" },
+  } catch (error) {
+    console.error("[Proxy] Error crítico enviando acción:", error);
+    return NextResponse.json(
+      { ok: false, error: "Error de comunicación con el servidor de bots" },
       { status: 500 }
     );
   }
