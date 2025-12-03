@@ -6,7 +6,7 @@ import QRCode from "react-qr-code";
 import { Separator } from "@radix-ui/react-separator";
 import { Button } from "@/componentes/ui/button";
 import { useActiveTenant } from "@/app/providers/active-tenant";
-import { LogOut } from "lucide-react"; // Importamos icono para el botón de salir
+import { LogOut, Link as LinkIcon, Check } from "lucide-react";
 
 type ServerStatus = {
   ok: boolean;
@@ -61,6 +61,9 @@ export default function ConnectWhatsAppPage() {
   const [sessionError, setSessionError] = useState<string | null>(null);
 
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+  
+  // Estado para el botón de copiar link
+  const [copiedLink, setCopiedLink] = useState(false);
 
   // 1) Estado global del servidor WA
   async function fetchServerStatus() {
@@ -138,7 +141,6 @@ export default function ConnectWhatsAppPage() {
   async function handleAction(action: "connect" | "disconnect") {
     if (!tenantId) return;
     setSessionLoading(true);
-    // Si desconectamos, limpiamos datos locales para feedback inmediato
     if (action === "disconnect") {
         setSession(null);
         setTenantWaConnected(false);
@@ -164,7 +166,15 @@ export default function ConnectWhatsAppPage() {
     }
   }
 
-  // Polling cada 5s
+  // 5) Copiar Link Remoto
+  const copyRemoteLink = () => {
+    if (!tenantId) return;
+    const link = `${window.location.origin}/connect/${tenantId}`;
+    navigator.clipboard.writeText(link);
+    setCopiedLink(true);
+    setTimeout(() => setCopiedLink(false), 2000);
+  };
+
   useEffect(() => {
     if (loadingTenant) return;
     setSession(null);
@@ -223,7 +233,6 @@ export default function ConnectWhatsAppPage() {
         <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 flex flex-col md:flex-row gap-6 shadow-xl shadow-black/40">
           <div className="flex-1 flex flex-col items-center justify-center">
             
-            {/* OFFLINE */}
             {!isServerOnline && (
               <div className="text-center">
                 <p className="text-red-400 text-sm mb-2">El servidor de WhatsApp está OFFLINE.</p>
@@ -231,7 +240,6 @@ export default function ConnectWhatsAppPage() {
               </div>
             )}
 
-            {/* SIN TENANT */}
             {isServerOnline && !tenantId && (
               <div className="text-center">
                 <p className="text-amber-300 text-sm mb-2">No se detectó un negocio activo.</p>
@@ -239,7 +247,6 @@ export default function ConnectWhatsAppPage() {
               </div>
             )}
 
-            {/* CON TENANT */}
             {isServerOnline && tenantId && (
               <>
                 <p className="text-xs text-slate-400 mb-4">
@@ -254,7 +261,6 @@ export default function ConnectWhatsAppPage() {
                   <p className="text-slate-400 text-sm">Cargando estado...</p>
                 )}
 
-                {/* ESTADO: DESCONECTADO */}
                 {!sessionLoading && !isConnected && !showQr && rawStatus === "disconnected" && (
                   <div className="text-center">
                     <p className="text-slate-300 text-sm mb-2">Este negocio no tiene WhatsApp vinculado.</p>
@@ -268,7 +274,6 @@ export default function ConnectWhatsAppPage() {
                   </div>
                 )}
 
-                {/* ESTADO: CONECTANDO */}
                 {!sessionLoading && !isConnected && !showQr && rawStatus === "connecting" && (
                   <div className="text-center">
                     <p className="text-slate-300 text-sm mb-2">Iniciando conexión...</p>
@@ -276,20 +281,18 @@ export default function ConnectWhatsAppPage() {
                   </div>
                 )}
 
-                {/* ESTADO: MOSTRAR QR (FONDO BLANCO) */}
                 {!sessionLoading && showQr && (
                   <>
                     <p className="text-sm text-slate-300 mb-3 text-center">
                       Ve a WhatsApp &gt; Configuración &gt; Dispositivos vinculados &gt; Vincular
                     </p>
                     
-                    {/* AQUI ESTA LA CORRECCION DEL FONDO BLANCO */}
                     <div className="bg-white p-4 rounded-xl flex justify-center items-center">
                       <QRCode
                         value={session?.qr_data || ""}
                         size={220}
-                        bgColor="#FFFFFF" // Blanco puro
-                        fgColor="#000000" // Negro puro
+                        bgColor="#FFFFFF"
+                        fgColor="#000000"
                         level="M"
                         style={{ height: "auto", maxWidth: "100%", width: "100%" }}
                         viewBox={`0 0 256 256`}
@@ -302,7 +305,6 @@ export default function ConnectWhatsAppPage() {
                   </>
                 )}
 
-                {/* ESTADO: CONECTADO (CON BOTÓN DE DESCONECTAR) */}
                 {!sessionLoading && isConnected && (
                   <div className="text-center animate-in fade-in zoom-in">
                     <p className="text-emerald-400 font-medium mb-2 text-lg">
@@ -312,7 +314,6 @@ export default function ConnectWhatsAppPage() {
                       Número: <span className="font-semibold text-slate-300">{connectedPhone || "..."}</span>
                     </p>
                     
-                    {/* BOTÓN NUEVO PARA DESCONECTAR */}
                     <Button
                       variant="destructive"
                       size="sm"
@@ -335,7 +336,6 @@ export default function ConnectWhatsAppPage() {
                   </div>
                 )}
 
-                {/* ESTADO: ERROR */}
                 {!sessionLoading && !showQr && !isConnected && rawStatus === "error" && (
                   <div className="text-center">
                     <p className="text-red-400 text-sm mb-2">Error en la sesión.</p>
@@ -352,8 +352,30 @@ export default function ConnectWhatsAppPage() {
             )}
           </div>
 
-          {/* SIDEBAR INSTRUCCIONES */}
           <div className="md:w-64 bg-slate-950/60 border border-slate-800 rounded-2xl p-4 text-sm flex flex-col gap-3">
+            
+            {/* --- SECCIÓN NUEVA: BOTÓN LINK REMOTO --- */}
+            <div className="bg-violet-500/10 border border-violet-500/20 rounded-xl p-3 mb-2">
+              <p className="text-xs text-violet-300 mb-2 font-medium">
+                ¿Cliente remoto?
+              </p>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="w-full bg-violet-600 hover:bg-violet-700 text-white border-none flex gap-2 items-center justify-center text-xs"
+                onClick={copyRemoteLink}
+              >
+                {copiedLink ? <Check className="w-3 h-3" /> : <LinkIcon className="w-3 h-3" />}
+                {copiedLink ? "¡Copiado!" : "Copiar Link de Conexión"}
+              </Button>
+              <p className="text-[10px] text-slate-500 mt-2 leading-tight">
+                Envía este enlace para que escanee desde su casa.
+              </p>
+            </div>
+            {/* ---------------------------------------- */}
+
+            <Separator className="bg-slate-800 my-1" />
+
             <h2 className="font-semibold text-slate-100 mb-1">Instrucciones</h2>
             <ol className="list-decimal list-inside space-y-1 text-slate-300 text-xs">
               <li>Abre WhatsApp en el celular.</li>
