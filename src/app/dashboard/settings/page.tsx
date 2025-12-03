@@ -19,7 +19,7 @@ const KEY_SELECTED_TENANT = "pb.selectedTenantId";
 
 type Membership = { tenant_id: string; tenant_name: string };
 
-// Normaliza a "whatsapp:+1..." si hace falta
+// Normaliza a "whatsapp:+1..."
 function normalizePhone(raw: string) {
   const s = (raw || "").trim();
   if (!s) return null;
@@ -31,7 +31,7 @@ function normalizePhone(raw: string) {
   return `whatsapp:${digits}`;
 }
 
-// helpers fecha <-> input "datetime-local"
+// Helpers de fecha
 function isoToLocalInput(iso: string | null) {
   if (!iso) return "";
   const d = new Date(iso);
@@ -51,26 +51,24 @@ function localInputToIso(val: string) {
 
 export default function SettingsPage() {
   const router = useRouter();
-
   const [loading, setLoading] = useState(true);
 
-  // selector
+  // Selector de Tenant
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [tenantId, setTenantId] = useState<string>("");
 
-  // datos básicos
+  // Datos Básicos
   const [name, setName] = useState("");
-  const [phone, setPhone] = useState(""); // sin "whatsapp:"
+  const [phone, setPhone] = useState(""); // Número de recepción/notificaciones
   const [timezone, setTimezone] = useState(DEFAULT_TZ);
-  const [status, setStatus] =
-    useState<"active" | "inactive" | "trial" | "blocked">("active");
+  const [status, setStatus] = useState<"active" | "inactive" | "trial" | "blocked">("active");
   const [saving, setSaving] = useState(false);
 
-  // facturación / gate
+  // Facturación
   const [validUntil, setValidUntil] = useState<string | null>(null);
   const [graceDays, setGraceDays] = useState<number>(0);
 
-  // recurso para el calendario
+  // Recurso para calendario
   const [resourceId, setResourceId] = useState<string | null>(null);
 
   // ---------- CARGA INICIAL ----------
@@ -95,14 +93,8 @@ export default function SettingsPage() {
 
       let initial = "";
       try {
-        const fromStorage =
-          typeof window !== "undefined"
-            ? localStorage.getItem(KEY_SELECTED_TENANT)
-            : null;
-        initial =
-          fromStorage && all.some((m) => m.tenant_id === fromStorage)
-            ? fromStorage
-            : all[0]?.tenant_id || "";
+        const fromStorage = typeof window !== "undefined" ? localStorage.getItem(KEY_SELECTED_TENANT) : null;
+        initial = fromStorage && all.some((m) => m.tenant_id === fromStorage) ? fromStorage : all[0]?.tenant_id || "";
       } catch {
         initial = all[0]?.tenant_id || "";
       }
@@ -117,15 +109,11 @@ export default function SettingsPage() {
     })();
   }, []);
 
-  // persistir selección
   useEffect(() => {
     if (!tenantId) return;
-    try {
-      localStorage.setItem(KEY_SELECTED_TENANT, tenantId);
-    } catch {}
+    try { localStorage.setItem(KEY_SELECTED_TENANT, tenantId); } catch {}
   }, [tenantId]);
 
-  // recarga al cambiar tenant
   useEffect(() => {
     if (!tenantId) return;
     (async () => {
@@ -161,34 +149,18 @@ export default function SettingsPage() {
     setPhone((t.phone ?? "").replace(/^whatsapp:/i, ""));
     setTimezone(t.timezone ?? DEFAULT_TZ);
     setStatus((t.status as any) ?? "active");
-
     setValidUntil(t.valid_until ? new Date(t.valid_until as string).toISOString() : null);
     setGraceDays(Number.isFinite(t.grace_days) ? Number(t.grace_days) : 0);
   }
 
   async function pickDefaultResource(tid: string) {
     let rid: string | null = null;
-
-    const { data: res1 } = await sb
-      .from("resources")
-      .select("id")
-      .eq("tenant_id", tid)
-      .limit(1);
-
+    const { data: res1 } = await sb.from("resources").select("id").eq("tenant_id", tid).limit(1);
     rid = res1?.[0]?.id ?? null;
-
-    if (!rid) {
-      const { data: res2 } = await sb
-        .from("staff")
-        .select("id")
-        .eq("tenant_id", tid)
-        .limit(1);
-      rid = res2?.[0]?.id ?? null;
-    }
     setResourceId(rid);
   }
 
-  // ====== GUARDADOS ======
+  // ====== GUARDAR CAMBIOS ======
 
   async function save() {
     if (!tenantId) return;
@@ -197,7 +169,7 @@ export default function SettingsPage() {
     const payload: Record<string, any> = {
       name: name.trim(),
       timezone,
-      phone: normalizePhone(phone),
+      phone: normalizePhone(phone), // Se guarda con formato whatsapp:+1...
     };
 
     const { error } = await sb.from("tenants").update(payload).eq("id", tenantId);
@@ -208,51 +180,36 @@ export default function SettingsPage() {
       alert(error.message || "No se pudo guardar");
     } else {
       setMemberships((prev) =>
-        prev.map((m) =>
-          m.tenant_id === tenantId ? { ...m, tenant_name: payload.name } : m
-        )
+        prev.map((m) => (m.tenant_id === tenantId ? { ...m, tenant_name: payload.name } : m))
       );
-      alert("Cambios guardados");
+      alert("Configuración guardada correctamente");
     }
   }
 
-  // Cambiar estado legacy (editable)
-  async function handleLegacyStatusChange(
-    newStatus: "active" | "inactive" | "trial" | "blocked"
-  ) {
+  // Cambiar estado legacy
+  async function handleLegacyStatusChange(newStatus: "active" | "inactive" | "trial" | "blocked") {
     if (!tenantId) return;
     const old = status;
     setStatus(newStatus);
-  
-    const { error } = await sb
-      .from("tenants")
-      .update({ status: newStatus })
-      .eq("id", tenantId);
-  
+    const { error } = await sb.from("tenants").update({ status: newStatus }).eq("id", tenantId);
     if (error) {
-      // 23514 = check_violation en Postgres
       if ((error as any).code === "23514") {
-        alert("Tu BD tiene un CHECK que no permite ese valor. Ajusta el constraint o deja el estado en 'active'.");
+        alert("Restricción de base de datos impide este estado.");
       } else {
-        alert(error.message || "No se pudo actualizar el estado");
+        alert(error.message || "Error actualizando estado");
       }
-      setStatus(old); // revertir en UI
+      setStatus(old);
     }
   }
-  
 
   async function updateField(patch: Partial<{ valid_until: string | null; grace_days: number }>) {
     if (!tenantId) return;
     const { error } = await sb.from("tenants").update(patch).eq("id", tenantId);
-    if (error) {
-      console.error("update tenants error:", error);
-      alert("No se pudo guardar. Revisa consola.");
-    }
+    if (error) alert("Error al guardar campo.");
   }
 
   async function handleSaveValidUntil(e: React.FormEvent) {
     e.preventDefault();
-    // `validUntil` ya está en ISO por el onChange => guardamos tal cual
     await updateField({ valid_until: validUntil });
   }
 
@@ -265,7 +222,6 @@ export default function SettingsPage() {
     await updateField({ valid_until: iso });
   }
 
-  // Suspender ahora: mueve la fecha al pasado más allá de la gracia actual
   async function handleSuspendNow() {
     const ms = ((graceDays ?? 0) + 1) * 24 * 60 * 60 * 1000;
     const past = new Date(Date.now() - ms).toISOString();
@@ -279,7 +235,6 @@ export default function SettingsPage() {
     await updateField({ grace_days: g });
   }
 
-  // ====== Estado calculado (igual que el webhook) ======
   const computedStatus = useMemo<"active" | "past_due" | "suspended">(() => {
     if (!validUntil) return "active";
     const dueMs = new Date(validUntil).getTime();
@@ -290,44 +245,40 @@ export default function SettingsPage() {
     return "active";
   }, [validUntil, graceDays]);
 
-  const canShowCalendar = useMemo<boolean>(
-    () => Boolean(tenantId && resourceId),
-    [tenantId, resourceId]
-  );
+  const canShowCalendar = useMemo<boolean>(() => Boolean(tenantId && resourceId), [tenantId, resourceId]);
 
   return (
     <div className="p-6 space-y-8">
-      {/* halo premium */}
-      <div
-        className="pointer-events-none absolute inset-x-0 top-28 mx-auto max-w-5xl blur-3xl"
-        aria-hidden
-      >
+      {/* Halo visual */}
+      <div className="pointer-events-none absolute inset-x-0 top-28 mx-auto max-w-5xl blur-3xl" aria-hidden>
         <div className="h-56 w-full rounded-full bg-gradient-to-r from-fuchsia-400/15 via-violet-400/15 to-indigo-400/15" />
       </div>
 
       <header className="relative z-10 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
         <div>
-          <h1 className="text-2xl font-semibold">Configuración del Tenant</h1>
-          <p className="text-sm text-gray-500">Branding, horarios y reglas operativas.</p>
+          <h1 className="text-2xl font-semibold">Configuración del Negocio</h1>
+          <p className="text-sm text-gray-500">Datos generales, notificaciones y horarios.</p>
         </div>
         {tenantId ? <SubscriptionBadge tenantId={tenantId} /> : null}
       </header>
 
-      {/* Datos del negocio */}
+      {/* --- DATOS DEL NEGOCIO --- */}
       <section className="relative z-10 rounded-3xl border border-white/60 bg-white/80 shadow-xl backdrop-blur-xl p-6 md:p-8">
         <div className="mb-6 flex items-start gap-3">
           <div className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white shadow">
             ⚙️
           </div>
           <div>
-            <h2 className="text-lg font-semibold tracking-tight">Datos del negocio</h2>
-            <p className="text-sm text-gray-500">Nombre, WhatsApp, zona horaria y estado.</p>
+            <h2 className="text-lg font-semibold tracking-tight">Datos Generales</h2>
+            <p className="text-sm text-gray-500">Información pública y de contacto.</p>
           </div>
         </div>
 
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-6 md:grid-cols-3">
+          
+          {/* Selector de Negocio */}
           <div className="md:col-span-1">
-            <label className="block text-sm font-medium text-gray-700">Negocio</label>
+            <label className="block text-sm font-medium text-gray-700">Seleccionar Negocio</label>
             <select
               className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
               value={tenantId}
@@ -340,173 +291,142 @@ export default function SettingsPage() {
                 </option>
               ))}
             </select>
-            {!memberships.length && (
-              <p className="mt-2 text-sm text-gray-500">No hay negocios aún.</p>
-            )}
+            {!memberships.length && <p className="mt-2 text-sm text-gray-500">No hay negocios aún.</p>}
           </div>
 
+          {/* Nombre */}
           <div>
-            <label className="block text-sm font-medium text-gray-700">Nombre</label>
+            <label className="block text-sm font-medium text-gray-700">Nombre Público</label>
             <input
               className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
               value={name}
               onChange={(e) => setName(e.target.value)}
+              placeholder="Ej. Barbería El Duro"
             />
           </div>
 
+          {/* --- TELÉFONO DE NOTIFICACIONES (IMPORTANTE) --- */}
           <div>
-            <label className="block text-sm font-medium text-gray-700">WhatsApp / Teléfono</label>
+            <label className="block text-sm font-medium text-gray-900">
+              WhatsApp (Recepción / Notificaciones)
+            </label>
             <input
               className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
-              placeholder="+1829XXXXXXX"
+              placeholder="Ej: 18295550000"
               value={phone}
               onChange={(e) => setPhone(e.target.value)}
             />
-            <p className="mt-1 text-xs text-gray-400">
-              Se guardará como <code>whatsapp:+…</code> en el campo <b>phone</b>.
+            <p className="mt-1 text-xs text-violet-600 font-medium">
+              🔔 A este número llegarán las alertas de citas.
             </p>
           </div>
 
-          {/* Estado legacy: EDITABLE */}
+          {/* Estado Legacy */}
           <div>
-            <label className="block text-sm font-medium text-gray-700">Estado (legacy)</label>
+            <label className="block text-sm font-medium text-gray-700">Estado Manual</label>
             <select
               className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
               value={status}
-              onChange={(e) =>
-                handleLegacyStatusChange(e.target.value as "active" | "inactive" | "trial" | "blocked")
-              }
+              onChange={(e) => handleLegacyStatusChange(e.target.value as any)}
             >
-              <option value="active">active</option>
-              <option value="inactive">inactive</option>
-              <option value="trial">trial</option>
-              <option value="blocked">blocked</option>
+              <option value="active">Activo</option>
+              <option value="inactive">Inactivo</option>
+              <option value="trial">Prueba</option>
+              <option value="blocked">Bloqueado</option>
             </select>
-            <p className="mt-1 text-xs text-gray-400">
-              Informativo. El encendido real del bot depende de <b>Vigente</b> + <b>Gracia</b>.
-            </p>
           </div>
         </div>
 
-        <div className="mt-6 flex justify-end gap-3">
+        <div className="mt-8 flex justify-end gap-3 border-t pt-4">
           <button
             type="button"
             onClick={() => router.push("/dashboard/tenants/new")}
-            className="rounded-2xl border px-5 py-2.5 text-sm text-gray-700 hover:bg-gray-50"
+            className="rounded-2xl border px-5 py-2.5 text-sm text-gray-700 hover:bg-gray-50 transition"
           >
-            Nuevo negocio
+            + Nuevo negocio
           </button>
           <button
             onClick={save}
             disabled={saving || !tenantId}
-            className="rounded-2xl bg-violet-600 px-6 py-2.5 font-medium text-white shadow-md transition hover:bg-violet-700 hover:shadow-lg active:scale-[.98] disabled:cursor-not-allowed disabled:opacity-60"
+            className="rounded-2xl bg-gray-900 px-6 py-2.5 font-medium text-white shadow-md transition hover:bg-black hover:shadow-lg active:scale-[.98] disabled:opacity-60"
           >
-            {saving ? "Guardando..." : "Guardar cambios"}
+            {saving ? "Guardando..." : "Guardar Configuración"}
           </button>
         </div>
       </section>
 
-      {/* === Facturación / Control del bot === */}
+      {/* === Facturación === */}
       <section className="relative z-10 rounded-3xl border border-white/60 bg-white/80 shadow-xl backdrop-blur-xl p-6 md:p-8 space-y-6">
         <div className="mb-2">
-          <h2 className="text-lg font-semibold tracking-tight">Facturación y control del bot</h2>
-          <p className="text-sm text-gray-500">
-            El webhook bloquea el bot si el vencimiento pasó (se considera el período de gracia).
-          </p>
+          <h2 className="text-lg font-semibold tracking-tight">Suscripción y Vencimiento</h2>
+          <div className="flex items-center gap-3 mt-2">
+            <span className="text-sm text-gray-600">Estado Calculado:</span>
+            <span className={`px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${
+              computedStatus === "active" ? "bg-emerald-100 text-emerald-700" : 
+              computedStatus === "past_due" ? "bg-amber-100 text-amber-700" : 
+              "bg-red-100 text-red-700"
+            }`}>
+              {computedStatus === "active" ? "Activo" : computedStatus === "past_due" ? "Gracia" : "Suspendido"}
+            </span>
+          </div>
         </div>
 
-        {/* Estado calculado */}
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-gray-600">Estado actual:</span>
-          <span
-            className={`px-2.5 py-1 rounded-full text-xs font-medium ${
-              computedStatus === "active"
-                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                : computedStatus === "past_due"
-                ? "bg-amber-50 text-amber-700 border border-amber-200"
-                : "bg-rose-50 text-rose-700 border border-rose-200"
-            }`}
-          >
-            {computedStatus === "active" ? "Activo" : computedStatus === "past_due" ? "Vencido (gracia)" : "Suspendido"}
-          </span>
-        </div>
-
-        {/* Vencimiento + Gracia */}
         <div className="grid gap-4 md:grid-cols-3">
           <div className="md:col-span-2">
-            <label className="block text-sm font-medium text-gray-700">Vigente hasta</label>
+            <label className="block text-sm font-medium text-gray-700">Fecha de Vencimiento</label>
             <form className="mt-1 flex flex-col sm:flex-row gap-3" onSubmit={handleSaveValidUntil}>
               <input
                 type="datetime-local"
-                className="w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
+                className="w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px]"
                 value={isoToLocalInput(validUntil)}
                 onChange={(e) => setValidUntil(localInputToIso(e.target.value))}
               />
-              <button className="rounded-2xl border px-5 py-2.5 text-sm text-gray-700 hover:bg-gray-50" type="submit">
-                Guardar fecha
-              </button>
-              <button
-                type="button"
-                onClick={handleExtend30}
-                className="rounded-2xl border px-5 py-2.5 text-sm text-gray-700 hover:bg-gray-50"
-              >
-                Extender 30 días
-              </button>
-              <button
-                type="button"
-                onClick={handleSuspendNow}
-                className="rounded-2xl border px-5 py-2.5 text-sm text-rose-700 hover:bg-rose-50"
-              >
-                Suspender ahora
-              </button>
+              <button className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50" type="submit">Guardar</button>
+              <button type="button" onClick={handleExtend30} className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50 text-blue-600 font-medium">+30 Días</button>
+              <button type="button" onClick={handleSuspendNow} className="rounded-xl border px-4 py-2 text-sm hover:bg-red-50 text-red-600 font-medium">Suspender</button>
             </form>
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-gray-700">Gracia (días)</label>
+            <label className="block text-sm font-medium text-gray-700">Días de Gracia</label>
             <input
               type="number"
               min={0}
-              className="mt-1 w-32 rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
+              className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5"
               value={graceDays}
               onChange={(e) => setGraceDays(Number(e.target.value))}
               onBlur={handleSaveGrace}
             />
-            <p className="mt-1 text-xs text-gray-400">
-              Tras vencer + gracia, el estado pasa a <b>Suspended</b>.
-            </p>
           </div>
         </div>
       </section>
 
       {/* Horarios */}
       <section className="space-y-4">
-        <h2 className="text-xl font-medium">Horarios de atención</h2>
+        <h2 className="text-xl font-medium text-gray-800">📅 Horarios de Atención</h2>
         {tenantId ? (
           <BusinessHoursEditor tenantId={tenantId} resourceId={resourceId} />
         ) : (
-          <div className="text-sm text-gray-500">
-            {loading ? "Cargando..." : "No se pudo cargar el tenant."}
-          </div>
+          <div className="text-sm text-gray-500">Cargando...</div>
         )}
       </section>
 
       {/* Excepciones */}
       <section className="space-y-4">
-        <h2 className="text-xl font-medium">Excepciones / Feriados</h2>
+        <h2 className="text-xl font-medium text-gray-800">⛔ Feriados y Cierres</h2>
         {tenantId ? <ExceptionsTable tenantId={tenantId} resourceId={resourceId} /> : null}
       </section>
 
       {/* Calendario */}
-      <section className="space-y-4">
-        <h2 className="text-xl font-medium">Vista previa de calendario</h2>
+      <section className="space-y-4 pb-10">
+        <h2 className="text-xl font-medium text-gray-800">👀 Vista Previa de Agenda</h2>
         {canShowCalendar ? (
-          <ResourceCalendar tenantId={tenantId} resourceId={resourceId as string} />
+          <div className="border rounded-3xl overflow-hidden shadow-sm">
+             <ResourceCalendar tenantId={tenantId} resourceId={resourceId as string} />
+          </div>
         ) : (
-          <div className="text-sm text-gray-500">
-            {loading
-              ? "Cargando calendario…"
-              : "No hay recurso asignado aún. Crea un recurso o selecciona uno para ver el calendario."}
+          <div className="text-sm text-gray-500 italic p-4 border rounded-xl bg-gray-50">
+            No hay recursos creados. Crea un barbero o doctor para ver el calendario.
           </div>
         )}
       </section>
