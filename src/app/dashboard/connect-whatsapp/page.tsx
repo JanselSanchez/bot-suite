@@ -6,6 +6,7 @@ import QRCode from "react-qr-code";
 import { Separator } from "@radix-ui/react-separator";
 import { Button } from "@/componentes/ui/button";
 import { useActiveTenant } from "@/app/providers/active-tenant";
+import { LogOut } from "lucide-react"; // Importamos icono para el botón de salir
 
 type ServerStatus = {
   ok: boolean;
@@ -38,11 +39,9 @@ type ActiveTenantResponse = {
   ok: boolean;
   tenantId: string | null;
   tenantName?: string | null;
-
   waConnected?: boolean;
   waPhone?: string | null;
   waLastConnectedAt?: string | null;
-
   error?: string;
 };
 
@@ -55,9 +54,7 @@ export default function ConnectWhatsAppPage() {
   const [tenantName, setTenantName] = useState<string | null>(null);
   const [tenantWaConnected, setTenantWaConnected] = useState(false);
   const [tenantWaPhone, setTenantWaPhone] = useState<string | null>(null);
-  const [tenantWaLastConnectedAt, setTenantWaLastConnectedAt] = useState<
-    string | null
-  >(null);
+  const [tenantWaLastConnectedAt, setTenantWaLastConnectedAt] = useState<string | null>(null);
 
   const [session, setSession] = useState<SessionDTO | null>(null);
   const [sessionLoading, setSessionLoading] = useState(false);
@@ -70,7 +67,6 @@ export default function ConnectWhatsAppPage() {
     try {
       const res = await fetch("/api/wa/status", { cache: "no-store" });
       const json = await res.json();
-
       setServerStatus({
         ok: json.ok ?? true,
         status: (json.status as ServerStatus["status"]) ?? "online",
@@ -84,7 +80,7 @@ export default function ConnectWhatsAppPage() {
     }
   }
 
-  // 2) Datos del tenant (nombre + estado WA guardado en BD)
+  // 2) Datos del tenant
   async function fetchActiveTenant() {
     if (!tenantId) {
       setTenantName(null);
@@ -93,11 +89,8 @@ export default function ConnectWhatsAppPage() {
       setTenantWaLastConnectedAt(null);
       return;
     }
-
     try {
-      const res = await fetch("/api/admin/tenants/activate", {
-        cache: "no-store",
-      });
+      const res = await fetch("/api/admin/tenants/activate", { cache: "no-store" });
       const json = (await res.json()) as ActiveTenantResponse;
 
       if (json.ok && json.tenantId) {
@@ -113,10 +106,6 @@ export default function ConnectWhatsAppPage() {
       }
     } catch (err) {
       console.error("[ConnectWhatsApp] fetchActiveTenant error:", err);
-      setTenantName(null);
-      setTenantWaConnected(false);
-      setTenantWaPhone(null);
-      setTenantWaLastConnectedAt(null);
     }
   }
 
@@ -134,7 +123,6 @@ export default function ConnectWhatsAppPage() {
       if (!json.ok) {
         throw new Error(json.error || "Error al cargar sesión de WhatsApp");
       }
-
       setSession(json.session);
       setSessionError(null);
     } catch (err: any) {
@@ -146,10 +134,15 @@ export default function ConnectWhatsAppPage() {
     }
   }
 
-  // 4) Acción conectar / desconectar para este negocio
+  // 4) Acción conectar / desconectar
   async function handleAction(action: "connect" | "disconnect") {
     if (!tenantId) return;
     setSessionLoading(true);
+    // Si desconectamos, limpiamos datos locales para feedback inmediato
+    if (action === "disconnect") {
+        setSession(null);
+        setTenantWaConnected(false);
+    }
     try {
       const res = await fetch("/api/wa/session", {
         method: "POST",
@@ -161,7 +154,6 @@ export default function ConnectWhatsAppPage() {
       if (!json.ok) {
         throw new Error(json.error || "Error al ejecutar acción");
       }
-
       await fetchSession();
       await fetchActiveTenant();
     } catch (err: any) {
@@ -172,13 +164,11 @@ export default function ConnectWhatsAppPage() {
     }
   }
 
-  // Cargar servidor + tenant + sesión cuando cambia el tenant activo
+  // Polling cada 5s
   useEffect(() => {
     if (loadingTenant) return;
-
     setSession(null);
     setSessionError(null);
-
     fetchServerStatus();
     fetchActiveTenant();
     fetchSession();
@@ -193,21 +183,13 @@ export default function ConnectWhatsAppPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId, loadingTenant]);
 
-  // Consideramos "online" por status, no por ok
-  const isServerOnline =
-    !serverStatus || serverStatus.status === "online" || serverStatus.ok;
-
+  const isServerOnline = !serverStatus || serverStatus.status === "online" || serverStatus.ok;
   const rawStatus: SessionStatus = session?.status ?? "disconnected";
   const hasQr = !!session?.qr_data;
-
-  const isConnected =
-    !hasQr && (tenantWaConnected || rawStatus === "connected");
-
+  const isConnected = !hasQr && (tenantWaConnected || rawStatus === "connected");
   const showQr = hasQr && !isConnected;
-
   const connectedPhone = tenantWaPhone || session?.phone_number || null;
-  const connectedAt =
-    tenantWaLastConnectedAt || session?.last_connected_at || null;
+  const connectedAt = tenantWaLastConnectedAt || session?.last_connected_at || null;
 
   return (
     <div className="min-h-screen w-full bg-slate-950 text-slate-50 flex flex-col items-center">
@@ -217,7 +199,7 @@ export default function ConnectWhatsAppPage() {
         </h1>
         <p className="text-slate-300 mb-4">
           Escanea el código QR con el WhatsApp del negocio para vincular el
-          asistente. Esta vinculación se hace una sola vez.
+          asistente.
         </p>
 
         <div className="flex items-center justify-between text-xs text-slate-400 mb-4">
@@ -240,37 +222,28 @@ export default function ConnectWhatsAppPage() {
 
         <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 flex flex-col md:flex-row gap-6 shadow-xl shadow-black/40">
           <div className="flex-1 flex flex-col items-center justify-center">
+            
+            {/* OFFLINE */}
             {!isServerOnline && (
               <div className="text-center">
-                <p className="text-red-400 text-sm mb-2">
-                  El servidor de WhatsApp está OFFLINE.
-                </p>
-                <p className="text-xs text-slate-500">
-                  Enciende el servidor Baileys o contacta soporte antes de
-                  intentar vincular un número.
-                </p>
+                <p className="text-red-400 text-sm mb-2">El servidor de WhatsApp está OFFLINE.</p>
+                <p className="text-xs text-slate-500">Contacta soporte.</p>
               </div>
             )}
 
+            {/* SIN TENANT */}
             {isServerOnline && !tenantId && (
               <div className="text-center">
-                <p className="text-amber-300 text-sm mb-2">
-                  No se detectó un negocio activo.
-                </p>
-                <p className="text-xs text-slate-500">
-                  Selecciona un negocio en el selector superior para vincular su
-                  WhatsApp.
-                </p>
+                <p className="text-amber-300 text-sm mb-2">No se detectó un negocio activo.</p>
+                <p className="text-xs text-slate-500">Selecciona un negocio arriba.</p>
               </div>
             )}
 
+            {/* CON TENANT */}
             {isServerOnline && tenantId && (
               <>
                 <p className="text-xs text-slate-400 mb-4">
-                  Negocio seleccionado:{" "}
-                  <span className="font-medium">
-                    {tenantName || tenantId}
-                  </span>
+                  Negocio: <span className="font-medium">{tenantName || tenantId}</span>
                 </p>
 
                 {sessionError && (
@@ -278,156 +251,117 @@ export default function ConnectWhatsAppPage() {
                 )}
 
                 {sessionLoading && (
-                  <p className="text-slate-400 text-sm">
-                    Cargando estado de WhatsApp...
-                  </p>
+                  <p className="text-slate-400 text-sm">Cargando estado...</p>
                 )}
 
-                {!sessionLoading &&
-                  !isConnected &&
-                  !showQr &&
-                  rawStatus === "disconnected" && (
-                    <div className="text-center">
-                      <p className="text-slate-300 text-sm mb-2">
-                        Este negocio aún no tiene WhatsApp vinculado.
-                      </p>
-                      <p className="text-xs text-slate-500 mb-3">
-                        Pulsa el botón para iniciar la vinculación y generar un
-                        código QR único para este negocio.
-                      </p>
-                      <Button
-                        size="sm"
-                        disabled={!isServerOnline}
-                        onClick={() => handleAction("connect")}
-                      >
-                        Conectar WhatsApp
-                      </Button>
-                    </div>
-                  )}
+                {/* ESTADO: DESCONECTADO */}
+                {!sessionLoading && !isConnected && !showQr && rawStatus === "disconnected" && (
+                  <div className="text-center">
+                    <p className="text-slate-300 text-sm mb-2">Este negocio no tiene WhatsApp vinculado.</p>
+                    <Button
+                      size="sm"
+                      disabled={!isServerOnline}
+                      onClick={() => handleAction("connect")}
+                    >
+                      Generar Código QR
+                    </Button>
+                  </div>
+                )}
 
-                {!sessionLoading &&
-                  !isConnected &&
-                  !showQr &&
-                  rawStatus === "connecting" && (
-                    <div className="text-center">
-                      <p className="text-slate-300 text-sm mb-2">
-                        Inicializando conexión con WhatsApp...
-                      </p>
-                      <p className="text-xs text-slate-500">
-                        Puede tardar unos segundos mientras se genera el código
-                        QR para este negocio.
-                      </p>
-                    </div>
-                  )}
+                {/* ESTADO: CONECTANDO */}
+                {!sessionLoading && !isConnected && !showQr && rawStatus === "connecting" && (
+                  <div className="text-center">
+                    <p className="text-slate-300 text-sm mb-2">Iniciando conexión...</p>
+                    <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white mx-auto"></div>
+                  </div>
+                )}
 
-                {/* --- SECCIÓN CORREGIDA PARA QR BLANCO --- */}
+                {/* ESTADO: MOSTRAR QR (FONDO BLANCO) */}
                 {!sessionLoading && showQr && (
                   <>
                     <p className="text-sm text-slate-300 mb-3 text-center">
-                      Abre WhatsApp o WhatsApp Business en el móvil del negocio
-                      y ve a{" "}
-                      <span className="font-semibold">
-                        Configuración &gt; Dispositivos vinculados &gt; Vincular
-                        un dispositivo
-                      </span>{" "}
-                      y escanea este código:
+                      Ve a WhatsApp &gt; Configuración &gt; Dispositivos vinculados &gt; Vincular
                     </p>
                     
-                    {/* FONDO BLANCO PURO PARA EL QR */}
+                    {/* AQUI ESTA LA CORRECCION DEL FONDO BLANCO */}
                     <div className="bg-white p-4 rounded-xl flex justify-center items-center">
                       <QRCode
                         value={session?.qr_data || ""}
                         size={220}
-                        bgColor="#FFFFFF" // Fondo blanco explícito
-                        fgColor="#000000" // Negro explícito
-                        level="M"         // Corrección de errores media
+                        bgColor="#FFFFFF" // Blanco puro
+                        fgColor="#000000" // Negro puro
+                        level="M"
                         style={{ height: "auto", maxWidth: "100%", width: "100%" }}
                         viewBox={`0 0 256 256`}
                       />
                     </div>
                     
                     <p className="text-xs text-slate-400 mt-3 text-center">
-                      Si el QR expira, se actualizará solo en unos segundos.
+                      El QR se actualiza automáticamente.
                     </p>
                   </>
                 )}
-                {/* ----------------------------------------- */}
 
+                {/* ESTADO: CONECTADO (CON BOTÓN DE DESCONECTAR) */}
                 {!sessionLoading && isConnected && (
-                  <div className="text-center">
-                    <p className="text-emerald-400 font-medium mb-2">
-                      ✅ WhatsApp conectado correctamente
+                  <div className="text-center animate-in fade-in zoom-in">
+                    <p className="text-emerald-400 font-medium mb-2 text-lg">
+                      ✅ WhatsApp Conectado
                     </p>
-                    <p className="text-xs text-slate-400 mb-3">
-                      Ya puedes cerrar esta pantalla. El asistente está
-                      respondiendo mensajes en este número.
+                    <p className="text-xs text-slate-500 mb-4">
+                      Número: <span className="font-semibold text-slate-300">{connectedPhone || "..."}</span>
                     </p>
-                    <p className="text-xs text-slate-500 mb-1">
-                      Número conectado:{" "}
-                      <span className="font-semibold">
-                        {connectedPhone || "N/D"}
-                      </span>
-                    </p>
+                    
+                    {/* BOTÓN NUEVO PARA DESCONECTAR */}
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      className="bg-red-500/10 text-red-500 hover:bg-red-500/20 border border-red-500/20"
+                      onClick={() => {
+                          if(confirm("¿Seguro que deseas desconectar el bot?")) {
+                              handleAction("disconnect");
+                          }
+                      }}
+                    >
+                      <LogOut className="w-4 h-4 mr-2" />
+                      Desvincular Sesión
+                    </Button>
+
                     {connectedAt && (
-                      <p className="text-[10px] text-slate-500">
-                        Última conexión:{" "}
-                        {new Date(connectedAt).toLocaleString()}
+                      <p className="text-[10px] text-slate-600 mt-4">
+                        Conectado desde: {new Date(connectedAt).toLocaleString()}
                       </p>
                     )}
                   </div>
                 )}
 
-                {!sessionLoading &&
-                  !showQr &&
-                  !isConnected &&
-                  rawStatus === "error" && (
-                    <div className="text-center">
-                      <p className="text-red-400 text-sm mb-2">
-                        Hubo un error en la sesión de WhatsApp.
-                      </p>
-                      <p className="text-xs text-slate-500 mb-3">
-                        Intenta reconectar el número. Si persiste, reinicia el
-                        servidor de WhatsApp.
-                      </p>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => handleAction("connect")}
-                      >
-                        Reintentar conexión
-                      </Button>
-                    </div>
-                  )}
+                {/* ESTADO: ERROR */}
+                {!sessionLoading && !showQr && !isConnected && rawStatus === "error" && (
+                  <div className="text-center">
+                    <p className="text-red-400 text-sm mb-2">Error en la sesión.</p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handleAction("connect")}
+                    >
+                      Reintentar
+                    </Button>
+                  </div>
+                )}
               </>
             )}
           </div>
 
+          {/* SIDEBAR INSTRUCCIONES */}
           <div className="md:w-64 bg-slate-950/60 border border-slate-800 rounded-2xl p-4 text-sm flex flex-col gap-3">
-            <h2 className="font-semibold text-slate-100 mb-1">
-              Instrucciones rápidas
-            </h2>
-            <ol className="list-decimal list-inside space-y-1 text-slate-300">
-              <li>Ten en la mano el celular del negocio.</li>
-              <li>Abre WhatsApp o WhatsApp Business.</li>
-              <li>
-                Ve a{" "}
-                <span className="font-semibold">
-                  Configuración → Dispositivos vinculados
-                </span>
-                .
-              </li>
-              <li>Elige “Vincular un dispositivo”.</li>
-              <li>Escanea el código QR que ves en esta pantalla.</li>
+            <h2 className="font-semibold text-slate-100 mb-1">Instrucciones</h2>
+            <ol className="list-decimal list-inside space-y-1 text-slate-300 text-xs">
+              <li>Abre WhatsApp en el celular.</li>
+              <li>Ve a Configuración.</li>
+              <li>Toca "Dispositivos vinculados".</li>
+              <li>Escanea el código QR.</li>
             </ol>
-
             <Separator className="bg-slate-800 my-2" />
-
-            <p className="text-xs text-slate-400">
-              Si el cliente está remoto, puedes enviarle el enlace a esta
-              pantalla y decirle que siga estos pasos. No necesitas ir al local
-              físicamente.
-            </p>
-
             <Button
               variant="outline"
               size="sm"
@@ -438,7 +372,7 @@ export default function ConnectWhatsAppPage() {
                 fetchSession();
               }}
             >
-              Refrescar ahora
+              Refrescar estado
             </Button>
           </div>
         </div>
