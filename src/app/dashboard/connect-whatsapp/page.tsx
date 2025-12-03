@@ -71,9 +71,6 @@ export default function ConnectWhatsAppPage() {
       const res = await fetch("/api/wa/status", { cache: "no-store" });
       const json = await res.json();
 
-      // console.log para debug si hace falta
-      console.log("[ConnectWhatsApp] /api/wa/status =>", json);
-
       setServerStatus({
         ok: json.ok ?? true,
         status: (json.status as ServerStatus["status"]) ?? "online",
@@ -196,7 +193,7 @@ export default function ConnectWhatsAppPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId, loadingTenant]);
 
-  // 🔑 CAMBIO IMPORTANTE: consideramos "online" por status, no por ok
+  // Consideramos "online" por status, no por ok
   const isServerOnline =
     !serverStatus || serverStatus.status === "online" || serverStatus.ok;
 
@@ -323,6 +320,7 @@ export default function ConnectWhatsAppPage() {
                     </div>
                   )}
 
+                {/* --- SECCIÓN CORREGIDA PARA QR BLANCO --- */}
                 {!sessionLoading && showQr && (
                   <>
                     <p className="text-sm text-slate-300 mb-3 text-center">
@@ -334,14 +332,26 @@ export default function ConnectWhatsAppPage() {
                       </span>{" "}
                       y escanea este código:
                     </p>
-                    <div className="bg.white p-4 rounded-xl">
-                      <QRCode value={session?.qr_data || ""} size={220} />
+                    
+                    {/* FONDO BLANCO PURO PARA EL QR */}
+                    <div className="bg-white p-4 rounded-xl flex justify-center items-center">
+                      <QRCode
+                        value={session?.qr_data || ""}
+                        size={220}
+                        bgColor="#FFFFFF" // Fondo blanco explícito
+                        fgColor="#000000" // Negro explícito
+                        level="M"         // Corrección de errores media
+                        style={{ height: "auto", maxWidth: "100%", width: "100%" }}
+                        viewBox={`0 0 256 256`}
+                      />
                     </div>
+                    
                     <p className="text-xs text-slate-400 mt-3 text-center">
                       Si el QR expira, se actualizará solo en unos segundos.
                     </p>
                   </>
                 )}
+                {/* ----------------------------------------- */}
 
                 {!sessionLoading && isConnected && (
                   <div className="text-center">
