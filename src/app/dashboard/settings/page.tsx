@@ -3,11 +3,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@supabase/supabase-js";
+import { Store, FileText, Phone } from "lucide-react"; // Iconos visuales
 
 import SubscriptionBadge from "@/app/dashboard/components/SubscriptionBadge";
 import BusinessHoursEditor from "@/componentes/Availability/BusinessHoursEditor";
 import ExceptionsTable from "@/componentes/Availability/ExceptionsTable";
 import ResourceCalendar from "@/componentes/Calendar/ResourceCalendar";
+import { VERTICALS } from "@/app/lib/constants";
 
 const sb = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -60,6 +62,8 @@ export default function SettingsPage() {
   // Datos Básicos
   const [name, setName] = useState("");
   const [phone, setPhone] = useState(""); // Número de recepción/notificaciones
+  const [vertical, setVertical] = useState("general"); // Tipo de negocio (IA)
+  const [description, setDescription] = useState("");  // Contexto (IA)
   const [timezone, setTimezone] = useState(DEFAULT_TZ);
   const [status, setStatus] = useState<"active" | "inactive" | "trial" | "blocked">("active");
   const [saving, setSaving] = useState(false);
@@ -123,9 +127,10 @@ export default function SettingsPage() {
   }, [tenantId]);
 
   async function loadTenant(tid: string) {
+    // ⚠️ Cargamos también 'vertical' y 'description' para la IA
     const { data, error } = await sb
       .from("tenants")
-      .select("name, phone, timezone, status, valid_until, grace_days")
+      .select("name, phone, timezone, status, valid_until, grace_days, vertical, description")
       .eq("id", tid)
       .maybeSingle();
 
@@ -138,6 +143,8 @@ export default function SettingsPage() {
     if (!t) {
       setName("");
       setPhone("");
+      setVertical("general");
+      setDescription("");
       setTimezone(DEFAULT_TZ);
       setStatus("active");
       setValidUntil(null);
@@ -147,6 +154,8 @@ export default function SettingsPage() {
 
     setName(t.name ?? "");
     setPhone((t.phone ?? "").replace(/^whatsapp:/i, ""));
+    setVertical(t.vertical ?? "general");
+    setDescription(t.description ?? "");
     setTimezone(t.timezone ?? DEFAULT_TZ);
     setStatus((t.status as any) ?? "active");
     setValidUntil(t.valid_until ? new Date(t.valid_until as string).toISOString() : null);
@@ -170,6 +179,8 @@ export default function SettingsPage() {
       name: name.trim(),
       timezone,
       phone: normalizePhone(phone), // Se guarda con formato whatsapp:+1...
+      vertical,                     // Guardamos la identidad del bot
+      description: description.trim() || null
     };
 
     const { error } = await sb.from("tenants").update(payload).eq("id", tenantId);
@@ -193,11 +204,7 @@ export default function SettingsPage() {
     setStatus(newStatus);
     const { error } = await sb.from("tenants").update({ status: newStatus }).eq("id", tenantId);
     if (error) {
-      if ((error as any).code === "23514") {
-        alert("Restricción de base de datos impide este estado.");
-      } else {
-        alert(error.message || "Error actualizando estado");
-      }
+      alert(error.message || "Error actualizando estado");
       setStatus(old);
     }
   }
@@ -257,7 +264,7 @@ export default function SettingsPage() {
       <header className="relative z-10 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Configuración del Negocio</h1>
-          <p className="text-sm text-gray-500">Datos generales, notificaciones y horarios.</p>
+          <p className="text-sm text-gray-500">Datos generales, IA y reglas operativas.</p>
         </div>
         {tenantId ? <SubscriptionBadge tenantId={tenantId} /> : null}
       </header>
@@ -274,7 +281,7 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        <div className="grid gap-6 md:grid-cols-3">
+        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
           
           {/* Selector de Negocio */}
           <div className="md:col-span-1">
@@ -291,7 +298,6 @@ export default function SettingsPage() {
                 </option>
               ))}
             </select>
-            {!memberships.length && <p className="mt-2 text-sm text-gray-500">No hay negocios aún.</p>}
           </div>
 
           {/* Nombre */}
@@ -305,36 +311,57 @@ export default function SettingsPage() {
             />
           </div>
 
-          {/* --- TELÉFONO DE NOTIFICACIONES (IMPORTANTE) --- */}
+          {/* --- TELÉFONO DE NOTIFICACIONES (RECEPCIÓN) --- */}
           <div>
-            <label className="block text-sm font-medium text-gray-900">
-              WhatsApp (Recepción / Notificaciones)
+            <label className="block text-sm font-medium text-gray-900 flex items-center gap-2">
+              <Phone className="w-4 h-4 text-violet-600" />
+              WhatsApp Recepción
             </label>
             <input
               className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
-              placeholder="Ej: 18295550000"
+              placeholder="Ej: 1829..."
               value={phone}
               onChange={(e) => setPhone(e.target.value)}
             />
-            <p className="mt-1 text-xs text-violet-600 font-medium">
-              🔔 A este número llegarán las alertas de citas.
+            <p className="mt-1 text-[11px] text-gray-500">
+              Número principal para alertas generales.
             </p>
           </div>
 
-          {/* Estado Legacy */}
+          {/* --- PERSONALIDAD IA (NUEVO) --- */}
           <div>
-            <label className="block text-sm font-medium text-gray-700">Estado Manual</label>
+            <label className="block text-sm font-medium text-gray-900 flex items-center gap-2">
+              <Store className="w-4 h-4 text-violet-600" />
+              Tipo de Negocio (IA)
+            </label>
             <select
               className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
-              value={status}
-              onChange={(e) => handleLegacyStatusChange(e.target.value as any)}
+              value={vertical}
+              onChange={(e) => setVertical(e.target.value)}
             >
-              <option value="active">Activo</option>
-              <option value="inactive">Inactivo</option>
-              <option value="trial">Prueba</option>
-              <option value="blocked">Bloqueado</option>
+              {VERTICALS.map(v => (
+                  <option key={v.value} value={v.value}>{v.label}</option>
+              ))}
             </select>
           </div>
+
+          {/* --- DESCRIPCIÓN IA (NUEVO) --- */}
+          <div className="lg:col-span-2">
+            <label className="block text-sm font-medium text-gray-900 flex items-center gap-2">
+              <FileText className="w-4 h-4 text-violet-600" />
+              Descripción para el Bot
+            </label>
+            <textarea
+              className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200 resize-none h-[50px]"
+              placeholder="Ej. Especialistas en cortes modernos y barbas. Ubicados en el centro."
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+            />
+            <p className="mt-1 text-[11px] text-gray-500">
+              Esto le da contexto a la Inteligencia Artificial sobre qué servicios ofreces.
+            </p>
+          </div>
+
         </div>
 
         <div className="mt-8 flex justify-end gap-3 border-t pt-4">
@@ -373,7 +400,7 @@ export default function SettingsPage() {
 
         <div className="grid gap-4 md:grid-cols-3">
           <div className="md:col-span-2">
-            <label className="block text-sm font-medium text-gray-700">Fecha de Vencimiento</label>
+            <label className="block text-sm font-medium text-gray-700">Vencimiento</label>
             <form className="mt-1 flex flex-col sm:flex-row gap-3" onSubmit={handleSaveValidUntil}>
               <input
                 type="datetime-local"
@@ -383,20 +410,7 @@ export default function SettingsPage() {
               />
               <button className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50" type="submit">Guardar</button>
               <button type="button" onClick={handleExtend30} className="rounded-xl border px-4 py-2 text-sm hover:bg-gray-50 text-blue-600 font-medium">+30 Días</button>
-              <button type="button" onClick={handleSuspendNow} className="rounded-xl border px-4 py-2 text-sm hover:bg-red-50 text-red-600 font-medium">Suspender</button>
             </form>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700">Días de Gracia</label>
-            <input
-              type="number"
-              min={0}
-              className="mt-1 w-full rounded-2xl border border-gray-200 bg-white px-4 py-2.5"
-              value={graceDays}
-              onChange={(e) => setGraceDays(Number(e.target.value))}
-              onBlur={handleSaveGrace}
-            />
           </div>
         </div>
       </section>
