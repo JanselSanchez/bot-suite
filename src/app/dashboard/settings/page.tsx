@@ -9,7 +9,7 @@ import SubscriptionBadge from "@/app/dashboard/components/SubscriptionBadge";
 import BusinessHoursEditor from "@/componentes/Availability/BusinessHoursEditor";
 import ExceptionsTable from "@/componentes/Availability/ExceptionsTable";
 import ResourceCalendar from "@/componentes/Calendar/ResourceCalendar";
-import { VERTICALS } from "@/lib/constants"; // Asumimos esta importación
+import { VERTICALS } from "@/app/lib/constants";
 
 const sb = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
