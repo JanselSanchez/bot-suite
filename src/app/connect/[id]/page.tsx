@@ -2,9 +2,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useParams } from "next/navigation";
 import QRCode from "react-qr-code";
 import { Check, LogOut } from "lucide-react";
-import { useRouter } from "next/navigation";
 
 type SessionStatus =
   | "disconnected"
@@ -28,29 +28,26 @@ type SessionResponse = {
   error?: string;
 };
 
-type Props = {
-  params: { tenantId: string };
-};
-
-export default function PublicConnectWhatsAppPage({ params }: Props) {
-  const router = useRouter();
-  const tenantId = params.tenantId;
+export default function PublicConnectWhatsAppPage() {
+  // 👇 leemos el tenantId directamente de la URL (/connect/[tenantId])
+  const params = useParams();
+  const tenantId = (params?.tenantId as string) || "";
 
   const [session, setSession] = useState<SessionDTO | null>(null);
   const [loading, setLoading] = useState(true);
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
-  const [justConnected, setJustConnected] = useState(false);
 
-  // --- helpers ---
+  // helper: estado derivado
   const rawStatus: SessionStatus = session?.status ?? "disconnected";
   const hasQr = !!session?.qr_data;
   const isConnected = rawStatus === "connected" && !hasQr;
   const connectedPhone = session?.phone_number || null;
   const connectedAt = session?.last_connected_at || null;
 
-  // Llama a /api/wa/session?tenantId=...
+  // --- llamadas a API ---
+
   async function fetchSession() {
     if (!tenantId) return;
     try {
@@ -74,7 +71,6 @@ export default function PublicConnectWhatsAppPage({ params }: Props) {
     }
   }
 
-  // Enviar acción connect al backend (igual que en dashboard)
   async function ensureConnectedSession() {
     if (!tenantId) return;
     setConnecting(true);
@@ -97,7 +93,6 @@ export default function PublicConnectWhatsAppPage({ params }: Props) {
     }
   }
 
-  // Desconectar desde la página pública (por si se equivocan de número)
   async function handleDisconnect() {
     if (!tenantId) return;
     if (!confirm("¿Seguro que quieres desconectar este WhatsApp?")) return;
@@ -108,25 +103,27 @@ export default function PublicConnectWhatsAppPage({ params }: Props) {
         body: JSON.stringify({ tenantId, action: "disconnect" }),
       });
       setSession(null);
-      setJustConnected(false);
       await fetchSession();
     } catch (err) {
       console.error("[PublicConnect] handleDisconnect error:", err);
     }
   }
 
-  // Primer load: iniciar sesión y empezar a hacer polling
+  // --- efecto principal: iniciar sesión + polling ---
   useEffect(() => {
-    if (!tenantId) return;
+    if (!tenantId) {
+      setError("El enlace no tiene un negocio válido.");
+      setLoading(false);
+      return;
+    }
 
     let interval: NodeJS.Timeout | null = null;
 
     (async () => {
       setLoading(true);
       setError(null);
-      // Aseguramos que el backend arranque la sesión
       await ensureConnectedSession();
-      // Polling cada 4s para refrescar QR / estado
+      // Poll cada 4s para actualizar QR / estado
       interval = setInterval(fetchSession, 4000);
     })();
 
@@ -136,15 +133,6 @@ export default function PublicConnectWhatsAppPage({ params }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId]);
 
-  // Si pasa a "connected" marcamos un flag para mostrar check grande
-  useEffect(() => {
-    if (isConnected) {
-      setJustConnected(true);
-      const t = setTimeout(() => setJustConnected(false), 5000);
-      return () => clearTimeout(t);
-    }
-  }, [isConnected]);
-
   return (
     <div className="min-h-screen w-full bg-slate-950 text-slate-50 flex items-center justify-center px-4">
       <div className="w-full max-w-md">
@@ -153,22 +141,22 @@ export default function PublicConnectWhatsAppPage({ params }: Props) {
             <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-violet-600/20 border border-violet-500/40">
               <span className="text-2xl">📱</span>
             </div>
-            <h1 className="text-xl font-semibold mb-1">
-              Conectar Asistente
-            </h1>
+            <h1 className="text-xl font-semibold mb-1">Conectar Asistente</h1>
             <p className="text-xs text-slate-400">
-              Negocio ID: <span className="font-mono">{tenantId}</span>
+              Negocio ID:{" "}
+              <span className="font-mono">
+                {tenantId || "—"}
+              </span>
             </p>
           </div>
 
-          {/* ESTADOS SUPERIORES */}
           {error && (
             <p className="text-xs text-red-400 mb-3">
               {error}
             </p>
           )}
 
-          {/* 1) Mientras prepara la sesión */}
+          {/* 1) Loading inicial */}
           {loading && !session && (
             <div className="py-6">
               <div className="mx-auto mb-3 h-8 w-8 rounded-full border-2 border-violet-400 border-t-transparent animate-spin" />
@@ -181,7 +169,7 @@ export default function PublicConnectWhatsAppPage({ params }: Props) {
             </div>
           )}
 
-          {/* 2) QR visible */}
+          {/* 2) Mostrar QR */}
           {!loading && !isConnected && hasQr && (
             <div className="flex flex-col items-center">
               <p className="text-sm text-slate-200 mb-3">
@@ -198,11 +186,7 @@ export default function PublicConnectWhatsAppPage({ params }: Props) {
                   bgColor="#FFFFFF"
                   fgColor="#000000"
                   level="M"
-                  style={{
-                    height: "auto",
-                    maxWidth: "100%",
-                    width: "100%",
-                  }}
+                  style={{ height: "auto", maxWidth: "100%", width: "100%" }}
                   viewBox="0 0 256 256"
                 />
               </div>
@@ -245,7 +229,16 @@ export default function PublicConnectWhatsAppPage({ params }: Props) {
             </div>
           )}
 
-          {/* Footer pequeñito */}
+          {/* 4) Estado raro sin QR */}
+          {!loading && !hasQr && !isConnected && !error && (
+            <div className="py-4">
+              <p className="text-sm text-slate-300 mb-2">
+                Preparando el código QR...
+              </p>
+              <div className="mx-auto h-6 w-6 rounded-full border-2 border-violet-400 border-t-transparent animate-spin" />
+            </div>
+          )}
+
           <p className="mt-6 text-[10px] text-slate-500">
             Powered by PymeBOT • Última actualización:{" "}
             {lastUpdated || "—"}
