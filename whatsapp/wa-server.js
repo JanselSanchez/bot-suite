@@ -150,7 +150,7 @@ async function getAvailableSlots(
   const weekEnd = addDays(weekStart, daysToLookAhead);
 
   // 2. Consulta de Horarios (business_hours)
-  // 🔥 FIX: Filtramos por is_closed = FALSE para optimizar y evitar errores
+  // 🔥 FIX: Añadido filtro is_closed=false para asegurar que traemos días abiertos
   const { data: hours } = await supabase
     .from("business_hours")
     .select("dow, is_closed, open_time, close_time")
@@ -252,7 +252,7 @@ const tools = [
             description: "Notas adicionales para la cita.",
           },
         },
-        // 🔥 FIX CRÍTICO: Quitamos resourceId de required para permitir auto-asignación (NULL)
+        // 🔥 FIX CRÍTICO: resourceId ELIMINADO de required para permitir nulos
         required: [
           "customerName",
           "phone",
@@ -328,7 +328,7 @@ const tools = [
 // 4. IA CON REGLA DE ORO Y MANEJO DE TOOLS
 // ---------------------------------------------------------------------
 
-// 🔥 FIX: Agregamos pushName para personalizar el saludo
+// 🔥 FIX: Aceptamos pushName en los argumentos
 async function generateReply(text, tenantId, pushName) {
   const cleanText = text.trim();
   const lower = cleanText.toLowerCase();
@@ -343,7 +343,7 @@ async function generateReply(text, tenantId, pushName) {
   // B) IA CONTEXTUAL
   const context = await getTenantContext(tenantId);
 
-  // 🔥 FECHA ACTUAL + Prompt "Anti-Excusas"
+  // 🔥 FECHA ACTUAL + PROMPT ANTI-MIEDO
   const now = new Date();
   const currentDateStr = now.toLocaleString("es-DO", {
     timeZone: "America/Santo_Domingo",
@@ -427,7 +427,7 @@ async function generateReply(text, tenantId, pushName) {
           
         } else if (functionName === "create_booking") {
           
-          // 🔥 FIX LÓGICO: ResourceId NULL si no viene (No asignamos a nadie por defecto, dejamos que la tienda decida)
+          // 🔥 FIX LÓGICO: ResourceId NULL si no viene
           const finalResourceId = functionArgs.resourceId || null;
 
           const { data: booking, error } = await supabase
@@ -457,7 +457,6 @@ async function generateReply(text, tenantId, pushName) {
         } else if (functionName === "reschedule_booking" || functionName === "cancel_booking") {
            
            // 🔥 FIX TELÉFONOS: Buscamos el limpio Y el formato whatsapp:+
-           // Esto soluciona que no encontrara las citas guardadas con prefijo
            const cleanPhone = functionArgs.customerPhone.replace(/\D/g, "");
            const whatsappPhone = `whatsapp:+${cleanPhone}`; 
            
