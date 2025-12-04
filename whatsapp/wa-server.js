@@ -190,15 +190,24 @@ const tools = [
     type: "function",
     function: {
       name: "check_availability",
-      description: "Consulta los slots libres de un recurso para agendar una cita. Obligatorio si el cliente pregunta por horarios.",
+      description:
+        "Consulta los slots libres. Si el cliente no especifica barbero/recurso, busca disponibilidad general.",
       parameters: {
         type: "object",
         properties: {
-          resourceId: { type: "string", description: "El ID UUID del recurso. (Ej: '846190e1-...')" },
-          requestedDate: { type: "string", description: "La fecha ISO de inicio de la búsqueda (Ej: 2025-12-05T10:00:00Z). Si es hoy, usa la hora actual." },
+          resourceId: {
+            type: "string",
+            description: "El ID UUID del recurso. Opcional si el cliente no tiene preferencia.",
+          },
+          requestedDate: {
+            type: "string",
+            description:
+              "La fecha ISO de inicio. Si el cliente dice 'hoy' o 'mañana', calcula la fecha basada en la fecha actual.",
+          },
         },
-        required: ["resourceId", "requestedDate"],
-      }
+        // 🔥 CAMBIO CLAVE: Solo requestedDate es obligatorio ahora.
+        required: ["requestedDate"], 
+      },
     }
   },
   {
@@ -263,11 +272,13 @@ const tools = [
 // 4. IA CON REGLA DE ORO Y MANEJO DE TOOLS
 // ---------------------------------------------------------------------
 
+// En wa-server.js -> generateReply
+
 async function generateReply(text, tenantId) {
   const cleanText = text.trim();
   const lower = cleanText.toLowerCase();
 
-  // A) REGLA PRECIOS
+  // A) REGLA PRECIOS (Se mantiene igual)
   const priceKeywords = ["precio", "costo", "cuanto vale", "planes", "tarifa"];
   if (priceKeywords.some((kw) => lower.includes(kw))) {
     const template = await getTemplate(tenantId, "pricing_pitch");
@@ -276,23 +287,34 @@ async function generateReply(text, tenantId) {
 
   // B) IA CONTEXTUAL
   const context = await getTenantContext(tenantId);
+  
+  // 🔥 AGREGAMOS LA FECHA ACTUAL PARA QUE LA IA SE UBIQUE
+  const now = new Date();
+  const currentDateStr = now.toLocaleString("es-DO", { 
+    weekday: 'long', 
+    year: 'numeric', 
+    month: 'long', 
+    day: 'numeric', 
+    hour: '2-digit', 
+    minute: '2-digit' 
+  });
 
   const systemPrompt = `
     Eres el asistente virtual de "${context.name}".
     Tipo: ${context.vertical}.
     Descripción: ${context.description}.
+    
+    FECHA Y HORA ACTUAL: ${currentDateStr}. (Usa esto para calcular 'hoy', 'mañana', 'lunes', etc).
 
-    REGLAS DE ORO:
-    1. Responde dudas sobre nuestros servicios de forma breve y amable.
-    2. TU OBJETIVO es conseguir que agenden una cita.
-    3. Puedes consultar disponibilidad, agendar, reagendar y cancelar citas usando las herramientas disponibles.
-    4. PROHIBIDO decir frases como "te paso con un humano", "un asesor te atenderá" o "no tengo esa información".
-    5. Si no sabes la respuesta, usa una táctica de espera natural como: 
-       - "Déjame confirmar ese detalle exacto un momento..." 
-       - "Buena pregunta, déjame revisar la disponibilidad exacta..."
-       (Esto da tiempo a que el dueño real conteste si es necesario).
-    6. Actúa como parte del equipo, no como un robot externo.
+    REGLAS ABSOLUTAS:
+    1. TU MISIÓN es agendar la cita. NO mandes al cliente a llamar ni a escribir por Instagram.
+    2. Si el cliente quiere una cita y no especificó con quién, USA la herramienta "check_availability" sin resourceId (o pregunta si prefiere a alguien específico).
+    3. Si el cliente pide horarios, USA "check_availability" inmediatamente.
+    4. Sé breve y persuasivo. Ve al grano.
+    5. Solo confirma la cita usando la herramienta "create_booking" cuando tengas: Nombre, Teléfono, Fecha/Hora exactas y Recurso.
   `.trim();
+
+  // ... el resto sigue igual
 
   const messages = [
     { role: "system", content: systemPrompt },
