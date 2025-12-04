@@ -518,10 +518,20 @@ async function generateReply(text, tenantId) {
 // ---------------------------------------------------------------------
 
 async function updateSessionDB(tenantId, updateData) {
-  await supabase
+  // Siempre incluimos tenant_id para poder usar upsert
+  const row = {
+    tenant_id: tenantId,
+    ...updateData,
+  };
+
+  const { error } = await supabase
     .from("whatsapp_sessions")
-    .update(updateData)
-    .eq("tenant_id", tenantId);
+    .upsert([row], { onConflict: "tenant_id" });
+
+  if (error) {
+    console.error("[updateSessionDB] Error upsert whatsapp_sessions:", error);
+  }
+
   if (updateData.status) {
     const isConnected = updateData.status === "connected";
     await supabase

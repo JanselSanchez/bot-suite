@@ -1,109 +1,138 @@
-// whatsapp/utils/supabaseAuthState.mjs
+// whatsapp/utils/wa-server/supabaseAuthState.mjs
 import { initAuthCreds, BufferJSON, proto } from "@whiskeysockets/baileys";
 
 /**
- * Guarda el auth_state de Baileys en la tabla `whatsapp_sessions`
- * usando tenant_id como clave.
- *
- * Tabla esperada:
- *  - tenant_id (uuid, PK o UNIQUE)
- *  - auth_state (jsonb, nullable)
+ * Maneja el auth_state de Baileys guardándolo en la tabla `whatsapp_sessions`
+ * por `tenant_id`, de forma que sobreviva a reinicios y deploys.
  */
-export async function useSupabaseAuthState(supabase, tenantId) {
-  // 1. Buscar si ya existen datos guardados para este tenant
-  const { data, error } = await supabase
+export const useSupabaseAuthState = async (supabase, tenantId) => {
+  // 1) Buscar fila existente de sesión para ese tenant
+  const { data: row, error: fetchError } = await supabase
     .from("whatsapp_sessions")
-    .select("auth_state")
+    .select("id, auth_state")
     .eq("tenant_id", tenantId)
     .maybeSingle();
 
-  if (error) {
-    console.error("[Supabase Auth] Error cargando sesión:", error);
+  if (fetchError) {
+    console.error(
+      "[Supabase Auth] Error buscando whatsapp_sessions:",
+      fetchError
+    );
   }
 
   let creds;
   let keys = {};
 
-  // 2. Si hay datos, los recuperamos y decodificamos
-  if (data?.auth_state) {
+  if (row?.auth_state) {
+    // 2) Si hay auth_state, lo reconstruimos usando BufferJSON.reviver
     try {
       const parsedState = JSON.parse(
-        JSON.stringify(data.auth_state),
+        JSON.stringify(row.auth_state),
         BufferJSON.reviver
       );
-
-      if (parsedState.creds) {
-        creds = proto.Credentials.fromObject(parsedState.creds);
-      } else {
-        creds = initAuthCreds();
-      }
-
+      creds = parsedState.creds;
       keys = parsedState.keys || {};
+      console.log(
+        "[Supabase Auth]",
+        `Auth state cargado desde DB para tenant ${tenantId}`
+      );
     } catch (e) {
-      console.error("[Supabase Auth] Error parseando auth_state:", e);
+      console.error(
+        "[Supabase Auth] Error parseando auth_state, re-inicializando credenciales:",
+        e
+      );
       creds = initAuthCreds();
       keys = {};
     }
   } else {
-    // 3. Si no hay datos, inicializamos credenciales nuevas
+    // 3) Si no hay fila o está vacía, inicializamos credenciales nuevas
+    console.log(
+      "[Supabase Auth]",
+      `No había auth_state para tenant ${tenantId}, creando nuevas credenciales`
+    );
     creds = initAuthCreds();
+    keys = {};
+
+    // Asegurar que exista la fila para ese tenant (insert si no está)
+    const { error: insertError } = await supabase
+      .from("whatsapp_sessions")
+      .insert([{ tenant_id: tenantId, status: "disconnected", auth_state: null }])
+      .onConflict("tenant_id")
+      .ignore();
+
+    if (insertError) {
+      console.error(
+        "[Supabase Auth] Error creando fila inicial en whatsapp_sessions:",
+        insertError
+      );
+    }
   }
 
-  // 4. Función para guardar (se ejecuta cada vez que Baileys actualiza llaves/creds)
+  // 4) Función que guarda el estado completo (creds + keys) en Supabase
   const saveState = async () => {
     try {
       const stateToSave = JSON.parse(
         JSON.stringify({ creds, keys }, BufferJSON.replacer)
       );
 
-      const { error: saveError } = await supabase
+      const { error: upsertError } = await supabase
         .from("whatsapp_sessions")
         .upsert(
-          {
-            tenant_id: tenantId,
-            auth_state: stateToSave,
-          },
+          [
+            {
+              tenant_id: tenantId,
+              auth_state: stateToSave,
+            },
+          ],
           { onConflict: "tenant_id" }
         );
 
-      if (saveError) {
-        console.error("[Supabase Auth] Error guardando sesión:", saveError);
+      if (upsertError) {
+        console.error(
+          "[Supabase Auth] Error guardando auth_state en whatsapp_sessions:",
+          upsertError
+        );
+      } else {
+        // console.log("[Supabase Auth] Auth state guardado para", tenantId);
       }
     } catch (e) {
-      console.error("[Supabase Auth] Excepción guardando sesión:", e);
+      console.error("[Supabase Auth] Error serializando auth_state:", e);
     }
   };
 
-  const state = {
-    creds,
-    keys: {
-      get: (type, ids) => {
-        const result = {};
-        for (const id of ids) {
-          let value = keys[type]?.[id];
-
-          if (type === "app-state-sync-key" && value) {
-            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+  return {
+    state: {
+      creds,
+      keys: {
+        /**
+         * get(type, ids) -> devuelve las llaves pedidas para Baileys
+         */
+        get: (type, ids) => {
+          const data = {};
+          ids.forEach((id) => {
+            let value = keys[type]?.[id];
+            if (type === "app-state-sync-key" && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          });
+          return data;
+        },
+        /**
+         * set(data) -> Baileys nos pasa llaves nuevas/actualizadas
+         */
+        set: async (data) => {
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              if (!keys[category]) keys[category] = {};
+              keys[category][id] = value;
+            }
           }
-
-          result[id] = value || null;
-        }
-        return result;
-      },
-      set: async (data) => {
-        for (const category of Object.keys(data)) {
-          if (!keys[category]) keys[category] = {};
-          for (const id of Object.keys(data[category])) {
-            keys[category][id] = data[category][id];
-          }
-        }
-        await saveState();
+          await saveState();
+        },
       },
     },
-  };
-
-  return {
-    state,
     saveCreds: saveState,
   };
-}
+};
