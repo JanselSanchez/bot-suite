@@ -1,82 +1,136 @@
-// wa-server/scheduling-logic.mjs
+// utils/wa-server/scheduling-logic.mjs
 
-// 1. Helpers de tiempo y fechas (Necesarios para todas las funciones)
+// ----------------------------------------------------------------------
+// 1. HELPERS DE FORMATO Y TIEMPO
+// ----------------------------------------------------------------------
+
 function hmsToParts(hms) {
+    // Maneja formatos "09:00:00" o "09:00"
     const [h, m] = hms.split(":").map(Number);
     return { h, m };
-}
-
-function pad2(n) { return n.toString().padStart(2, "0"); }
-
-function toHHMM(t) {
+  }
+  
+  function pad2(n) {
+    return n.toString().padStart(2, "0");
+  }
+  
+  function toHHMM(t) {
     if (!t) return "";
-    const [h, m] = t.split(":");
-    return `${pad2(Number(h))}:${pad2(Number(m))}`;
-}
-
-// 2. Construye el objeto Date para un día específico de la semana
-export function buildDateOnWeek(weekStart, dow, hms) {
-    const { h, m } = hmsToParts(hms);
-    const d = new Date(weekStart);
-    // Añadir días a la fecha base (Lunes de la semana)
-    d.setDate(d.getDate() + dow);
-    const base = new Date(d);
-    base.setHours(h, m, 0, 0);
-    return base;
-}
-
-// 3. Obtiene las ventanas de horario abierto (Maneja el cruce de medianoche)
-export function weeklyOpenWindows(weekStart, businessHours) {
-    const out = [];
-    for (const d of businessHours) {
-        if (d.is_closed || !d.open_time || !d.close_time) continue;
-        
-        // Suponemos que los datos de DB vienen con dow (0=Dom, 1=Lun...)
-        const open = buildDateOnWeek(weekStart, d.dow, toHHMM(d.open_time));
-        const close = buildDateOnWeek(weekStart, d.dow, toHHMM(d.close_time));
-        
-        if (+close <= +open) {
-            // Caso 1: Cruce de medianoche (ej: 22:00 a 02:00)
-            const end1 = new Date(open); end1.setHours(23, 59, 0, 0);
-            out.push({ start: open, end: end1 });
-            const start2 = new Date(open); start2.setDate(start2.getDate() + 1); start2.setHours(0, 0, 0, 0);
-            out.push({ start: start2, end: close });
-        } else {
-            // Caso 2: Horario normal (ej: 09:00 a 18:00)
-            out.push({ start: open, end: close });
+    // Aseguramos que si viene "09:00:00" lo dejemos en "09:00"
+    const parts = t.split(":");
+    return `${pad2(Number(parts[0]))}:${pad2(Number(parts[1]))}`;
+  }
+  
+  // ----------------------------------------------------------------------
+  // 2. CÁLCULO DE VENTANAS ABIERTAS (LÓGICA CORREGIDA)
+  // ----------------------------------------------------------------------
+  
+  /**
+   * Recorre los 7 días desde weekStart y busca si hay horario en la DB para ese día.
+   * Evita errores matemáticos de "dow" iterando naturalmente sobre el calendario.
+   */
+  export function weeklyOpenWindows(weekStart, businessHours) {
+    const windows = [];
+    
+    // Clonamos la fecha de inicio para no mutar la original
+    // weekStart se asume que es el Lunes de esa semana (00:00 horas)
+    let currentDayCursor = new Date(weekStart);
+  
+    // Iteramos 7 días hacia adelante (Lunes, Martes... Domingo)
+    for (let i = 0; i < 7; i++) {
+      
+      // Obtenemos el día de la semana real de la fecha actual (0=Domingo, 1=Lunes...)
+      const currentDow = currentDayCursor.getDay();
+  
+      // Buscamos si existe una configuración para este día exacto en la DB
+      // Coincide con tu columna 'dow' y 'is_closed' de la imagen
+      const dayConfig = businessHours.find(
+        (bh) => bh.dow === currentDow && bh.is_closed === false
+      );
+  
+      if (dayConfig && dayConfig.open_time && dayConfig.close_time) {
+        // Parseamos hora apertura
+        const { h: openH, m: openM } = hmsToParts(toHHMM(dayConfig.open_time));
+        // Parseamos hora cierre
+        const { h: closeH, m: closeM } = hmsToParts(toHHMM(dayConfig.close_time));
+  
+        // Construimos fecha inicio (Fecha del cursor + Hora DB)
+        const start = new Date(currentDayCursor);
+        start.setHours(openH, openM, 0, 0);
+  
+        // Construimos fecha fin
+        const end = new Date(currentDayCursor);
+        end.setHours(closeH, closeM, 0, 0);
+  
+        // Validación simple: Si cierra después de abrir, es una ventana válida
+        if (end > start) {
+          windows.push({ start, end });
         }
+      }
+  
+      // Avanzamos el cursor al siguiente día
+      currentDayCursor.setDate(currentDayCursor.getDate() + 1);
     }
-    return out;
-}
-
-// 4. Genera slots libres de 30 min (El corazón del algoritmo)
-export function generateOfferableSlots(
-    windows, // Horarios abiertos (ej: 09:00 - 18:00)
-    bookings, // Citas ya tomadas
-    stepMin = 30 // Paso de cita
-) {
+  
+    return windows;
+  }
+  
+  // ----------------------------------------------------------------------
+  // 3. GENERADOR DE SLOTS (EL CORAZÓN DEL SISTEMA)
+  // ----------------------------------------------------------------------
+  
+  /**
+   * Toma las ventanas abiertas y "resta" las citas existentes para dejar los huecos.
+   */
+  export function generateOfferableSlots(
+    openWindows, // Array de { start, end } calculado arriba
+    bookings,    // Array de citas confirmadas de la DB
+    stepMin = 30 // Duración del slot (30 min por defecto)
+  ) {
     const slots = [];
-    for (const w of windows) {
-        const cursor = new Date(w.start);
-        while (+cursor < +w.end) {
-            const end = new Date(cursor);
-            end.setMinutes(end.getMinutes() + stepMin);
-            
-            if (+end > +w.end) break;
-            
-            // Revisa si el nuevo slot choca con alguna reserva existente
-            const clash = bookings.some((b) => {
-                const bs = new Date(b.starts_at);
-                const be = new Date(b.ends_at);
-                // Un choque ocurre si el nuevo slot empieza antes de que termine la reserva
-                // Y termina después de que empieza la reserva.
-                return +bs < +end && +be > +cursor;
-            });
-            
-            if (!clash) slots.push({ start: new Date(cursor), end });
-            
-            cursor.setMinutes(cursor.getMinutes() + stepMin);
+  
+    for (const window of openWindows) {
+      let cursor = new Date(window.start);
+      const windowEnd = new Date(window.end);
+  
+      // Mientras quepa un slot más antes de cerrar...
+      while (cursor.getTime() < windowEnd.getTime()) {
+        
+        // Calculamos el fin de este slot candidato
+        const slotEnd = new Date(cursor);
+        slotEnd.setMinutes(slotEnd.getMinutes() + stepMin);
+  
+        // Si el slot se sale del horario de cierre, paramos
+        if (slotEnd.getTime() > windowEnd.getTime()) {
+          break;
         }
+  
+        // -----------------------------------------------------------
+        // DETECCIÓN DE CHOQUES (COLLISION DETECTION)
+        // -----------------------------------------------------------
+        // Un slot está ocupado si se solapa con CUALQUIER cita existente
+        const isBusy = bookings.some((booking) => {
+          const busyStart = new Date(booking.starts_at);
+          const busyEnd = new Date(booking.ends_at);
+  
+          // Fórmula matemática de solapamiento de rangos:
+          // (StartA < EndB) AND (EndA > StartB)
+          return (cursor.getTime() < busyEnd.getTime()) && 
+                 (slotEnd.getTime() > busyStart.getTime());
+        });
+  
+        // Si no está ocupado, lo agregamos a la lista de ofertas
+        if (!isBusy) {
+          slots.push({
+            start: new Date(cursor),
+            end: slotEnd,
+          });
+        }
+  
+        // Avanzamos el cursor 30 mins para probar el siguiente hueco
+        cursor.setMinutes(cursor.getMinutes() + stepMin);
+      }
     }
+  
     return slots;
-}
+  }
