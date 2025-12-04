@@ -150,10 +150,12 @@ async function getAvailableSlots(
   const weekEnd = addDays(weekStart, daysToLookAhead);
 
   // 2. Consulta de Horarios (business_hours)
+  // 🔥 FIX: Filtramos por is_closed = FALSE para optimizar y evitar errores
   const { data: hours } = await supabase
     .from("business_hours")
     .select("dow, is_closed, open_time, close_time")
     .eq("tenant_id", tenantId)
+    .eq("is_closed", false) 
     .order("dow", { ascending: true });
 
   // 3. Consulta de Citas (bookings)
@@ -165,7 +167,7 @@ async function getAvailableSlots(
     .lt("ends_at", addDays(weekEnd, 1).toISOString())
     .in("status", ["confirmed", "pending"]);
 
-  // Si se especifica un recurso (barbero), filtramos. SI NO, TRAEMOS TODO.
+  // Si se especifica un recurso (barbero), filtramos. Si no, traemos todo.
   if (resourceId) {
     bookingsQuery = bookingsQuery.eq("resource_id", resourceId);
   }
@@ -250,7 +252,7 @@ const tools = [
             description: "Notas adicionales para la cita.",
           },
         },
-        // 🔥 FIX: Quitamos resourceId de required
+        // 🔥 FIX CRÍTICO: Quitamos resourceId de required para permitir auto-asignación (NULL)
         required: [
           "customerName",
           "phone",
@@ -326,7 +328,7 @@ const tools = [
 // 4. IA CON REGLA DE ORO Y MANEJO DE TOOLS
 // ---------------------------------------------------------------------
 
-// 🔥 FIX: Aceptamos pushName
+// 🔥 FIX: Agregamos pushName para personalizar el saludo
 async function generateReply(text, tenantId, pushName) {
   const cleanText = text.trim();
   const lower = cleanText.toLowerCase();
@@ -341,7 +343,7 @@ async function generateReply(text, tenantId, pushName) {
   // B) IA CONTEXTUAL
   const context = await getTenantContext(tenantId);
 
-  // 🔥 FECHA ACTUAL + Prompt Cálido
+  // 🔥 FECHA ACTUAL + Prompt "Anti-Excusas"
   const now = new Date();
   const currentDateStr = now.toLocaleString("es-DO", {
     timeZone: "America/Santo_Domingo",
@@ -359,21 +361,26 @@ async function generateReply(text, tenantId, pushName) {
 
     TU PERSONALIDAD:
     - Amable, cercana y con un toque dominicano cálido (pero profesional).
-    - Saluda por el nombre "${pushName}" si es posible.
+    - Saluda por el nombre "${pushName}" si es posible y no lo has hecho.
+
+    ⚠️ INSTRUCCIÓN SUPREMA (ANTI-MIEDO):
+    1. ESTÁ PROHIBIDO decir "no puedo agendar" o "llama al local". TU AGENDA ES TUYA.
+    2. SIEMPRE usa las herramientas. Si faltan datos, asúmelos (ej: recurso vacío) o pregúntalos rápido.
+
+    REGLAS DE ACCIÓN:
+    1. Si el cliente dice "Cita hoy a las 3:30":
+       - Ejecuta "create_booking" DE INMEDIATO con esa hora.
+       - Si no tienes su nombre, pregúntalo RÁPIDO y agenda.
     
-    TUS OBJETIVOS Y REGLAS (CRÍTICO):
-    1. AGENDAR CITAS ES TU PRIORIDAD.
-    2. PROACTIVIDAD TOTAL: Si el cliente dice "cita", "agendar", "hoy", "mañana":
-       - ¡NO preguntes "¿qué hora prefieres?"!
-       - Ejecuta INMEDIATAMENTE "check_availability".
-       - Responde ofreciendo las horas disponibles.
+    2. Si preguntan horarios:
+       - Ejecuta "check_availability".
+       - Muestra las horas que te devuelva la herramienta.
     
-    3. ASIGNACIÓN:
-       - Si el cliente no pide un barbero específico, NO PREGUNTES.
-       - Asume "cualquiera" y deja el resourceId vacío al usar "create_booking".
+    3. Barbero/Recurso:
+       - Si el cliente no dice nombre, MANDA resourceId VACÍO (NULL). El sistema lo resolverá.
     
-    4. CERO EXCUSAS:
-       - Tienes acceso total a la agenda. NUNCA mandes a llamar al local.
+    4. Reagendar/Cancelar:
+       - Pide el teléfono si no lo tienes y ejecuta la herramienta.
   `.trim();
 
   const messages = [
@@ -420,7 +427,7 @@ async function generateReply(text, tenantId, pushName) {
           
         } else if (functionName === "create_booking") {
           
-          // 🔥 FIX LÓGICO: ResourceId NULL si no viene
+          // 🔥 FIX LÓGICO: ResourceId NULL si no viene (No asignamos a nadie por defecto, dejamos que la tienda decida)
           const finalResourceId = functionArgs.resourceId || null;
 
           const { data: booking, error } = await supabase
@@ -447,55 +454,38 @@ async function generateReply(text, tenantId, pushName) {
             functionResponse = JSON.stringify({ success: false, error: error?.message });
           }
 
-        } else if (functionName === "reschedule_booking") {
-          // Búsqueda por teléfono y fecha (Lógica recuperada)
-          const query = supabase
-            .from("bookings")
-            .select("id")
-            .eq("tenant_id", tenantId)
-            .eq("customer_phone", functionArgs.customerPhone)
-            .in("status", ["confirmed", "pending"]);
+        } else if (functionName === "reschedule_booking" || functionName === "cancel_booking") {
+           
+           // 🔥 FIX TELÉFONOS: Buscamos el limpio Y el formato whatsapp:+
+           // Esto soluciona que no encontrara las citas guardadas con prefijo
+           const cleanPhone = functionArgs.customerPhone.replace(/\D/g, "");
+           const whatsappPhone = `whatsapp:+${cleanPhone}`; 
+           
+           const query = supabase.from('bookings').select('id')
+             .eq('tenant_id', tenantId)
+             // Buscamos coincidencia en cualquiera de los formatos para asegurar éxito
+             .or(`customer_phone.eq.${functionArgs.customerPhone},customer_phone.eq.${whatsappPhone},customer_phone.eq.${cleanPhone}`)
+             .in('status', ['confirmed', 'pending']);
             
+          // Filtramos por fecha si viene (para ser precisos)
           if(functionArgs.oldBookingDate) query.eq("starts_at", functionArgs.oldBookingDate);
-
-          const { data: oldBooking } = await query.maybeSingle();
-
-          if (oldBooking) {
-            const { error } = await supabase
-              .from("bookings")
-              .update({
-                starts_at: functionArgs.newStartsAtISO,
-                ends_at: functionArgs.newEndsAtISO,
-              })
-              .eq("id", oldBooking.id);
-
-            functionResponse = JSON.stringify({ success: !error });
-          } else {
-            functionResponse = JSON.stringify({ success: false, error: "Cita no encontrada con ese teléfono y fecha." });
-          }
-
-        } else if (functionName === "cancel_booking") {
-           // Búsqueda por teléfono y fecha (Lógica recuperada)
-          const query = supabase
-            .from("bookings")
-            .select("id")
-            .eq("tenant_id", tenantId)
-            .eq("customer_phone", functionArgs.customerPhone)
-            .in("status", ["confirmed", "pending"]);
-
           if(functionArgs.bookingDate) query.eq("starts_at", functionArgs.bookingDate);
 
-          const { data: oldBooking } = await query.maybeSingle();
+          const { data: targetBooking } = await query.maybeSingle();
 
-          if (oldBooking) {
-            const { error } = await supabase
-              .from("bookings")
-              .update({ status: "cancelled" })
-              .eq("id", oldBooking.id);
-
-            functionResponse = JSON.stringify({ success: !error });
+          if (targetBooking) {
+             let err;
+             if (functionName === "cancel_booking") {
+                ({ error: err } = await supabase.from('bookings').update({ status: 'cancelled' }).eq('id', targetBooking.id));
+             } else {
+                ({ error: err } = await supabase.from('bookings').update({ 
+                    starts_at: functionArgs.newStartsAtISO, 
+                    ends_at: functionArgs.newEndsAtISO 
+                }).eq('id', targetBooking.id));
+             }
+             functionResponse = JSON.stringify({ success: !err });
           } else {
-            functionResponse = JSON.stringify({ success: false, error: "Cita no encontrada." });
+            functionResponse = JSON.stringify({ success: false, error: "No encontré la cita. Verifica el número y la fecha." });
           }
         }
 
@@ -644,9 +634,10 @@ async function getOrCreateSession(tenantId) {
       msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
     if (!text) return;
 
-    // 🔥 FIX: OBTENER PUSHNAME (Nombre del Cliente)
+    // 🔥 FIX: Capturamos el nombre real del cliente desde WhatsApp
     const pushName = msg.pushName || "Cliente";
 
+    // 🔥 Pasamos el nombre a la función de respuesta
     const reply = await generateReply(text, tenantId, pushName);
     if (reply) {
       await sock.sendMessage(remoteJid, { text: reply });
@@ -823,7 +814,6 @@ app.post("/api/v1/create-booking", async (req, res) => {
 
   if (
     !tenantId ||
-    // resourceId YA NO ES REQUERIDO AQUÍ SI QUEREMOS PERMITIR AUTO-ASIGNACIÓN EXTERNA
     !customerName ||
     !phone ||
     !startsAtISO ||
@@ -1180,7 +1170,6 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 // 12. AUTO-RECONEXIÓN (restoreSessions)
 // ---------------------------------------------------------------------
 
-// 🔥 RECUPERADA: Lógica para reconectar al reiniciar el server
 async function restoreSessions() {
   try {
     logger.info("♻️ Restaurando sesiones de WhatsApp desde la base de datos…");
