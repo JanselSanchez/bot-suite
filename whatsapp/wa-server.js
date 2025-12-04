@@ -136,6 +136,7 @@ async function getAvailableSlots(
   if (!tenantId) return [];
 
   // ⬇⬇ Import dinámico del módulo ESM scheduling-logic.mjs ⬇⬇
+  // Asegúrate de que la ruta sea correcta relativa a donde se ejecuta este archivo
   const {
     weeklyOpenWindows,
     generateOfferableSlots,
