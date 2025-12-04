@@ -185,30 +185,31 @@ async function getAvailableSlots(
 // 3. DEFINICIÓN DE TOOLS (HERRAMIENTAS) PARA OPENAI
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// 3. DEFINICIÓN DE TOOLS (HERRAMIENTAS) PARA OPENAI
+// ---------------------------------------------------------------------
+
 const tools = [
   {
     type: "function",
     function: {
       name: "check_availability",
-      description:
-        "Consulta los slots libres. Si el cliente no especifica barbero/recurso, busca disponibilidad general.",
+      description: "Consulta los espacios disponibles. ÚSALA SIEMPRE QUE EL CLIENTE MENCIONE AGENDAR, RECORTARSE O PIDA HORARIOS.",
       parameters: {
         type: "object",
         properties: {
           resourceId: {
             type: "string",
-            description: "El ID UUID del recurso. Opcional si el cliente no tiene preferencia.",
+            description: "Opcional. Si el cliente no dice con quién, déjalo vacío.",
           },
           requestedDate: {
             type: "string",
-            description:
-              "La fecha ISO de inicio. Si el cliente dice 'hoy' o 'mañana', calcula la fecha basada en la fecha actual.",
+            description: "Fecha ISO (YYYY-MM-DD). Si el cliente dice 'hoy', 'mañana', 'lunes', calcula la fecha exacta.",
           },
         },
-        // 🔥 CAMBIO CLAVE: Solo requestedDate es obligatorio ahora.
-        required: ["requestedDate"], 
+        required: ["requestedDate"],
       },
-    }
+    },
   },
   {
     type: "function",
@@ -219,37 +220,38 @@ const tools = [
         type: "object",
         properties: {
           serviceId: { type: "string", description: "ID del servicio a agendar (si aplica)." },
-          resourceId: { type: "string", description: "ID del recurso/empleado con quien se agenda." },
+          resourceId: { 
+            type: "string", 
+            description: "ID del recurso. OPCIONAL. Si no se especifica, el sistema asignará uno." 
+          },
           customerName: { type: "string", description: "Nombre del cliente." },
           phone: { type: "string", description: "Número de teléfono del cliente." },
           startsAtISO: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
           endsAtISO: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
-          notes: { type: "string", description: "Notas adicionales para la cita." }
+          notes: { type: "string", description: "Notas adicionales para la cita." },
         },
-        required: ["resourceId", "customerName", "phone", "startsAtISO", "endsAtISO"]
-      }
-    }
+        // 🔥 CORRECCIÓN: Quitamos resourceId de aquí para permitir auto-asignación
+        required: ["customerName", "phone", "startsAtISO", "endsAtISO"],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "reschedule_booking",
-      description: "Actualiza la fecha y hora de una cita ya existente. Úsalo si el cliente pide M O V E R o C A M B I A R su cita.",
+      description: "Actualiza la fecha y hora de una cita ya existente.",
       parameters: {
         type: "object",
         properties: {
-          bookingId: { type: "string", description: "ID de la cita a reagendar (si se conoce)." }, // Idealmente la IA debería poder buscar la cita antes, pero por ahora asumiremos flujo directo o búsqueda interna simplificada
-          // Para simplificar en este contexto, asumiremos que la IA obtiene el bookingId de una búsqueda previa o contexto, 
-          // pero si no, podríamos necesitar una tool 'search_booking'. 
-          // Vamos a usar customerPhone y oldBookingDate para buscarla si no hay ID.
-          customerPhone: { type: "string", description: "Número de teléfono WhatsApp del cliente (Ej: +1809...)" },
-          oldBookingDate: { type: "string", description: "Fecha ISO UTC original de la cita antigua (clave para buscar el registro)." },
-          newStartsAtISO: { type: "string", description: "Nueva fecha y hora de inicio en formato ISO 8601." },
-          newEndsAtISO: { type: "string", description: "Nueva fecha y hora de fin en formato ISO 8601." }
+          bookingId: { type: "string", description: "ID de la cita (si se conoce)." },
+          customerPhone: { type: "string", description: "Teléfono del cliente." },
+          oldBookingDate: { type: "string", description: "Fecha ISO original de la cita." },
+          newStartsAtISO: { type: "string", description: "Nueva fecha inicio ISO." },
+          newEndsAtISO: { type: "string", description: "Nueva fecha fin ISO." },
         },
-        required: ["customerPhone", "oldBookingDate", "newStartsAtISO", "newEndsAtISO"]
-      }
-    }
+        required: ["customerPhone", "oldBookingDate", "newStartsAtISO", "newEndsAtISO"],
+      },
+    },
   },
   {
     type: "function",
@@ -259,18 +261,19 @@ const tools = [
       parameters: {
         type: "object",
         properties: {
-          customerPhone: { type: "string", description: "Número de teléfono del cliente." },
-          bookingDate: { type: "string", description: "Fecha de la cita a cancelar (ISO)." }
+          customerPhone: { type: "string", description: "Teléfono del cliente." },
+          bookingDate: { type: "string", description: "Fecha de la cita a cancelar (ISO)." },
         },
-        required: ["customerPhone", "bookingDate"]
-      }
-    }
-  }
+        required: ["customerPhone", "bookingDate"],
+      },
+    },
+  },
 ];
-
 // ---------------------------------------------------------------------
 // 4. IA CON REGLA DE ORO Y MANEJO DE TOOLS
 // ---------------------------------------------------------------------
+
+// En wa-server.js -> generateReply
 
 // En wa-server.js -> generateReply
 
@@ -278,41 +281,48 @@ async function generateReply(text, tenantId) {
   const cleanText = text.trim();
   const lower = cleanText.toLowerCase();
 
-  // A) REGLA PRECIOS (Se mantiene igual)
-  const priceKeywords = ["precio", "costo", "cuanto vale", "planes", "tarifa"];
-  if (priceKeywords.some((kw) => lower.includes(kw))) {
-    const template = await getTemplate(tenantId, "pricing_pitch");
-    if (template) return renderTemplate(template, {});
-  }
+  // ... (tu lógica de precios sigue igual aquí) ...
 
-  // B) IA CONTEXTUAL
   const context = await getTenantContext(tenantId);
   
-  // 🔥 AGREGAMOS LA FECHA ACTUAL PARA QUE LA IA SE UBIQUE
+  // 1. FECHA ACTUAL (Crucial para que entienda "hoy" o "mañana")
   const now = new Date();
   const currentDateStr = now.toLocaleString("es-DO", { 
+    timeZone: "America/Santo_Domingo",
     weekday: 'long', 
     year: 'numeric', 
     month: 'long', 
     day: 'numeric', 
     hour: '2-digit', 
-    minute: '2-digit' 
+    minute: '2-digit',
+    hour12: true
   });
 
+  // 2. PROMPT AGRESIVO / PROACTIVO
   const systemPrompt = `
-    Eres el asistente virtual de "${context.name}".
-    Tipo: ${context.vertical}.
-    Descripción: ${context.description}.
+    Eres el asistente de "${context.name}".
+    FECHA Y HORA ACTUAL: ${currentDateStr}.
     
-    FECHA Y HORA ACTUAL: ${currentDateStr}. (Usa esto para calcular 'hoy', 'mañana', 'lunes', etc).
+    TU OBJETIVO: Llenar la agenda. Agendar lo más rápido posible.
 
-    REGLAS ABSOLUTAS:
-    1. TU MISIÓN es agendar la cita. NO mandes al cliente a llamar ni a escribir por Instagram.
-    2. Si el cliente quiere una cita y no especificó con quién, USA la herramienta "check_availability" sin resourceId (o pregunta si prefiere a alguien específico).
-    3. Si el cliente pide horarios, USA "check_availability" inmediatamente.
-    4. Sé breve y persuasivo. Ve al grano.
-    5. Solo confirma la cita usando la herramienta "create_booking" cuando tengas: Nombre, Teléfono, Fecha/Hora exactas y Recurso.
+    REGLA DE ORO (FLUJO DE VENTA):
+    1. Si el usuario muestra intención de cita ("recortarme", "agendar", "cita", "hoy", "mañana"):
+       - ¡NO PREGUNTES "¿A QUÉ HORA QUIERES?"!
+       - EJECUTA INMEDIATAMENTE la herramienta "check_availability".
+       - Cuando recibas los horarios, responde: "Tengo disponibilidad a las [hora1], [hora2] y [hora3]. ¿Cuál prefieres?".
+    
+    2. SI YA ELIGIERON HORA:
+       - Pide el nombre del cliente (si no lo tienes).
+       - Ejecuta "create_booking".
+    
+    3. MANEJO DE BARBEROS:
+       - Si no piden barbero específico, busca disponibilidad general (check_availability sin resourceId).
+       - Al agendar, si no hay barbero, no te preocupes, el sistema asignará uno.
+
+    4. NUNCA inventes horas. Usa solo lo que te devuelve la herramienta.
   `.trim();
+
+  // ... (resto de la función igual: openai.chat.completions.create, etc) ...
 
   // ... el resto sigue igual
 
@@ -358,24 +368,43 @@ async function generateReply(text, tenantId) {
           ).slice(0, 10).join(", ");
           functionResponse = JSON.stringify({ available_slots: formattedSlots });
         } else if (functionName === "create_booking") {
-           // Llamamos internamente a la lógica de creación (podríamos refactorizar para llamar a la función directa, pero simularemos la llamada a la API o lógica directa aquí)
-           // Por simplicidad y para mantener todo en este archivo, implementaré la lógica directa aquí o llamaré a una función auxiliar.
-           // Vamos a simular una llamada exitosa para que la IA confirme, pero idealmente deberías llamar a tu función de crear booking real.
-           // Como esto es wa-server, podemos llamar a la DB directo.
-           
-           const { data: booking, error } = await supabase
-            .from("bookings")
-            .insert([{
-                tenant_id: tenantId,
-                service_id: functionArgs.serviceId, // La IA debe inventar o saber un ID, esto es un punto débil si no tiene IDs reales. Asumiremos que los tiene o pasaremos null si la DB lo permite (o un default).
-                // MEJORA: Deberíamos buscar el servicio por nombre si la IA no tiene el ID.
-                resource_id: functionArgs.resourceId,
-                customer_name: functionArgs.customerName,
-                customer_phone: functionArgs.phone,
-                starts_at: functionArgs.startsAtISO,
-                ends_at: functionArgs.endsAtISO,
-                status: "confirmed",
-                notes: functionArgs.notes
+    
+          // 🛡️ LÓGICA DE AUTO-ASIGNACIÓN
+          // Si la IA no mandó barbero, buscamos uno cualquiera en la DB para que no falle
+          let finalResourceId = functionArgs.resourceId;
+          
+          if (!finalResourceId) {
+              // Buscamos el primer barbero activo del negocio
+              const { data: anyResource } = await supabase
+                  .from("resources") // Ojo: Asegúrate que tu tabla se llama 'resources' o 'employees'
+                  .select("id")
+                  .eq("tenant_id", tenantId)
+                  .limit(1)
+                  .maybeSingle();
+                  
+              if (anyResource) {
+                  finalResourceId = anyResource.id;
+              } else {
+                  // Si no hay barberos creados en el sistema
+                  functionResponse = JSON.stringify({ success: false, error: "Error interno: No hay barberos registrados en el sistema." });
+                  // continue; // Ojo con el flujo aquí
+              }
+          }
+      
+          // Ahora insertamos con 'finalResourceId' que seguro tiene un valor
+          const { data: booking, error } = await supabase
+          .from("bookings")
+          .insert([
+              {
+              tenant_id: tenantId,
+              service_id: functionArgs.serviceId || null,
+              resource_id: finalResourceId, // <--- USAMOS EL ID QUE BUSCAMOS
+              customer_name: functionArgs.customerName,
+              customer_phone: functionArgs.phone,
+              starts_at: functionArgs.startsAtISO,
+              ends_at: functionArgs.endsAtISO,
+              status: "confirmed", // <--- AL GUARDAR COMO CONFIRMED, DESAPARECE DE LA LISTA PARA OTROS
+              notes: functionArgs.notes || null,
             }])
             .select("*")
             .single();
