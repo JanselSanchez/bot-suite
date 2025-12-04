@@ -1,3 +1,4 @@
+// whatsapp/wa-server.js
 require("dotenv").config({ path: ".env.local" });
 require("dotenv").config();
 
@@ -38,6 +39,11 @@ const supabase = createClient(
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const sessions = new Map();
+
+// Import ESM de scheduling logic (una sola vez)
+const schedulingLogicPromise = import(
+  "./utils/wa-server/scheduling-logic.mjs"
+);
 
 // ---------------------------------------------------------------------
 // 1. HELPERS: CALENDARIO Y ARCHIVOS (.ICS)
@@ -99,7 +105,8 @@ async function getTenantContext(tenantId) {
       .eq("id", tenantId)
       .maybeSingle();
 
-    if (!data) return { name: "el negocio", vertical: "general", description: "" };
+    if (!data)
+      return { name: "el negocio", vertical: "general", description: "" };
     return data;
   } catch (e) {
     return { name: "el negocio", vertical: "general", description: "" };
@@ -135,12 +142,9 @@ async function getAvailableSlots(
 ) {
   if (!tenantId) return [];
 
-  // ⬇⬇ Import dinámico del módulo ESM scheduling-logic.mjs ⬇⬇
-  // Asegúrate de que la ruta sea correcta relativa a donde se ejecuta este archivo
-  const {
-    weeklyOpenWindows,
-    generateOfferableSlots,
-  } = await import("./utils/wa-server/scheduling-logic.mjs");
+  // Import ESM (una sola vez, reutilizado por todas las llamadas)
+  const { weeklyOpenWindows, generateOfferableSlots } =
+    await schedulingLogicPromise;
 
   // 1. Obtener la semana de inicio (Lunes = 1)
   const weekStart = startOfWeek(startDate, { weekStartsOn: 1 });
@@ -190,57 +194,113 @@ const tools = [
     type: "function",
     function: {
       name: "check_availability",
-      description: "Consulta los slots libres de un recurso para agendar una cita. Obligatorio si el cliente pregunta por horarios.",
+      description:
+        "Consulta los slots libres de un recurso para agendar una cita. Obligatorio si el cliente pregunta por horarios.",
       parameters: {
         type: "object",
         properties: {
-          resourceId: { type: "string", description: "El ID UUID del recurso. (Ej: '846190e1-...')" },
-          requestedDate: { type: "string", description: "La fecha ISO de inicio de la búsqueda (Ej: 2025-12-05T10:00:00Z). Si es hoy, usa la hora actual." },
+          resourceId: {
+            type: "string",
+            description: "El ID UUID del recurso. (Ej: '846190e1-...')",
+          },
+          requestedDate: {
+            type: "string",
+            description:
+              "La fecha ISO de inicio de la búsqueda (Ej: 2025-12-05T10:00:00Z). Si es hoy, usa la hora actual.",
+          },
         },
         required: ["resourceId", "requestedDate"],
-      }
-    }
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "create_booking",
-      description: "Crea una nueva cita en el sistema cuando el cliente confirma fecha y hora.",
+      description:
+        "Crea una nueva cita en el sistema cuando el cliente confirma fecha y hora.",
       parameters: {
         type: "object",
         properties: {
-          serviceId: { type: "string", description: "ID del servicio a agendar (si aplica)." },
-          resourceId: { type: "string", description: "ID del recurso/empleado con quien se agenda." },
-          customerName: { type: "string", description: "Nombre del cliente." },
-          phone: { type: "string", description: "Número de teléfono del cliente." },
-          startsAtISO: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
-          endsAtISO: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
-          notes: { type: "string", description: "Notas adicionales para la cita." }
+          serviceId: {
+            type: "string",
+            description: "ID del servicio a agendar (si aplica).",
+          },
+          resourceId: {
+            type: "string",
+            description: "ID del recurso/empleado con quien se agenda.",
+          },
+          customerName: {
+            type: "string",
+            description: "Nombre del cliente.",
+          },
+          phone: {
+            type: "string",
+            description: "Número de teléfono del cliente.",
+          },
+          startsAtISO: {
+            type: "string",
+            description: "Fecha y hora de inicio en formato ISO 8601.",
+          },
+          endsAtISO: {
+            type: "string",
+            description: "Fecha y hora de fin en formato ISO 8601.",
+          },
+          notes: {
+            type: "string",
+            description: "Notas adicionales para la cita.",
+          },
         },
-        required: ["resourceId", "customerName", "phone", "startsAtISO", "endsAtISO"]
-      }
-    }
+        required: [
+          "resourceId",
+          "customerName",
+          "phone",
+          "startsAtISO",
+          "endsAtISO",
+        ],
+      },
+    },
   },
   {
     type: "function",
     function: {
       name: "reschedule_booking",
-      description: "Actualiza la fecha y hora de una cita ya existente. Úsalo si el cliente pide M O V E R o C A M B I A R su cita.",
+      description:
+        "Actualiza la fecha y hora de una cita ya existente. Úsalo si el cliente pide M O V E R o C A M B I A R su cita.",
       parameters: {
         type: "object",
         properties: {
-          bookingId: { type: "string", description: "ID de la cita a reagendar (si se conoce)." }, // Idealmente la IA debería poder buscar la cita antes, pero por ahora asumiremos flujo directo o búsqueda interna simplificada
-          // Para simplificar en este contexto, asumiremos que la IA obtiene el bookingId de una búsqueda previa o contexto, 
-          // pero si no, podríamos necesitar una tool 'search_booking'. 
-          // Vamos a usar customerPhone y oldBookingDate para buscarla si no hay ID.
-          customerPhone: { type: "string", description: "Número de teléfono WhatsApp del cliente (Ej: +1809...)" },
-          oldBookingDate: { type: "string", description: "Fecha ISO UTC original de la cita antigua (clave para buscar el registro)." },
-          newStartsAtISO: { type: "string", description: "Nueva fecha y hora de inicio en formato ISO 8601." },
-          newEndsAtISO: { type: "string", description: "Nueva fecha y hora de fin en formato ISO 8601." }
+          bookingId: {
+            type: "string",
+            description: "ID de la cita a reagendar (si se conoce).",
+          },
+          customerPhone: {
+            type: "string",
+            description:
+              "Número de teléfono WhatsApp del cliente (Ej: +1809...)",
+          },
+          oldBookingDate: {
+            type: "string",
+            description:
+              "Fecha ISO UTC original de la cita antigua (clave para buscar el registro).",
+          },
+          newStartsAtISO: {
+            type: "string",
+            description: "Nueva fecha y hora de inicio en formato ISO 8601.",
+          },
+          newEndsAtISO: {
+            type: "string",
+            description: "Nueva fecha y hora de fin en formato ISO 8601.",
+          },
         },
-        required: ["customerPhone", "oldBookingDate", "newStartsAtISO", "newEndsAtISO"]
-      }
-    }
+        required: [
+          "customerPhone",
+          "oldBookingDate",
+          "newStartsAtISO",
+          "newEndsAtISO",
+        ],
+      },
+    },
   },
   {
     type: "function",
@@ -250,13 +310,19 @@ const tools = [
       parameters: {
         type: "object",
         properties: {
-          customerPhone: { type: "string", description: "Número de teléfono del cliente." },
-          bookingDate: { type: "string", description: "Fecha de la cita a cancelar (ISO)." }
+          customerPhone: {
+            type: "string",
+            description: "Número de teléfono del cliente.",
+          },
+          bookingDate: {
+            type: "string",
+            description: "Fecha de la cita a cancelar (ISO).",
+          },
         },
-        required: ["customerPhone", "bookingDate"]
-      }
-    }
-  }
+        required: ["customerPhone", "bookingDate"],
+      },
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------
@@ -311,7 +377,7 @@ async function generateReply(text, tenantId) {
 
     // Si la IA quiere usar una herramienta
     if (message.tool_calls) {
-      messages.push(message); // Agregamos la respuesta de la IA con la llamada a la herramienta al historial
+      messages.push(message);
 
       for (const toolCall of message.tool_calls) {
         const functionName = toolCall.function.name;
@@ -325,70 +391,102 @@ async function generateReply(text, tenantId) {
             new Date(functionArgs.requestedDate),
             7
           );
-          const formattedSlots = slots.map((s) =>
-            s.start.toLocaleString("es-DO", {
-              weekday: "short",
-              month: "numeric",
-              day: "numeric",
-              hour: "2-digit",
-              minute: "2-digit",
-            })
-          ).slice(0, 10).join(", ");
+          const formattedSlots = slots
+            .map((s) =>
+              s.start.toLocaleString("es-DO", {
+                weekday: "short",
+                month: "numeric",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+              })
+            )
+            .slice(0, 10)
+            .join(", ");
           functionResponse = JSON.stringify({ available_slots: formattedSlots });
         } else if (functionName === "create_booking") {
-           // Llamamos internamente a la lógica de creación (podríamos refactorizar para llamar a la función directa, pero simularemos la llamada a la API o lógica directa aquí)
-           // Por simplicidad y para mantener todo en este archivo, implementaré la lógica directa aquí o llamaré a una función auxiliar.
-           // Vamos a simular una llamada exitosa para que la IA confirme, pero idealmente deberías llamar a tu función de crear booking real.
-           // Como esto es wa-server, podemos llamar a la DB directo.
-           
-           const { data: booking, error } = await supabase
+          const { data: booking, error } = await supabase
             .from("bookings")
-            .insert([{
+            .insert([
+              {
                 tenant_id: tenantId,
-                service_id: functionArgs.serviceId, // La IA debe inventar o saber un ID, esto es un punto débil si no tiene IDs reales. Asumiremos que los tiene o pasaremos null si la DB lo permite (o un default).
-                // MEJORA: Deberíamos buscar el servicio por nombre si la IA no tiene el ID.
+                service_id: functionArgs.serviceId || null,
                 resource_id: functionArgs.resourceId,
                 customer_name: functionArgs.customerName,
                 customer_phone: functionArgs.phone,
                 starts_at: functionArgs.startsAtISO,
                 ends_at: functionArgs.endsAtISO,
                 status: "confirmed",
-                notes: functionArgs.notes
-            }])
+                notes: functionArgs.notes || null,
+              },
+            ])
             .select("*")
             .single();
 
-            if (!error && booking) {
-                 functionResponse = JSON.stringify({ success: true, bookingId: booking.id });
-                 // Enviar notificación proactiva (ICS) aquí o dejar que la IA responda y luego enviar.
-                 // Mejor enviar aquí para asegurar.
-                 // ... Lógica de envío de ICS (reutilizando la del endpoint) ...
-                 const session = sessions.get(tenantId);
-                 if(session){
-                    // ... enviar ICS ...
-                 }
-            } else {
-                functionResponse = JSON.stringify({ success: false, error: error?.message });
-            }
+          if (!error && booking) {
+            functionResponse = JSON.stringify({
+              success: true,
+              bookingId: booking.id,
+            });
 
-        } else if (functionName === "reschedule_booking") {
-            // Lógica de búsqueda y actualización
-            const { data: oldBooking } = await supabase.from('bookings').select('id').eq('tenant_id', tenantId).eq('customer_phone', functionArgs.customerPhone).eq('starts_at', functionArgs.oldBookingDate).single();
-            
-            if (oldBooking) {
-                const { error } = await supabase.from('bookings').update({ starts_at: functionArgs.newStartsAtISO, ends_at: functionArgs.newEndsAtISO }).eq('id', oldBooking.id);
-                functionResponse = JSON.stringify({ success: !error });
-            } else {
-                functionResponse = JSON.stringify({ success: false, error: "Cita no encontrada" });
+            const session = sessions.get(tenantId);
+            if (session) {
+              // Aquí podrías enviar ICS también si quieres en la ruta de tool
+              // (ya lo hacemos en el endpoint HTTP, así que lo dejo mínimo)
             }
+          } else {
+            functionResponse = JSON.stringify({
+              success: false,
+              error: error?.message,
+            });
+          }
+        } else if (functionName === "reschedule_booking") {
+          const { data: oldBooking } = await supabase
+            .from("bookings")
+            .select("id")
+            .eq("tenant_id", tenantId)
+            .eq("customer_phone", functionArgs.customerPhone)
+            .eq("starts_at", functionArgs.oldBookingDate)
+            .maybeSingle();
+
+          if (oldBooking) {
+            const { error } = await supabase
+              .from("bookings")
+              .update({
+                starts_at: functionArgs.newStartsAtISO,
+                ends_at: functionArgs.newEndsAtISO,
+              })
+              .eq("id", oldBooking.id);
+
+            functionResponse = JSON.stringify({ success: !error });
+          } else {
+            functionResponse = JSON.stringify({
+              success: false,
+              error: "Cita no encontrada",
+            });
+          }
         } else if (functionName === "cancel_booking") {
-             const { data: oldBooking } = await supabase.from('bookings').select('id').eq('tenant_id', tenantId).eq('customer_phone', functionArgs.customerPhone).eq('starts_at', functionArgs.bookingDate).single();
-             if (oldBooking) {
-                const { error } = await supabase.from('bookings').update({ status: 'cancelled' }).eq('id', oldBooking.id);
-                functionResponse = JSON.stringify({ success: !error });
-             } else {
-                functionResponse = JSON.stringify({ success: false, error: "Cita no encontrada" });
-             }
+          const { data: oldBooking } = await supabase
+            .from("bookings")
+            .select("id")
+            .eq("tenant_id", tenantId)
+            .eq("customer_phone", functionArgs.customerPhone)
+            .eq("starts_at", functionArgs.bookingDate)
+            .maybeSingle();
+
+          if (oldBooking) {
+            const { error } = await supabase
+              .from("bookings")
+              .update({ status: "cancelled" })
+              .eq("id", oldBooking.id);
+
+            functionResponse = JSON.stringify({ success: !error });
+          } else {
+            functionResponse = JSON.stringify({
+              success: false,
+              error: "Cita no encontrada",
+            });
+          }
         }
 
         messages.push({
@@ -420,7 +518,10 @@ async function generateReply(text, tenantId) {
 // ---------------------------------------------------------------------
 
 async function updateSessionDB(tenantId, updateData) {
-  await supabase.from("whatsapp_sessions").update(updateData).eq("tenant_id", tenantId);
+  await supabase
+    .from("whatsapp_sessions")
+    .update(updateData)
+    .eq("tenant_id", tenantId);
   if (updateData.status) {
     const isConnected = updateData.status === "connected";
     await supabase
@@ -444,8 +545,9 @@ async function getOrCreateSession(tenantId) {
     "@whiskeysockets/baileys"
   );
   const { useSupabaseAuthState } = await import(
-    "./utils/wa-server/supabaseAuthState.mjs"
+    "./utils/supabaseAuthState.mjs"
   );
+  
 
   const { state, saveCreds } = await useSupabaseAuthState(supabase, tenantId);
 
@@ -473,6 +575,7 @@ async function getOrCreateSession(tenantId) {
         status: "qrcode",
         last_seen_at: new Date().toISOString(),
       });
+      qrcode.generate(qr, { small: true });
     }
 
     if (connection === "open") {
@@ -655,14 +758,15 @@ app.get("/api/v1/availability", async (req, res) => {
     7
   );
 
-  const formattedSlots = slots.map((s) =>
-    `${s.start.toLocaleString("es-DO", {
-      weekday: "short",
-      month: "numeric",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    })}`
+  const formattedSlots = slots.map(
+    (s) =>
+      `${s.start.toLocaleString("es-DO", {
+        weekday: "short",
+        month: "numeric",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      })}`
   );
 
   res.json({
@@ -950,115 +1054,155 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
  * POST /api/v1/cancel-booking
  */
 app.post("/api/v1/cancel-booking", async (req, res) => {
-    const {
-        tenantId,
-        bookingId,
-        extraVariables,
-    } = req.body || {};
+  const { tenantId, bookingId, extraVariables } = req.body || {};
 
-    if (!tenantId || !bookingId) {
-        return res.status(400).json({
-            ok: false,
-            error: "missing_fields",
-            detail: "Requiere tenantId y bookingId en el body.",
-        });
-    }
-
-    const { data: cancelledBooking, error } = await supabase
-        .from("bookings")
-        .update({
-            status: "cancelled",
-        })
-        .eq("id", bookingId)
-        .eq("tenant_id", tenantId)
-        .select("*")
-        .maybeSingle();
-
-    if (error) {
-        logger.error(error, "Error cancelando booking");
-        return res.status(500).json({ ok: false, error: "db_error" });
-    }
-
-    if (!cancelledBooking) {
-        return res
-            .status(404)
-            .json({ ok: false, error: "booking_not_found_or_not_owned" });
-    }
-
-    // 2. Intentar enviar WhatsApp de confirmación de cancelación
-    try {
-        const session = await getOrCreateSession(tenantId);
-        if (session && session.status === "connected") {
-            const context = await getTenantContext(tenantId);
-
-            const phone =
-                cancelledBooking.customer_phone ||
-                cancelledBooking.phone ||
-                cancelledBooking.client_phone ||
-                null;
-
-            if (phone) {
-                const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
-
-                const startsDate = new Date(cancelledBooking.starts_at);
-                const dateStr = startsDate.toISOString().slice(0, 10);
-                const timeStr = startsDate.toTimeString().slice(0, 5);
-
-                const templateBody = await getTemplate(
-                    tenantId,
-                    "booking_cancelled"
-                );
-
-                const vars = {
-                    date: dateStr,
-                    time: timeStr,
-                    business_name: context.name,
-                    customer_name: cancelledBooking.customer_name || "",
-                    resource_name: cancelledBooking.resource_name || "",
-                    ...(extraVariables || {}),
-                };
-
-                let msg = "";
-                if (templateBody) {
-                    msg = renderTemplate(templateBody, vars);
-                } else {
-                    // Fallback si no hay plantilla
-                    msg = `Tu cita en ${context.name} para el ${dateStr} a las ${timeStr} ha sido cancelada exitosamente.`;
-                }
-                
-                await session.socket.sendMessage(jid, { text: msg });
-
-                logger.info(
-                    { tenantId, bookingId },
-                    "✅ Booking cancelado y mensaje enviado"
-                );
-            } else {
-                logger.warn(
-                    { tenantId, bookingId },
-                    "Booking cancelado pero sin teléfono para notificar"
-                );
-            }
-        } else {
-            logger.warn(
-                { tenantId, bookingId },
-                "Booking cancelado pero bot no conectado"
-            );
-        }
-    } catch (e) {
-        logger.error(e, "Error enviando confirmación de cancelación");
-    }
-
-    return res.json({
-        ok: true,
-        booking: {
-            id: cancelledBooking.id,
-            status: cancelledBooking.status,
-        },
+  if (!tenantId || !bookingId) {
+    return res.status(400).json({
+      ok: false,
+      error: "missing_fields",
+      detail: "Requiere tenantId y bookingId en el body.",
     });
+  }
+
+  const { data: cancelledBooking, error } = await supabase
+    .from("bookings")
+    .update({
+      status: "cancelled",
+    })
+    .eq("id", bookingId)
+    .eq("tenant_id", tenantId)
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    logger.error(error, "Error cancelando booking");
+    return res.status(500).json({ ok: false, error: "db_error" });
+  }
+
+  if (!cancelledBooking) {
+    return res
+      .status(404)
+      .json({ ok: false, error: "booking_not_found_or_not_owned" });
+  }
+
+  // 2. Intentar enviar WhatsApp de confirmación de cancelación
+  try {
+    const session = await getOrCreateSession(tenantId);
+    if (session && session.status === "connected") {
+      const context = await getTenantContext(tenantId);
+
+      const phone =
+        cancelledBooking.customer_phone ||
+        cancelledBooking.phone ||
+        cancelledBooking.client_phone ||
+        null;
+
+      if (phone) {
+        const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
+
+        const startsDate = new Date(cancelledBooking.starts_at);
+        const dateStr = startsDate.toISOString().slice(0, 10);
+        const timeStr = startsDate.toTimeString().slice(0, 5);
+
+        const templateBody = await getTemplate(tenantId, "booking_cancelled");
+
+        const vars = {
+          date: dateStr,
+          time: timeStr,
+          business_name: context.name,
+          customer_name: cancelledBooking.customer_name || "",
+          resource_name: cancelledBooking.resource_name || "",
+          ...(extraVariables || {}),
+        };
+
+        let msg = "";
+        if (templateBody) {
+          msg = renderTemplate(templateBody, vars);
+        } else {
+          msg = `Tu cita en ${context.name} para el ${dateStr} a las ${timeStr} ha sido cancelada exitosamente.`;
+        }
+
+        await session.socket.sendMessage(jid, { text: msg });
+
+        logger.info(
+          { tenantId, bookingId },
+          "✅ Booking cancelado y mensaje enviado"
+        );
+      } else {
+        logger.warn(
+          { tenantId, bookingId },
+          "Booking cancelado pero sin teléfono para notificar"
+        );
+      }
+    } else {
+      logger.warn(
+        { tenantId, bookingId },
+        "Booking cancelado pero bot no conectado"
+      );
+    }
+  } catch (e) {
+    logger.error(e, "Error enviando confirmación de cancelación");
+  }
+
+  return res.json({
+    ok: true,
+    booking: {
+      id: cancelledBooking.id,
+      status: cancelledBooking.status,
+    },
+  });
 });
 
 // ---------------------------------------------------------------------
-// 12. START SERVER
+// 12. AUTO-RECONEXIÓN (restoreSessions)
 // ---------------------------------------------------------------------
 
-app.listen(PORT, () => logger.info(`🚀 Ready on ${PORT}`));
+async function restoreSessions() {
+  try {
+    logger.info("♻️ Restaurando sesiones de WhatsApp desde la base de datos…");
+
+    const { data, error } = await supabase
+      .from("whatsapp_sessions")
+      .select("tenant_id, status")
+      .in("status", ["connected", "qrcode", "connecting"]);
+
+    if (error) {
+      logger.error(error, "Error al cargar sesiones para restoreSessions");
+      return;
+    }
+
+    if (!data || data.length === 0) {
+      logger.info("No hay sesiones previas que restaurar.");
+      return;
+    }
+
+    for (const row of data) {
+      const tenantId = row.tenant_id;
+      try {
+        logger.info({ tenantId }, "🔄 Restaurando sesión previa…");
+        await getOrCreateSession(tenantId);
+        await updateSessionDB(tenantId, {
+          last_seen_at: new Date().toISOString(),
+        });
+      } catch (err) {
+        logger.error(
+          { tenantId, err },
+          "Error restaurando sesión de WhatsApp"
+        );
+      }
+    }
+  } catch (e) {
+    logger.error(e, "Fallo general en restoreSessions");
+  }
+}
+
+// ---------------------------------------------------------------------
+// 13. START SERVER
+// ---------------------------------------------------------------------
+
+app.listen(PORT, () => {
+  logger.info(`🚀 WA server escuchando en puerto ${PORT}`);
+  restoreSessions().catch((e) =>
+    logger.error(e, "Error al intentar restaurar sesiones al inicio")
+  );
+});
