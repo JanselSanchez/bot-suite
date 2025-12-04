@@ -1,112 +1,65 @@
 // whatsapp/utils/wa-server/supabaseAuthState.mjs
 import { initAuthCreds, BufferJSON, proto } from "@whiskeysockets/baileys";
 
-/**
- * Maneja el auth_state de Baileys guardándolo en la tabla `whatsapp_sessions`
- * por `tenant_id`, de forma que sobreviva a reinicios y deploys.
- */
 export const useSupabaseAuthState = async (supabase, tenantId) => {
-  // 1) Buscar fila existente de sesión para ese tenant
-  const { data: row, error: fetchError } = await supabase
+  // 1. Cargar datos iniciales
+  const { data: row, error } = await supabase
     .from("whatsapp_sessions")
-    .select("id, auth_state")
+    .select("auth_state")
     .eq("tenant_id", tenantId)
     .maybeSingle();
-
-  if (fetchError) {
-    console.error(
-      "[Supabase Auth] Error buscando whatsapp_sessions:",
-      fetchError
-    );
-  }
 
   let creds;
   let keys = {};
 
+  // Recuperar sesión o iniciar nueva
   if (row?.auth_state) {
-    // 2) Si hay auth_state, lo reconstruimos usando BufferJSON.reviver
     try {
-      const parsedState = JSON.parse(
-        JSON.stringify(row.auth_state),
-        BufferJSON.reviver
-      );
-      creds = parsedState.creds;
-      keys = parsedState.keys || {};
-      console.log(
-        "[Supabase Auth]",
-        `Auth state cargado desde DB para tenant ${tenantId}`
-      );
+      const parsed = JSON.parse(JSON.stringify(row.auth_state), BufferJSON.reviver);
+      creds = parsed.creds;
+      keys = parsed.keys || {};
     } catch (e) {
-      console.error(
-        "[Supabase Auth] Error parseando auth_state, re-inicializando credenciales:",
-        e
-      );
+      console.error("Error parseando sesión, reiniciando:", e);
       creds = initAuthCreds();
-      keys = {};
     }
   } else {
-    // 3) Si no hay fila o está vacía, inicializamos credenciales nuevas
-    console.log(
-      "[Supabase Auth]",
-      `No había auth_state para tenant ${tenantId}, creando nuevas credenciales`
-    );
     creds = initAuthCreds();
-    keys = {};
-
-    // Asegurar que exista la fila para ese tenant (insert si no está)
-    const { error: insertError } = await supabase
-      .from("whatsapp_sessions")
-      .insert([{ tenant_id: tenantId, status: "disconnected", auth_state: null }])
-      .onConflict("tenant_id")
-      .ignore();
-
-    if (insertError) {
-      console.error(
-        "[Supabase Auth] Error creando fila inicial en whatsapp_sessions:",
-        insertError
-      );
-    }
   }
 
-  // 4) Función que guarda el estado completo (creds + keys) en Supabase
+  // 2. Lógica de guardado con DEBOUNCE (La solución mágica)
+  // Evita que saturemos la DB y corrompamos los datos por escrituras simultáneas
+  let saveTimeout = null;
+
   const saveState = async () => {
-    try {
-      const stateToSave = JSON.parse(
-        JSON.stringify({ creds, keys }, BufferJSON.replacer)
-      );
+    // Si ya hay un guardado pendiente, lo cancelamos y esperamos más
+    if (saveTimeout) clearTimeout(saveTimeout);
 
-      const { error: upsertError } = await supabase
-        .from("whatsapp_sessions")
-        .upsert(
-          [
-            {
-              tenant_id: tenantId,
-              auth_state: stateToSave,
-            },
-          ],
-          { onConflict: "tenant_id" }
+    saveTimeout = setTimeout(async () => {
+      try {
+        // Serializamos
+        const stateToSave = JSON.parse(
+          JSON.stringify({ creds, keys }, BufferJSON.replacer)
         );
 
-      if (upsertError) {
-        console.error(
-          "[Supabase Auth] Error guardando auth_state en whatsapp_sessions:",
-          upsertError
-        );
-      } else {
-        // console.log("[Supabase Auth] Auth state guardado para", tenantId);
+        // Guardamos en DB
+        const { error } = await supabase
+          .from("whatsapp_sessions")
+          .upsert(
+            [{ tenant_id: tenantId, auth_state: stateToSave }],
+            { onConflict: "tenant_id" }
+          );
+
+        if (error) console.error("Error guardando AuthState:", error.message);
+      } catch (e) {
+        console.error("Error serializando AuthState:", e);
       }
-    } catch (e) {
-      console.error("[Supabase Auth] Error serializando auth_state:", e);
-    }
+    }, 2000); // Espera 2 segundos de inactividad antes de guardar
   };
 
   return {
     state: {
       creds,
       keys: {
-        /**
-         * get(type, ids) -> devuelve las llaves pedidas para Baileys
-         */
         get: (type, ids) => {
           const data = {};
           ids.forEach((id) => {
@@ -118,18 +71,15 @@ export const useSupabaseAuthState = async (supabase, tenantId) => {
           });
           return data;
         },
-        /**
-         * set(data) -> Baileys nos pasa llaves nuevas/actualizadas
-         */
-        set: async (data) => {
+        set: (data) => {
           for (const category in data) {
+            keys[category] = keys[category] || {};
             for (const id in data[category]) {
-              const value = data[category][id];
-              if (!keys[category]) keys[category] = {};
-              keys[category][id] = value;
+              keys[category][id] = data[category][id];
             }
           }
-          await saveState();
+          // Llamamos al guardado (que ahora espera 2s)
+          saveState();
         },
       },
     },

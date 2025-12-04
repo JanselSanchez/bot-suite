@@ -602,22 +602,36 @@ async function getOrCreateSession(tenantId) {
       });
     }
 
-    if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !==
-        DisconnectReason.loggedOut;
-      if (shouldReconnect) {
-        sessions.delete(tenantId);
-        getOrCreateSession(tenantId);
-      } else {
-        sessions.delete(tenantId);
-        await updateSessionDB(tenantId, {
-          status: "disconnected",
-          qr_data: null,
-          auth_state: null,
-        });
-      }
-    }
+// ... dentro de sock.ev.on("connection.update") ...
+
+if (connection === "close") {
+  const statusCode = lastDisconnect?.error?.output?.statusCode;
+  
+  // Si es "Logged Out" (401) o null, borramos sesión para pedir QR nuevo limpio
+  const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+  // A veces 403 o 401 genéricos también requieren re-autenticar
+  const shouldClearSession = isLoggedOut || statusCode === 401 || statusCode === 403;
+
+  if (shouldClearSession) {
+    logger.warn({ tenantId }, "❌ Sesión inválida o cerrada. Eliminando datos para pedir nuevo QR.");
+    sessions.delete(tenantId);
+    // Borramos credenciales corruptas de la DB
+    await updateSessionDB(tenantId, {
+      status: "disconnected",
+      qr_data: null,
+      auth_state: null, // <--- Importante: Limpiar auth_state
+    });
+  } else {
+    // Reconexión normal (internet caído, reinicio de server, etc.)
+    logger.info({ tenantId }, "🔄 Intentando reconectar en 3 segundos...");
+    sessions.delete(tenantId);
+    
+    // Pequeña pausa para no saturar si entra en bucle
+    setTimeout(() => {
+      getOrCreateSession(tenantId);
+    }, 3000); 
+  }
+}
   });
 
   sock.ev.on("creds.update", saveCreds);
