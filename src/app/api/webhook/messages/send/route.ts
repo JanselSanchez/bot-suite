@@ -1,25 +1,10 @@
 // src/app/api/webhook/messages/send/route.ts
 import { NextRequest } from "next/server";
-import crypto from "crypto";
-
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
-import { enqueueWhatsapp } from "@/server/queue";
+// ❌ ELIMINADO: import { enqueueWhatsapp } from "@/server/queue";
 
 export async function GET() {
   return Response.json({ ok: true, route: "/api/webhook/messages/send" });
-}
-
-/**
- * Genera un jobId determinista para BullMQ cuando NO tenemos externalId del proveedor.
- * Usa bucket de 1 minuto para absorber dobles submits/reintentos muy cercanos.
- */
-function fallbackJobId(conversationId: string, text: string) {
-  const minuteBucket = Math.floor(Date.now() / 60000);
-  const key = crypto
-    .createHash("sha256")
-    .update(`${conversationId}|${text.trim()}|${minuteBucket}`)
-    .digest("hex");
-  return `inbound:${conversationId}:${key}`;
 }
 
 export async function POST(req: NextRequest) {
@@ -33,13 +18,13 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Extrae campos (admite opcional externalId/metadata del proveedor)
+  // Extrae campos
   const {
     conversationId,
     text,
-    externalId, // p.ej. Twilio MessageSid
-    provider, // opcional, "twilio" | "whatsapp" | ...
-    meta, // opcional: cualquier metadata del proveedor
+    externalId,
+    provider,
+    meta,
   } = body ?? {};
 
   const debug = {
@@ -76,7 +61,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    // 1) Idempotencia a nivel de mensajes usando externalId (si está disponible)
+    // 1) Idempotencia a nivel de mensajes usando externalId
     if (externalId) {
       const { data: existing, error: selErr } = await supabaseAdmin
         .from("messages")
@@ -92,7 +77,6 @@ export async function POST(req: NextRequest) {
       }
 
       if (existing?.id) {
-        // Ya procesado: NO encolar de nuevo
         return Response.json({
           ok: true,
           id: existing.id,
@@ -102,18 +86,13 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 2) Inserta el mensaje del usuario (con external_id si viene)
+    // 2) Inserta el mensaje del usuario
     const insertPayload: any = {
       conversation_id: conversationId,
       role: "user",
       content: trimmedText,
     };
     if (externalId) insertPayload.external_id = externalId;
-    if (provider || meta) {
-      // Si luego agregas columnas para metadata, puedes guardarlas aquí:
-      // insertPayload.provider = provider ?? null;
-      // insertPayload.meta = meta ?? null; // requiere columna jsonb opcional
-    }
 
     const { data: inserted, error: insErr } = await supabaseAdmin
       .from("messages")
@@ -122,7 +101,6 @@ export async function POST(req: NextRequest) {
       .single();
 
     if (insErr) {
-      // Si rompe por unique constraint en external_id, recupera y sal con dedup
       const msg = (insErr as any)?.message || "";
       const code = (insErr as any)?.code || "";
       const unique =
@@ -154,31 +132,15 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3) Encola job con jobId idempotente:
-    //    - Si hay externalId (p.ej. Twilio MessageSid) úsalo como jobId
-    //    - Si no hay, usa hash determinista por minuto
-    const jobId = externalId
-      ? `inbound:${provider || "ext"}:${externalId}`
-      : fallbackJobId(conversationId, trimmedText);
+    // 3) PROCESAMIENTO DIRECTO (Sin Redis)
+    // Aquí podrías llamar a tu lógica de IA directamente si fuera necesario.
+    // Como eliminamos la cola, solo confirmamos que se guardó.
+    
+    // Si necesitas que el bot responda a estos mensajes web, 
+    // tendrías que invocar la IA aquí mismo o notificar al wa-server.
+    // Por ahora, solo guardamos para no romper el flujo.
 
-    await enqueueWhatsapp(
-      "user-message",
-      {
-        conversationId,
-        userMessageId: inserted.id,
-        text: trimmedText,
-        externalId: externalId ?? null,
-        provider: provider ?? null,
-      },
-      {
-        jobId, // 👈 evita duplicados en cola
-        attempts: 1, // 👈 no reintentar mensajes del usuario (evita dobles respuestas)
-        removeOnComplete: true,
-        removeOnFail: false,
-      }
-    );
-
-    return Response.json({ ok: true, id: inserted.id, jobId, debug });
+    return Response.json({ ok: true, id: inserted.id, status: "saved_only_no_queue", debug });
   } catch (e: any) {
     return Response.json(
       { ok: false, error: "Unhandled", detail: e?.message },

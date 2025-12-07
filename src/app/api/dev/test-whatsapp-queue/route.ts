@@ -1,37 +1,29 @@
 // src/app/api/admin/test-whatsapp/route.ts
 import { NextResponse } from "next/server";
-import {
-  whatsappQueue,
-  type WhatsappJobPayload,
-} from "@/server/queue";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  if (!whatsappQueue) {
-    return NextResponse.json(
-      { ok: false, error: "Cola deshabilitada (no hay REDIS_URL)" },
-      { status: 500 }
-    );
+  // Como eliminamos Redis, ya no podemos encolar mensajes de prueba.
+  // Esta ruta ahora sirve para verificar que la API responde.
+
+  const waServerUrl = process.env.WA_SERVER_URL || "http://localhost:4001";
+  
+  let botStatus = "unknown";
+  try {
+    // Intentamos hacer un ping al bot local para ver si está vivo
+    const res = await fetch(`${waServerUrl}/health`);
+    const data = await res.json();
+    botStatus = data.ok ? "online" : "offline";
+  } catch (error) {
+    botStatus = "unreachable (bot server not running?)";
   }
-
-  // ⚠️ CAMBIA ESTE NÚMERO POR TU WHATSAPP VERIFICADO EN TWILIO
-  const payload: WhatsappJobPayload = {
-    tenantId: "debug-tenant",
-    to: "whatsapp:+1829XXXXXXXX", // ← pon tu número real aquí
-    body: "Mensaje de prueba desde /api/admin/test-whatsapp",
-    // Si quisieras probar plantilla interna:
-    // templateKey: "cita_confirmada",
-    // variables: { nombre: "Cliente Demo", fecha: "hoy", negocio: "PymeBOT Demo" },
-  };
-
-  const job = await whatsappQueue.add("test_whatsapp", payload);
 
   return NextResponse.json({
     ok: true,
-    message: "Job encolado en la cola 'whatsapp'",
-    jobId: job.id,
-    payload,
+    message: "El sistema de colas (Redis) ha sido eliminado. El bot funciona en modo directo.",
+    bot_server_status: botStatus,
+    note: "Para probar el envío real, crea una cita o interactúa con el bot directamente."
   });
 }

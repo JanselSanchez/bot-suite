@@ -1,7 +1,7 @@
 // src/app/api/admin/bookings/create/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
-import { enqueueWhatsapp } from "@/server/queue";
+// ❌ ELIMINADO: import { enqueueWhatsapp } from "@/server/queue";
 
 // 🔹 GET solo para probar en el navegador
 export async function GET() {
@@ -11,7 +11,7 @@ export async function GET() {
   });
 }
 
-// 🔹 POST real (lo que ya tienes)
+// 🔹 POST real
 function normalizeWhatsappPhone(phoneRaw: string): string {
   const s = (phoneRaw || "").trim();
   if (!s) return s;
@@ -57,6 +57,7 @@ export async function POST(req: Request) {
       );
     }
 
+    // 1. Crear Reserva en DB
     const { data, error } = await supabaseAdmin.rpc("book_slot_safe_phone", {
       p_tenant: tenantId,
       p_phone: phone,
@@ -75,33 +76,38 @@ export async function POST(req: Request) {
       );
     }
 
+    // 2. Notificar vía WhatsApp (Directo, sin Redis)
     const safeName = (customerName || "Cliente").toString();
     const to = normalizeWhatsappPhone(String(phone));
 
     try {
-      await enqueueWhatsapp("booking_created", {
-        tenantId,
-        to,
-        event: "booking_created",
-        body: "",
-        variables: {
-          customerName: safeName,
-          businessName: businessName || "tu negocio",
-          bookingTime: startsAtISO,
-        },
-        meta: {
-          serviceId,
-          resourceId,
-          startsAtISO,
-          endsAtISO,
-          notes: notes || null,
-        },
+      // Intentamos contactar al bot que corre localmente en el puerto 4001
+      // Si tienes WA_SERVER_URL en variables de entorno lo usa, si no, usa localhost
+      const waServerUrl = process.env.WA_SERVER_URL || "http://localhost:4001";
+      
+      // Parseamos fecha y hora simple para la plantilla
+      const dateObj = new Date(startsAtISO);
+      const dateStr = dateObj.toLocaleDateString("es-DO");
+      const timeStr = dateObj.toLocaleTimeString("es-DO", { hour: '2-digit', minute: '2-digit' });
+
+      await fetch(`${waServerUrl}/sessions/${tenantId}/send-template`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          phone: to,
+          event: "booking_created",
+          variables: {
+            customerName: safeName,
+            businessName: businessName || "tu negocio",
+            date: dateStr,
+            time: timeStr
+          }
+        }),
       });
+      
     } catch (e) {
-      console.warn(
-        "[bookings/create] No se pudo encolar WhatsApp:",
-        (e as any)?.message || e
-      );
+      // Solo advertencia, no fallamos la creación de la cita si el mensaje falla
+      console.warn("[bookings/create] No se pudo enviar WhatsApp directo:", e);
     }
 
     return NextResponse.json({ ok: true, data }, { status: 200 });
