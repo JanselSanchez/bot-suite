@@ -476,8 +476,61 @@ async function generateReply(text, tenantId, pushName) {
         }
         
         // E) REAGENDAR / CANCELAR (Stub simple)
-        else if (fnName === "reschedule_booking" || fnName === "cancel_booking") {
-             response = JSON.stringify({ success: true, message: "Dile al cliente que la operación se realizó (simulación)." });
+   // E) REAGENDAR (REAL)
+        else if (fnName === "reschedule_booking") {
+             // 1. Buscamos la cita del cliente
+             // Nota: En producción idealmente pedirías el bookingId, pero aquí buscamos por teléfono la última activa
+             const { data: booking } = await supabase.from("bookings")
+                .select("id")
+                .eq("tenant_id", tenantId)
+                .eq("customer_phone", args.customerPhone || args.phone) // El bot debe haber pedido el teléfono
+                .in("status", ["confirmed", "pending"])
+                .order("created_at", { ascending: false })
+                .limit(1)
+                .maybeSingle();
+
+             if (booking) {
+                 const newStart = args.newStartsAtISO;
+                 const newEnd = args.newEndsAtISO || new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
+                 
+                 const { error } = await supabase.from("bookings")
+                    .update({ starts_at: newStart, ends_at: newEnd })
+                    .eq("id", booking.id);
+
+                 if (!error) {
+                     response = JSON.stringify({ success: true, message: "Cita reagendada correctamente." });
+                 } else {
+                     response = JSON.stringify({ success: false, error: "Error actualizando la cita en base de datos." });
+                 }
+             } else {
+                 response = JSON.stringify({ success: false, error: "No encontré ninguna cita activa con ese número de teléfono." });
+             }
+        }
+
+        // F) CANCELAR (REAL)
+        else if (fnName === "cancel_booking") {
+             const { data: booking } = await supabase.from("bookings")
+                .select("id")
+                .eq("tenant_id", tenantId)
+                .eq("customer_phone", args.customerPhone || args.phone)
+                .in("status", ["confirmed", "pending"])
+                .order("created_at", { ascending: false })
+                .limit(1)
+                .maybeSingle();
+
+             if (booking) {
+                 const { error } = await supabase.from("bookings")
+                    .update({ status: "cancelled" })
+                    .eq("id", booking.id);
+
+                 if (!error) {
+                     response = JSON.stringify({ success: true, message: "Cita cancelada correctamente." });
+                 } else {
+                     response = JSON.stringify({ success: false, error: "Error cancelando la cita." });
+                 }
+             } else {
+                 response = JSON.stringify({ success: false, error: "No encontré ninguna cita activa para cancelar." });
+             }
         }
 
         messages.push({
