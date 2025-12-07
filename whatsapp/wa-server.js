@@ -9,36 +9,20 @@ const P = require("pino");
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
-const fs = require("fs");
-
-// ---------------------------------------------------------------------
-// IMPORTACIONES DE BAILEYS (CRÍTICAS PARA QUE FUNCIONE EN UN SOLO ARCHIVO)
-// ---------------------------------------------------------------------
-const {
-  default: makeWASocket,
-  DisconnectReason,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-  initAuthCreds,
-  BufferJSON,
-  proto
-} = require("@whiskeysockets/baileys");
 
 // Importaciones de Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
 
 // ---------------------------------------------------------------------
-// CONFIGURACIÓN GLOBAL Y VARIABLES DE ENTORNO
+// CONFIGURACIÓN GLOBAL
 // ---------------------------------------------------------------------
 
 const app = express();
 app.use(express.json());
-
-// Forzamos el puerto 4001 para el Bot (para que no choque con la Web en 10000)
 const PORT = process.env.PORT || 4001;
 
-// 🔥 AJUSTE DE ZONA HORARIA
+// 🔥 AJUSTE DE ZONA HORARIA (CRÍTICO)
+// Sumamos 4 horas para que el servidor UTC coincida con la hora de apertura en RD (UTC-4)
 const SERVER_OFFSET_HOURS = 4;
 
 const logger = P({
@@ -60,39 +44,8 @@ const supabase = createClient(
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const sessions = new Map();
 
-// Definimos la carpeta donde se guardarán las sesiones temporalmente
-// En Render, usamos /tmp o la raíz si no hay restricción
-const WA_SESSIONS_ROOT = process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
-
 // =====================================================================
-// 1. LÓGICA DE AUTENTICACIÓN (INTEGRADA - MONOLITO)
-// =====================================================================
-
-/**
- * Función de autenticación integrada.
- * Reemplaza la necesidad de importar el archivo 'supabaseAuthState.mjs' que faltaba.
- * Usa el sistema de archivos local para manejar las credenciales de Baileys.
- */
-async function useSupabaseAuthState(tenantId) {
-  if (!tenantId) throw new Error("useSupabaseAuthState requiere tenantId");
-
-  // Creamos la ruta específica para este cliente
-  const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
-
-  // Nos aseguramos de que la carpeta exista
-  if (!fs.existsSync(sessionFolder)) {
-    fs.mkdirSync(sessionFolder, { recursive: true });
-  }
-
-  // Usamos la autenticación nativa de Baileys (Multifile)
-  // Esto genera los archivos creds.json necesarios en la carpeta
-  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-
-  return { state, saveCreds };
-}
-
-// =====================================================================
-// 2. LÓGICA DE SCHEDULING (CALENDARIO Y HORARIOS)
+// 1. LÓGICA DE SCHEDULING
 // =====================================================================
 
 function hmsToParts(hms) {
@@ -130,13 +83,14 @@ function weeklyOpenWindows(weekStart, businessHours) {
       const { h: openH, m: openM } = hmsToParts(toHHMM(dayConfig.open_time));
       const { h: closeH, m: closeM } = hmsToParts(toHHMM(dayConfig.close_time));
 
-      // 🔥 CORRECCIÓN UTC: Sumamos el offset
+      // 🔥 CORRECCIÓN UTC: Sumamos el offset a la hora de apertura/cierre
       const start = new Date(currentDayCursor);
       start.setHours(openH + SERVER_OFFSET_HOURS, openM, 0, 0);
 
       const end = new Date(currentDayCursor);
       end.setHours(closeH + SERVER_OFFSET_HOURS, closeM, 0, 0);
 
+      // Si la ventana es válida (cierra después de abrir), la guardamos
       if (end > start) {
         windows.push({ start, end });
       }
@@ -160,11 +114,14 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
       const slotEnd = new Date(cursor);
       slotEnd.setMinutes(slotEnd.getMinutes() + stepMin);
 
+      // Si el slot se sale del cierre, paramos
       if (slotEnd.getTime() > windowEnd.getTime()) break;
 
+      // Detectar colisiones con citas existentes
       const isBusy = bookings.some((booking) => {
         const busyStart = new Date(booking.starts_at);
         const busyEnd = new Date(booking.ends_at);
+        // Lógica de solapamiento
         return (
           cursor.getTime() < busyEnd.getTime() &&
           slotEnd.getTime() > busyStart.getTime()
@@ -175,6 +132,7 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
         slots.push({ start: new Date(cursor), end: slotEnd });
       }
 
+      // Avanzamos al siguiente bloque
       cursor.setMinutes(cursor.getMinutes() + stepMin);
     }
   }
@@ -182,7 +140,7 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
 }
 
 // ---------------------------------------------------------------------
-// 3. HELPERS: CALENDARIO Y ARCHIVOS (.ICS)
+// 2. HELPERS: CALENDARIO Y ARCHIVOS (.ICS)
 // ---------------------------------------------------------------------
 
 function createICSFile(
@@ -227,7 +185,7 @@ function createICSFile(
 }
 
 // ---------------------------------------------------------------------
-// 4. CEREBRO DEL NEGOCIO & CÁLCULO DE DISPONIBILIDAD
+// 3. CEREBRO DEL NEGOCIO & CÁLCULO DE DISPONIBILIDAD
 // ---------------------------------------------------------------------
 
 async function getTenantContext(tenantId) {
@@ -306,7 +264,7 @@ async function getAvailableSlots(
 }
 
 // ---------------------------------------------------------------------
-// 5. DEFINICIÓN DE TOOLS (OPENAI)
+// 4. DEFINICIÓN DE TOOLS (OPENAI)
 // ---------------------------------------------------------------------
 
 const tools = [
@@ -321,7 +279,8 @@ const tools = [
         properties: {
           resourceId: {
             type: "string",
-            description: "Opcional. Si el cliente no dice con quién, déjalo vacío.",
+            description:
+              "Opcional. Si el cliente no dice con quién, déjalo vacío.",
           },
           requestedDate: {
             type: "string",
@@ -437,7 +396,7 @@ const tools = [
 ];
 
 // ---------------------------------------------------------------------
-// 6. IA CON REGLA DE ORO
+// 5. IA CON REGLA DE ORO E INVOCACIÓN DE TOOLS
 // ---------------------------------------------------------------------
 
 async function generateReply(text, tenantId, pushName) {
@@ -653,37 +612,99 @@ async function generateReply(text, tenantId, pushName) {
 }
 
 // ---------------------------------------------------------------------
-// 7. ACTUALIZAR ESTADO DB
+// 6. ACTUALIZAR ESTADO DB (SIN ON CONFLICT)
 // ---------------------------------------------------------------------
 
 async function updateSessionDB(tenantId, updateData) {
   if (!tenantId) return;
 
   try {
-    const row = {
-      tenant_id: tenantId,
-      ...updateData,
-    };
-
-    // Usamos UPSERT simple para evitar conflictos y simplificar
-    const { error } = await supabase
+    // 1) Ver si ya existe una fila para este tenant
+    const { data: existing, error: selectError } = await supabase
       .from("whatsapp_sessions")
-      .upsert([row], { onConflict: "tenant_id" });
+      .select("id")
+      .eq("tenant_id", tenantId)
+      .maybeSingle();
 
-    if (error) {
-      console.error("[updateSessionDB] Error upsert whatsapp_sessions:", error);
+    if (selectError) {
+      console.error(
+        "[updateSessionDB] Error select whatsapp_sessions:",
+        selectError
+      );
+      return;
     }
 
+    // 2) Si existe, hacemos UPDATE; si no, INSERT
+    if (existing) {
+      const { error: updateError } = await supabase
+        .from("whatsapp_sessions")
+        .update(updateData)
+        .eq("tenant_id", tenantId);
+
+      if (updateError) {
+        console.error(
+          "[updateSessionDB] Error update whatsapp_sessions:",
+          updateError
+        );
+      }
+    } else {
+      const row = {
+        tenant_id: tenantId,
+        ...updateData,
+      };
+
+      const { error: insertError } = await supabase
+        .from("whatsapp_sessions")
+        .insert([row]);
+
+      if (insertError) {
+        console.error(
+          "[updateSessionDB] Error insert whatsapp_sessions:",
+          insertError
+        );
+      }
+    }
+
+    // 3) Sincronizamos también la columna wa_connected en tenants (si viene status)
     if (updateData.status) {
       const isConnected = updateData.status === "connected";
-      await supabase
+      const { error: tenantError } = await supabase
         .from("tenants")
         .update({ wa_connected: isConnected })
         .eq("id", tenantId);
+
+      if (tenantError) {
+        console.error(
+          "[updateSessionDB] Error update tenants.wa_connected:",
+          tenantError
+        );
+      }
     }
   } catch (e) {
     console.error("[updateSessionDB] Error inesperado:", e);
   }
+}
+
+// ---------------------------------------------------------------------
+// 7. AUTH STATE MONOLÍTICO
+// ---------------------------------------------------------------------
+
+const WA_SESSIONS_ROOT =
+  process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
+
+/**
+ * Wrapper sobre useMultiFileAuthState de Baileys.
+ * Crea una carpeta por tenant dentro de .wa-sessions (o la que definas).
+ */
+async function useSupabaseAuthState(tenantId) {
+  if (!tenantId) throw new Error("useSupabaseAuthState requiere tenantId");
+
+  const { useMultiFileAuthState } = await import("@whiskeysockets/baileys");
+
+  const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+  return { state, saveCreds };
 }
 
 // ---------------------------------------------------------------------
@@ -696,7 +717,10 @@ async function getOrCreateSession(tenantId) {
 
   logger.info({ tenantId }, "🔌 Iniciando Socket...");
 
-  // 🔥 AQUÍ USAMOS LA FUNCIÓN INTEGRADA
+  const { default: makeWASocket, DisconnectReason } = await import(
+    "@whiskeysockets/baileys"
+  );
+
   const { state, saveCreds } = await useSupabaseAuthState(tenantId);
 
   const sock = makeWASocket({
@@ -746,14 +770,12 @@ async function getOrCreateSession(tenantId) {
         DisconnectReason.loggedOut;
       if (shouldReconnect) {
         sessions.delete(tenantId);
-        // Pequeño delay antes de reconectar
-        setTimeout(() => getOrCreateSession(tenantId), 3000);
+        getOrCreateSession(tenantId);
       } else {
         sessions.delete(tenantId);
         await updateSessionDB(tenantId, {
           status: "disconnected",
           qr_data: null,
-          auth_state: null,
         });
       }
     }
@@ -764,7 +786,8 @@ async function getOrCreateSession(tenantId) {
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages?.[0];
     if (!msg?.message || msg.key.fromMe) return;
-    if (msg.key.remoteJid.includes("@g.us")) return;
+    const remoteJid = msg.key.remoteJid;
+    if (remoteJid.includes("@g.us")) return;
 
     const text =
       msg.message.conversation ||
@@ -776,7 +799,7 @@ async function getOrCreateSession(tenantId) {
 
     const reply = await generateReply(text, tenantId, pushName);
     if (reply) {
-      await sock.sendMessage(msg.key.remoteJid, { text: reply });
+      await sock.sendMessage(remoteJid, { text: reply });
     }
   });
 
@@ -791,13 +814,46 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, active_sessions: sessions.size })
 );
 
+// 👉 Endpoint para iniciar/conectar la sesión de un tenant (botón "Conectar")
 app.post("/sessions/:tenantId/connect", async (req, res) => {
+  const tenantId = req.params.tenantId;
+
   try {
-    const info = await getOrCreateSession(req.params.tenantId);
-    res.json({ ok: true, status: info.status });
+    const info = await getOrCreateSession(tenantId);
+
+    return res.json({
+      ok: true,
+      status: info.status || "connecting",
+    });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("[/sessions/:tenantId/connect] Error:", e);
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "Error iniciando sesión de WhatsApp",
+    });
   }
+});
+
+// ✅ Endpoint para que el dashboard lea el estado y el QR
+app.get("/sessions/:tenantId", async (req, res) => {
+  const tenantId = req.params.tenantId;
+
+  // Estado en memoria
+  const info = sessions.get(tenantId);
+
+  // Estructura que el frontend espera (SessionDTO)
+  const session = {
+    id: tenantId,
+    status: info?.status || "disconnected",
+    qr_svg: null, // por ahora no usamos SVG
+    qr_data: info?.qr || null, // aquí va el QR RAW (string)
+    phone_number: info?.socket?.user
+      ? info.socket.user.id.split(":")[0]
+      : null,
+    last_connected_at: null, // podríamos leerlo de la DB si quieres
+  };
+
+  return res.json({ ok: true, session });
 });
 
 app.post("/sessions/:tenantId/disconnect", async (req, res) => {
@@ -807,11 +863,13 @@ app.post("/sessions/:tenantId/disconnect", async (req, res) => {
   await updateSessionDB(req.params.tenantId, {
     status: "disconnected",
     qr_data: null,
-    auth_state: null,
   });
   res.json({ ok: true });
 });
 
+/**
+ * 🔥 ENDPOINT MAESTRO: Envía la plantilla Y la alarma
+ */
 app.post("/sessions/:tenantId/send-template", async (req, res) => {
   const { tenantId } = req.params;
   const { event, phone, variables } = req.body;
@@ -1280,7 +1338,7 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 
 async function restoreSessions() {
   try {
-    logger.info("♻️ Restaurando sesiones de WhatsApp desde la base de datos...");
+    logger.info("♻️ Restaurando sesiones de WhatsApp desde la base de datos…");
 
     const { data, error } = await supabase
       .from("whatsapp_sessions")
@@ -1300,7 +1358,7 @@ async function restoreSessions() {
     for (const row of data) {
       const tenantId = row.tenant_id;
       try {
-        logger.info({ tenantId }, "🔄 Restaurando sesión previa...");
+        logger.info({ tenantId }, "🔄 Restaurando sesión previa…");
         await getOrCreateSession(tenantId);
         await updateSessionDB(tenantId, {
           last_seen_at: new Date().toISOString(),
