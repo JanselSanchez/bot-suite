@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 next dev --turbopack",
+    "dev": "npx concurrently -n \"WEB,BOT\" -c \"blue,green\" \"cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 next dev --turbopack\" \"npm run wa:dev\"",
     "build": "next build --turbopack",
-    "start": "cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 next start",
-    "lint": "eslint",
-    "wa:dev": "cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 node whatsapp/wa-server.js",
-    "wa:start": "cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 node whatsapp/wa-server.js"
+    "start": "npx concurrently --kill-others -n \"WEB,BOT\" -c \"blue,green\" \"npm run next:start\" \"npm run wa:start\"",
+    "next:start": "cross-env NODE_TLS_REJECT_UNAUTHORIZED=0 next start",
+    "wa:dev": "cross-env PORT=4001 NODE_TLS_REJECT_UNAUTHORIZED=0 node whatsapp/wa-server.js",
+    "wa:start": "cross-env PORT=4001 NODE_TLS_REJECT_UNAUTHORIZED=0 node whatsapp/wa-server.js",
+    "lint": "eslint"
   },
   "dependencies": {
     "@radix-ui/react-separator": "^1.1.7",
@@ -22,6 +23,7 @@
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "concurrently": "^9.1.0",
     "date-fns": "^4.1.0",
     "date-fns-tz": "^3.2.0",
     "dotenv": "^17.2.3",
