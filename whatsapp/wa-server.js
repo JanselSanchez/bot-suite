@@ -8,6 +8,7 @@ const qrcode = require("qrcode-terminal");
 const P = require("pino");
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
+const path = require("path"); // 👈 NUEVO
 
 // Importaciones de Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -72,7 +73,7 @@ function weeklyOpenWindows(weekStart, businessHours) {
   // Iteramos 7 días
   for (let i = 0; i < 7; i++) {
     const currentDow = currentDayCursor.getDay(); // 0=Dom, 1=Lun...
-    
+
     // Buscamos configuración para este día que NO esté cerrado
     const dayConfig = businessHours.find(
       (bh) => bh.dow === currentDow && bh.is_closed === false
@@ -121,13 +122,16 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
         const busyStart = new Date(booking.starts_at);
         const busyEnd = new Date(booking.ends_at);
         // Lógica de solapamiento
-        return (cursor.getTime() < busyEnd.getTime()) && (slotEnd.getTime() > busyStart.getTime());
+        return (
+          cursor.getTime() < busyEnd.getTime() &&
+          slotEnd.getTime() > busyStart.getTime()
+        );
       });
 
       if (!isBusy) {
         slots.push({ start: new Date(cursor), end: slotEnd });
       }
-      
+
       // Avanzamos al siguiente bloque
       cursor.setMinutes(cursor.getMinutes() + stepMin);
     }
@@ -242,7 +246,7 @@ async function getAvailableSlots(
     .from("business_hours")
     .select("dow, is_closed, open_time, close_time")
     .eq("tenant_id", tenantId)
-    .eq("is_closed", false) 
+    .eq("is_closed", false)
     .order("dow", { ascending: true });
 
   // 3. Consulta de Citas (bookings)
@@ -289,7 +293,8 @@ const tools = [
         properties: {
           resourceId: {
             type: "string",
-            description: "Opcional. Si el cliente no dice con quién, déjalo vacío.",
+            description:
+              "Opcional. Si el cliente no dice con quién, déjalo vacío.",
           },
           requestedDate: {
             type: "string",
@@ -340,11 +345,7 @@ const tools = [
           },
         },
         // 🔥 FIX CRÍTICO: resourceId y customerName ELIMINADOS de required para permitir nulos y auto-completado
-        required: [
-          "phone",
-          "startsAtISO",
-          "endsAtISO",
-        ],
+        required: ["phone", "startsAtISO", "endsAtISO"],
       },
     },
   },
@@ -352,8 +353,7 @@ const tools = [
     type: "function",
     function: {
       name: "reschedule_booking",
-      description:
-        "Actualiza la fecha y hora de una cita ya existente.",
+      description: "Actualiza la fecha y hora de una cita ya existente.",
       parameters: {
         type: "object",
         properties: {
@@ -433,8 +433,13 @@ async function generateReply(text, tenantId, pushName) {
   const now = new Date();
   const currentDateStr = now.toLocaleString("es-DO", {
     timeZone: "America/Santo_Domingo",
-    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-    hour: '2-digit', minute: '2-digit', hour12: true
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
   });
 
   const systemPrompt = `
@@ -499,21 +504,32 @@ async function generateReply(text, tenantId, pushName) {
             7
           );
           if (slots.length > 0) {
-              const formattedSlots = slots.slice(0, 15).map((s) =>
-                  s.start.toLocaleString("es-DO", {
-                    weekday: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: true
-                  })
-                ).join(", ");
-              functionResponse = JSON.stringify({ available_slots: formattedSlots });
+            const formattedSlots = slots
+              .slice(0, 15)
+              .map((s) =>
+                s.start.toLocaleString("es-DO", {
+                  weekday: "short",
+                  day: "numeric",
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  hour12: true,
+                })
+              )
+              .join(", ");
+            functionResponse = JSON.stringify({
+              available_slots: formattedSlots,
+            });
           } else {
-              functionResponse = JSON.stringify({ available_slots: "No hay horarios disponibles. (Verifica si la tienda cerró)" });
+            functionResponse = JSON.stringify({
+              available_slots:
+                "No hay horarios disponibles. (Verifica si la tienda cerró)",
+            });
           }
-          
         } else if (functionName === "create_booking") {
-          
           // 🔥 FIX LÓGICO: ResourceId NULL y Nombre por defecto si faltan
           const finalResourceId = functionArgs.resourceId || null;
-          const finalCustomerName = functionArgs.customerName || pushName || "Cliente WhatsApp";
+          const finalCustomerName =
+            functionArgs.customerName || pushName || "Cliente WhatsApp";
 
           const { data: booking, error } = await supabase
             .from("bookings")
@@ -534,42 +550,65 @@ async function generateReply(text, tenantId, pushName) {
             .single();
 
           if (!error && booking) {
-            functionResponse = JSON.stringify({ success: true, bookingId: booking.id, assignedName: finalCustomerName });
+            functionResponse = JSON.stringify({
+              success: true,
+              bookingId: booking.id,
+              assignedName: finalCustomerName,
+            });
           } else {
-            functionResponse = JSON.stringify({ success: false, error: error?.message });
+            functionResponse = JSON.stringify({
+              success: false,
+              error: error?.message,
+            });
           }
+        } else if (
+          functionName === "reschedule_booking" ||
+          functionName === "cancel_booking"
+        ) {
+          // 🔥 FIX TELÉFONOS: Buscamos el limpio Y el formato whatsapp:+
+          const cleanPhone = functionArgs.customerPhone.replace(/\D/g, "");
+          const whatsappPhone = `whatsapp:+${cleanPhone}`;
 
-        } else if (functionName === "reschedule_booking" || functionName === "cancel_booking") {
-           
-           // 🔥 FIX TELÉFONOS: Buscamos el limpio Y el formato whatsapp:+
-           const cleanPhone = functionArgs.customerPhone.replace(/\D/g, "");
-           const whatsappPhone = `whatsapp:+${cleanPhone}`; 
-           
-           const query = supabase.from('bookings').select('id')
-             .eq('tenant_id', tenantId)
-             // Buscamos coincidencia en cualquiera de los formatos para asegurar éxito
-             .or(`customer_phone.eq.${functionArgs.customerPhone},customer_phone.eq.${whatsappPhone},customer_phone.eq.${cleanPhone}`)
-             .in('status', ['confirmed', 'pending']);
-            
+          let query = supabase
+            .from("bookings")
+            .select("id")
+            .eq("tenant_id", tenantId)
+            // Buscamos coincidencia en cualquiera de los formatos para asegurar éxito
+            .or(
+              `customer_phone.eq.${functionArgs.customerPhone},customer_phone.eq.${whatsappPhone},customer_phone.eq.${cleanPhone}`
+            )
+            .in("status", ["confirmed", "pending"]);
+
           // Filtramos por fecha si viene (para ser precisos)
-          if(functionArgs.oldBookingDate) query.eq("starts_at", functionArgs.oldBookingDate);
-          if(functionArgs.bookingDate) query.eq("starts_at", functionArgs.bookingDate);
+          if (functionArgs.oldBookingDate)
+            query = query.eq("starts_at", functionArgs.oldBookingDate);
+          if (functionArgs.bookingDate)
+            query = query.eq("starts_at", functionArgs.bookingDate);
 
           const { data: targetBooking } = await query.maybeSingle();
 
           if (targetBooking) {
-             let err;
-             if (functionName === "cancel_booking") {
-                ({ error: err } = await supabase.from('bookings').update({ status: 'cancelled' }).eq('id', targetBooking.id));
-             } else {
-                ({ error: err } = await supabase.from('bookings').update({ 
-                    starts_at: functionArgs.newStartsAtISO, 
-                    ends_at: functionArgs.newEndsAtISO 
-                }).eq('id', targetBooking.id));
-             }
-             functionResponse = JSON.stringify({ success: !err });
+            let err;
+            if (functionName === "cancel_booking") {
+              ({ error: err } = await supabase
+                .from("bookings")
+                .update({ status: "cancelled" })
+                .eq("id", targetBooking.id));
+            } else {
+              ({ error: err } = await supabase
+                .from("bookings")
+                .update({
+                  starts_at: functionArgs.newStartsAtISO,
+                  ends_at: functionArgs.newEndsAtISO,
+                })
+                .eq("id", targetBooking.id));
+            }
+            functionResponse = JSON.stringify({ success: !err });
           } else {
-            functionResponse = JSON.stringify({ success: false, error: "No encontré la cita. Verifica el número y la fecha." });
+            functionResponse = JSON.stringify({
+              success: false,
+              error: "No encontré la cita. Verifica el número y la fecha.",
+            });
           }
         }
 
@@ -626,7 +665,29 @@ async function updateSessionDB(tenantId, updateData) {
 }
 
 // ---------------------------------------------------------------------
-// 7. CORE WHATSAPP
+// 7. AUTH STATE MONOLÍTICO (ANTES ESTABA EN OTRO ARCHIVO)
+// ---------------------------------------------------------------------
+
+const WA_SESSIONS_ROOT =
+  process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
+
+/**
+ * Wrapper sobre useMultiFileAuthState de Baileys.
+ * Crea una carpeta por tenant dentro de .wa-sessions (o la que definas).
+ */
+async function useSupabaseAuthState(tenantId) {
+  if (!tenantId) throw new Error("useSupabaseAuthState requiere tenantId");
+
+  const { useMultiFileAuthState } = await import("@whiskeysockets/baileys");
+
+  const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+  return { state, saveCreds };
+}
+
+// ---------------------------------------------------------------------
+// 8. CORE WHATSAPP
 // ---------------------------------------------------------------------
 
 async function getOrCreateSession(tenantId) {
@@ -638,11 +699,9 @@ async function getOrCreateSession(tenantId) {
   const { default: makeWASocket, DisconnectReason } = await import(
     "@whiskeysockets/baileys"
   );
-  const { useSupabaseAuthState } = await import(
-    "./utils/wa-server/supabaseAuthState.mjs"
-  );
-  
-  const { state, saveCreds } = await useSupabaseAuthState(supabase, tenantId);
+
+  // 🔥 AHORA usamos la función local, no el archivo externo
+  const { state, saveCreds } = await useSupabaseAuthState(tenantId);
 
   const sock = makeWASocket({
     auth: state,
@@ -731,7 +790,7 @@ async function getOrCreateSession(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 8. API ROUTES BÁSICAS
+// 9. API ROUTES BÁSICAS
 // ---------------------------------------------------------------------
 
 app.get("/health", (req, res) =>
@@ -805,7 +864,9 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
       if (!isNaN(appointmentDate.getTime())) {
         const icsBuffer = createICSFile(
           `Cita en ${context.name}`,
-          `Servicio con ${variables.resource_name || "Nosotros"}.`,
+          `Servicio con ${
+            variables.resource_name || "Nosotros"
+          }.`, // descripción
           "En el local",
           appointmentDate
         );
@@ -819,8 +880,8 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
         });
 
         logger.info(
-          { tenantId, bookingId: booking.id },
-          "✅ Booking creado y mensaje enviado"
+          { tenantId, event, phone },
+          "✅ Plantilla + ICS enviados correctamente"
         );
       }
     }
@@ -834,7 +895,7 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 9. API DE CONSULTA DE DISPONIBILIDAD (TOOL: check_availability)
+// 10. API DE CONSULTA DE DISPONIBILIDAD (TOOL: check_availability)
 // ---------------------------------------------------------------------
 
 /**
@@ -878,7 +939,7 @@ app.get("/api/v1/availability", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 10. API DE CREACIÓN DE CITA (TOOL: create_booking)
+// 11. API DE CREACIÓN DE CITA (TOOL: create_booking)
 // ---------------------------------------------------------------------
 
 /**
@@ -899,13 +960,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
     extraVariables,
   } = req.body || {};
 
-  if (
-    !tenantId ||
-    // resourceId ya no es requerido
-    !phone ||
-    !startsAtISO ||
-    !endsAtISO
-  ) {
+  if (!tenantId || !phone || !startsAtISO || !endsAtISO) {
     return res.status(400).json({
       ok: false,
       error: "missing_fields",
@@ -1013,7 +1068,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 11. API DE REAGENDAMIENTO (TOOL: reschedule_booking)
+// 12. API DE REAGENDAMIENTO (TOOL: reschedule_booking)
 // ---------------------------------------------------------------------
 
 /**
@@ -1147,7 +1202,7 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 12. API DE CANCELACIÓN (TOOL: cancel_booking)
+// 13. API DE CANCELACIÓN (TOOL: cancel_booking)
 // ---------------------------------------------------------------------
 
 /**
@@ -1256,7 +1311,7 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 13. AUTO-RECONEXIÓN (restoreSessions)
+// 14. AUTO-RECONEXIÓN (restoreSessions)
 // ---------------------------------------------------------------------
 
 async function restoreSessions() {
@@ -1299,7 +1354,7 @@ async function restoreSessions() {
 }
 
 // ---------------------------------------------------------------------
-// 14. START SERVER
+// 15. START SERVER
 // ---------------------------------------------------------------------
 
 app.listen(PORT, () => {
