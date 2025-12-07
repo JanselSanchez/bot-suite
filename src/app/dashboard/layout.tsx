@@ -1,4 +1,3 @@
-// src/app/dashboard/layout.tsx
 "use client";
 
 import Link from "next/link";
@@ -18,6 +17,8 @@ import {
   LogOut,
   Bell,
   MessageCircle,
+  ShoppingBag, // Nuevo icono para Catálogo
+  Users,       // Nuevo icono para Equipo
 } from "lucide-react";
 
 import Logo from "@/img/logo4.png";
@@ -35,8 +36,10 @@ const LINKS = [
   { href: "/dashboard/bookings", label: "Citas", icon: Calendar },
   { href: "/dashboard/reschedule", label: "Reprogramar", icon: RefreshCw },
   { href: "/dashboard/availability", label: "Disponibilidad", icon: Clock },
+  // 🔥 NUEVO: Catálogo Universal
+  { href: "/dashboard/catalog", label: "Catálogo", icon: ShoppingBag },
   { href: "/dashboard/templates", label: "Plantillas", icon: Layers },
-  // 👇 LINK NUEVO CORREGIDO
+  // { href: "/dashboard/team", label: "Equipo", icon: Users }, // Descomenta cuando hagas la pantalla de equipo
   { href: "/dashboard/connect-whatsapp", label: "QR WhatsApp", icon: MessageCircle },
   { href: "/dashboard/status", label: "Estado", icon: Activity },
   { href: "/dashboard/settings", label: "Configuración", icon: Settings },
