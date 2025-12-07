@@ -1,4 +1,3 @@
-// whatsapp/wa-server.js
 require("dotenv").config({ path: ".env.local" });
 require("dotenv").config();
 
@@ -14,17 +13,16 @@ const { createClient } = require("@supabase/supabase-js");
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
 
 // ---------------------------------------------------------------------
-// CONFIGURACIÓN GLOBAL Y VARIABLES DE ENTORNO
+// CONFIGURACIÓN GLOBAL
 // ---------------------------------------------------------------------
 
 const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 4001;
 
-// 🔥 AJUSTE DE ZONA HORARIA (CRÍTICO PARA SANTO DOMINGO)
-// Render/Railway corren en UTC (0). Santo Domingo es UTC-4.
-// Sumamos 4 horas a la hora de la DB para que el servidor entienda la hora real local.
-const SERVER_OFFSET_HOURS = 4; 
+// 🔥 AJUSTE DE ZONA HORARIA (CRÍTICO)
+// Sumamos 4 horas para que el servidor UTC coincida con la hora de apertura en RD (UTC-4)
+const SERVER_OFFSET_HOURS = 4;
 
 const logger = P({
   transport: {
@@ -46,8 +44,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const sessions = new Map();
 
 // =====================================================================
-// 1. LÓGICA DE SCHEDULING (INTEGRADA - NO BORRAR)
-// Se integra aquí para evitar errores de importación en producción.
+// 1. LÓGICA DE SCHEDULING (INTEGRADA PARA EVITAR ERRORES DE IMPORT)
 // =====================================================================
 
 function hmsToParts(hms) {
@@ -66,20 +63,17 @@ function toHHMM(t) {
 }
 
 /**
- * Convierte el horario de apertura (ej: 09:00:00) en ventanas de tiempo reales para la semana.
- * APLICA LA CORRECCIÓN DE ZONA HORARIA.
+ * Calcula las ventanas abiertas basándose en Business Hours y ajustando la zona horaria.
  */
 function weeklyOpenWindows(weekStart, businessHours) {
   const windows = [];
-  
-  // weekStart se asume que es el Lunes de esa semana (00:00 horas)
   let currentDayCursor = new Date(weekStart);
 
-  // Iteramos 7 días hacia adelante
+  // Iteramos 7 días
   for (let i = 0; i < 7; i++) {
-    const currentDow = currentDayCursor.getDay(); // 0=Domingo, 1=Lunes...
-
-    // Buscamos configuración para este día en la DB que NO esté cerrado
+    const currentDow = currentDayCursor.getDay(); // 0=Dom, 1=Lun...
+    
+    // Buscamos configuración para este día que NO esté cerrado
     const dayConfig = businessHours.find(
       (bh) => bh.dow === currentDow && bh.is_closed === false
     );
@@ -88,33 +82,29 @@ function weeklyOpenWindows(weekStart, businessHours) {
       const { h: openH, m: openM } = hmsToParts(toHHMM(dayConfig.open_time));
       const { h: closeH, m: closeM } = hmsToParts(toHHMM(dayConfig.close_time));
 
-      // Construimos fecha inicio (Fecha del cursor + Hora DB + OFFSET)
+      // 🔥 CORRECCIÓN UTC: Sumamos el offset a la hora de apertura/cierre
       const start = new Date(currentDayCursor);
       start.setHours(openH + SERVER_OFFSET_HOURS, openM, 0, 0);
 
-      // Construimos fecha fin (Fecha del cursor + Hora DB + OFFSET)
       const end = new Date(currentDayCursor);
       end.setHours(closeH + SERVER_OFFSET_HOURS, closeM, 0, 0);
 
-      // Validación simple: Si cierra después de abrir, es una ventana válida
+      // Si la ventana es válida (cierra después de abrir), la guardamos
       if (end > start) {
         windows.push({ start, end });
       }
     }
-
-    // Avanzamos el cursor al siguiente día
+    // Avanzamos al siguiente día
     currentDayCursor.setDate(currentDayCursor.getDate() + 1);
   }
-
   return windows;
 }
 
 /**
- * Resta las citas (bookings) a las ventanas abiertas para sacar los huecos libres.
+ * Resta las citas ocupadas a las ventanas abiertas.
  */
 function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
   const slots = [];
-
   for (const window of openWindows) {
     let cursor = new Date(window.start);
     const windowEnd = new Date(window.end);
@@ -123,33 +113,25 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
       const slotEnd = new Date(cursor);
       slotEnd.setMinutes(slotEnd.getMinutes() + stepMin);
 
-      // Si el slot se sale del horario de cierre, paramos
-      if (slotEnd.getTime() > windowEnd.getTime()) {
-        break;
-      }
+      // Si el slot se sale del cierre, paramos
+      if (slotEnd.getTime() > windowEnd.getTime()) break;
 
-      // Verificamos si este hueco choca con alguna reserva existente
+      // Detectar colisiones con citas existentes
       const isBusy = bookings.some((booking) => {
         const busyStart = new Date(booking.starts_at);
         const busyEnd = new Date(booking.ends_at);
-        
-        // Lógica de colisión: (StartA < EndB) && (EndA > StartB)
-        return (cursor.getTime() < busyEnd.getTime()) && 
-               (slotEnd.getTime() > busyStart.getTime());
+        // Lógica de solapamiento
+        return (cursor.getTime() < busyEnd.getTime()) && (slotEnd.getTime() > busyStart.getTime());
       });
 
       if (!isBusy) {
-        slots.push({
-          start: new Date(cursor),
-          end: slotEnd,
-        });
+        slots.push({ start: new Date(cursor), end: slotEnd });
       }
-
-      // Avanzamos al siguiente slot
+      
+      // Avanzamos al siguiente bloque
       cursor.setMinutes(cursor.getMinutes() + stepMin);
     }
   }
-
   return slots;
 }
 
@@ -474,7 +456,7 @@ async function generateReply(text, tenantId, pushName) {
     REGLAS DE ACCIÓN:
     1. Si el cliente dice "Cita hoy a las 3:30":
        - Ejecuta "create_booking" DE INMEDIATO con esa hora.
-       - Si no te dieron nombre, usa "${pushName}". NO te detengas.
+       - Si no tienes su nombre, usa "${pushName}". NO te detengas.
        - Si no dijo barbero, manda resourceId: null.
     
     2. Si preguntan horarios:
@@ -835,7 +817,11 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
           caption:
             "📅 Toca este archivo para agregar el recordatorio a tu calendario.",
         });
-        logger.info({ tenantId }, "📅 Alarma .ics enviada");
+
+        logger.info(
+          { tenantId, bookingId: booking.id },
+          "✅ Booking creado y mensaje enviado"
+        );
       }
     }
 
@@ -1273,7 +1259,6 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 // 13. AUTO-RECONEXIÓN (restoreSessions)
 // ---------------------------------------------------------------------
 
-// 🔥 RECUPERADA: Lógica para reconectar al reiniciar el server
 async function restoreSessions() {
   try {
     logger.info("♻️ Restaurando sesiones de WhatsApp desde la base de datos…");
