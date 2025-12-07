@@ -1,60 +1,51 @@
 // src/app/api/health/route.ts
-import { NextResponse } from "next/server";
-import Redis from "ioredis";
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
 
+// Forzamos que esta ruta sea dinámica (no cacheada)
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  // --------- ENV FLAGS ----------
+  // 1. Verificamos variables de entorno
   const env = {
     NEXT_PUBLIC_SUPABASE_URL: !!process.env.NEXT_PUBLIC_SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
-    REDIS_URL: !!process.env.REDIS_URL,
     OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
   };
 
-  // --------- CHEQUEO SUPABASE ----------
+  // 2. Chequeo de conexión a Supabase usando tu cliente existente
   let supabaseOk = false;
+  let errorMsg = null;
+
   try {
     const { error } = await supabaseAdmin
       .from("tenants")
       .select("id")
       .limit(1);
-    supabaseOk = !error;
-  } catch {
-    supabaseOk = false;
-  }
-
-  // --------- CHEQUEO REDIS ----------
-  let redisOk: boolean | undefined = undefined;
-
-  if (process.env.REDIS_URL) {
-    try {
-      const redis = new Redis(process.env.REDIS_URL, {
-        maxRetriesPerRequest: 1,
-        enableReadyCheck: false,
-      });
-      await redis.ping();
-      redisOk = true;
-      redis.disconnect();
-    } catch {
-      redisOk = false; // lo marcamos como error, pero no rompemos el endpoint
+    
+    if (!error) {
+      supabaseOk = true;
+    } else {
+      errorMsg = error.message;
     }
+  } catch (e: any) {
+    console.error("Health check error:", e);
+    errorMsg = e.toString();
   }
 
+  // 3. Estado de los servicios (Redis desactivado)
   const services = {
-    supabase: { ok: supabaseOk },
-    redis: { ok: redisOk },
+    supabase: { ok: supabaseOk, error: errorMsg },
+    redis: { status: "disabled" },
     worker: { heartbeat: false },
-    twilio: { envs: false },
   };
 
-  const ok = supabaseOk && (redisOk !== false);
-
-  return NextResponse.json({
-    ok,
+  // Usamos Response.json nativo para evitar líos de imports
+  return Response.json({
+    ok: supabaseOk,
     env,
     services,
+    message: "Bot Suite Running (Monolith Mode)"
+  }, {
+    status: supabaseOk ? 200 : 503
   });
 }
