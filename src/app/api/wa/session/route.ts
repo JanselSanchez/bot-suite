@@ -1,16 +1,14 @@
 // src/app/api/wa/session/route.ts
 import { NextResponse } from "next/server";
 
-// 1. URL del Servidor de Bots (Lee la variable de entorno que configuraste en Vercel/Render)
+// 1. URL del Servidor de Bots
 const WA_BOT_URL = process.env.NEXT_PUBLIC_WA_SERVER_URL || "http://localhost:4001";
 
-// Configuraciones para evitar caché en Vercel
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
  * GET: Obtener estado actual de la sesión
- * El Frontend llama aquí -> Este archivo llama a Render -> Render responde
  */
 export async function GET(req: Request) {
   try {
@@ -21,91 +19,89 @@ export async function GET(req: Request) {
       return NextResponse.json({ ok: false, error: "Falta tenantId" }, { status: 400 });
     }
 
-    console.log(`[Proxy] Consultando estado a: ${WA_BOT_URL}/sessions/${tenantId}`);
+    // console.log(`[Proxy] Consultando: ${WA_BOT_URL}/sessions/${tenantId}`);
 
-    // Llamada al Servidor de Bots (Render)
     const res = await fetch(`${WA_BOT_URL}/sessions/${tenantId}`, {
       cache: "no-store",
       headers: { "Content-Type": "application/json" }
     });
 
     if (!res.ok) {
-      // Si el servidor de bots está apagado o da error
-      console.warn("[Proxy] El servidor de bots devolvió error o está offline");
       return NextResponse.json({ 
         ok: true, 
-        session: { status: "disconnected" } // Asumimos desconectado si falla
+        session: { status: "disconnected" } 
       }); 
     }
 
     const data = await res.json(); 
-    // Data viene del bot así: { ok: true, status: '...', qr: '...', phone: '...' }
+    // El bot envía: { ok: true, session: { status: '...', qr_data: '...' } }
 
-    // Transformamos la respuesta para que tu Frontend la entienda (SessionDTO)
+    // 🔥 CORRECCIÓN: Accedemos a data.session, no a data directo
+    const botSession = data.session || {};
+
     return NextResponse.json({
       ok: true,
       session: {
         id: tenantId,
-        status: data.status,
-        qr_data: data.qr || null, // Mapeamos 'qr' del bot a 'qr_data' del frontend
-        phone_number: data.phone || null,
+        status: botSession.status || "disconnected",
+        // Aquí estaba el error: el bot manda 'qr_data', no 'qr'
+        qr_data: botSession.qr_data || botSession.qr || null, 
+        phone_number: botSession.phone_number || null,
       },
     });
 
   } catch (error) {
-    console.error("[Proxy] Error de conexión con wa-server:", error);
+    console.error("[Proxy] Error:", error);
     return NextResponse.json(
-      { ok: false, error: "No se pudo conectar con el servidor de WhatsApp" },
+      { ok: false, error: "Error de conexión" },
       { status: 502 }
     );
   }
 }
 
 /**
- * POST: Conectar (Generar QR) o Desconectar
+ * POST: Conectar o Desconectar
  */
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { tenantId, action } = body; // action: 'connect' | 'disconnect'
+    const { tenantId, action } = body; 
 
     if (!tenantId || !action) {
-      return NextResponse.json({ ok: false, error: "Faltan datos (tenantId o action)" }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "Faltan datos" }, { status: 400 });
     }
 
-    // Definimos a qué endpoint del bot llamar
     const endpoint = action === "disconnect" 
         ? `${WA_BOT_URL}/sessions/${tenantId}/disconnect`
         : `${WA_BOT_URL}/sessions/${tenantId}/connect`;
 
-    console.log(`[Proxy] Enviando acción '${action}' a: ${endpoint}`);
+    console.log(`[Proxy] Acción '${action}' -> ${endpoint}`);
 
     const res = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
     
-    // Si el bot responde, devolvemos su respuesta
     const data = await res.json();
 
     if (!res.ok) {
-      return NextResponse.json({ ok: false, error: data.error || "Error en el servidor de bots" }, { status: 500 });
+      return NextResponse.json({ ok: false, error: data.error || "Error bot" }, { status: 500 });
     }
 
-    // Respuesta exitosa
+    // El POST de connect a veces devuelve { status: 'connecting' } directo
     return NextResponse.json({
         ok: true,
         session: {
             id: tenantId,
-            status: data.status,
-            qr_data: data.qr || null,
+            status: data.status || "connecting",
+            qr_data: null, // El QR se obtiene por el GET (polling)
         }
     });
 
   } catch (error) {
-    console.error("[Proxy] Error crítico enviando acción:", error);
+    console.error("[Proxy] Error POST:", error);
     return NextResponse.json(
-      { ok: false, error: "Error de comunicación con el servidor de bots" },
+      { ok: false, error: "Error de comunicación" },
       { status: 500 }
     );
   }
