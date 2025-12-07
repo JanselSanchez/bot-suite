@@ -615,28 +615,68 @@ async function generateReply(text, tenantId, pushName) {
 // 6. ACTUALIZAR ESTADO DB
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// 6. ACTUALIZAR ESTADO DB (SIN ON CONFLICT)
+// ---------------------------------------------------------------------
+
 async function updateSessionDB(tenantId, updateData) {
-  const row = {
-    tenant_id: tenantId,
-    ...updateData,
-  };
+  if (!tenantId) return;
 
-  const { error } = await supabase
-    .from("whatsapp_sessions")
-    .upsert([row], { onConflict: "tenant_id" });
+  try {
+    // 1) Ver si ya existe una fila para este tenant
+    const { data: existing, error: selectError } = await supabase
+      .from("whatsapp_sessions")
+      .select("id")
+      .eq("tenant_id", tenantId)
+      .maybeSingle();
 
-  if (error) {
-    console.error("[updateSessionDB] Error upsert whatsapp_sessions:", error);
-  }
+    if (selectError) {
+      console.error("[updateSessionDB] Error select whatsapp_sessions:", selectError);
+      return;
+    }
 
-  if (updateData.status) {
-    const isConnected = updateData.status === "connected";
-    await supabase
-      .from("tenants")
-      .update({ wa_connected: isConnected })
-      .eq("id", tenantId);
+    // 2) Si existe, hacemos UPDATE; si no, INSERT
+    if (existing) {
+      const { error: updateError } = await supabase
+        .from("whatsapp_sessions")
+        .update(updateData)
+        .eq("tenant_id", tenantId);
+
+      if (updateError) {
+        console.error("[updateSessionDB] Error update whatsapp_sessions:", updateError);
+      }
+    } else {
+      const row = {
+        tenant_id: tenantId,
+        ...updateData,
+      };
+
+      const { error: insertError } = await supabase
+        .from("whatsapp_sessions")
+        .insert([row]);
+
+      if (insertError) {
+        console.error("[updateSessionDB] Error insert whatsapp_sessions:", insertError);
+      }
+    }
+
+    // 3) Sincronizamos también la columna wa_connected en tenants (si viene status)
+    if (updateData.status) {
+      const isConnected = updateData.status === "connected";
+      const { error: tenantError } = await supabase
+        .from("tenants")
+        .update({ wa_connected: isConnected })
+        .eq("id", tenantId);
+
+      if (tenantError) {
+        console.error("[updateSessionDB] Error update tenants.wa_connected:", tenantError);
+      }
+    }
+  } catch (e) {
+    console.error("[updateSessionDB] Error inesperado:", e);
   }
 }
+
 
 // ---------------------------------------------------------------------
 // 7. AUTH STATE MONOLÍTICO (ANTES ERA OTRO ARCHIVO)
