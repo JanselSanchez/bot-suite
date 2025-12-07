@@ -9,6 +9,7 @@ const P = require("pino");
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
+const fs = require("fs"); // Agregamos fs para manejar carpetas si hace falta
 
 // Importaciones de Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -612,7 +613,7 @@ async function generateReply(text, tenantId, pushName) {
 }
 
 // ---------------------------------------------------------------------
-// 6. ACTUALIZAR ESTADO DB (SIN ON CONFLICT)
+// 6. ACTUALIZAR ESTADO DB
 // ---------------------------------------------------------------------
 
 async function updateSessionDB(tenantId, updateData) {
@@ -702,6 +703,11 @@ async function useSupabaseAuthState(tenantId) {
   const { useMultiFileAuthState } = await import("@whiskeysockets/baileys");
 
   const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
+
+  // Nos aseguramos de que la carpeta exista
+  if (!fs.existsSync(sessionFolder)) {
+    fs.mkdirSync(sessionFolder, { recursive: true });
+  }
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
   return { state, saveCreds };
@@ -814,6 +820,35 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, active_sessions: sessions.size })
 );
 
+// 🔥🔥🔥 RUTA NUEVA: Esta es la que devuelve el QR a la web 🔥🔥🔥
+app.get("/sessions/:tenantId", async (req, res) => {
+  const tenantId = req.params.tenantId;
+  const info = sessions.get(tenantId);
+
+  // Si no está en memoria, asumimos desconectado
+  if (!info) {
+    return res.json({ 
+      ok: true, 
+      session: { 
+        id: tenantId, 
+        status: "disconnected", 
+        qr_data: null 
+      } 
+    });
+  }
+
+  return res.json({
+    ok: true,
+    session: {
+      id: tenantId,
+      status: info.status,
+      qr_data: info.qr || null, // Aquí va el string del QR
+      phone_number: info.socket?.user?.id?.split(":")[0] || null
+    }
+  });
+});
+// ---------------------------------------------------------------------
+
 // 👉 Endpoint para iniciar/conectar la sesión de un tenant (botón "Conectar")
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
@@ -832,28 +867,6 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
       error: e.message || "Error iniciando sesión de WhatsApp",
     });
   }
-});
-
-// ✅ Endpoint para que el dashboard lea el estado y el QR
-app.get("/sessions/:tenantId", async (req, res) => {
-  const tenantId = req.params.tenantId;
-
-  // Estado en memoria
-  const info = sessions.get(tenantId);
-
-  // Estructura que el frontend espera (SessionDTO)
-  const session = {
-    id: tenantId,
-    status: info?.status || "disconnected",
-    qr_svg: null, // por ahora no usamos SVG
-    qr_data: info?.qr || null, // aquí va el QR RAW (string)
-    phone_number: info?.socket?.user
-      ? info.socket.user.id.split(":")[0]
-      : null,
-    last_connected_at: null, // podríamos leerlo de la DB si quieres
-  };
-
-  return res.json({ ok: true, session });
 });
 
 app.post("/sessions/:tenantId/disconnect", async (req, res) => {
@@ -1338,7 +1351,7 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 
 async function restoreSessions() {
   try {
-    logger.info("♻️ Restaurando sesiones de WhatsApp desde la base de datos…");
+    logger.info("♻️ Restaurando sesiones de WhatsApp desde la base de datos...");
 
     const { data, error } = await supabase
       .from("whatsapp_sessions")
@@ -1358,7 +1371,7 @@ async function restoreSessions() {
     for (const row of data) {
       const tenantId = row.tenant_id;
       try {
-        logger.info({ tenantId }, "🔄 Restaurando sesión previa…");
+        logger.info({ tenantId }, "🔄 Restaurando sesión previa...");
         await getOrCreateSession(tenantId);
         await updateSessionDB(tenantId, {
           last_seen_at: new Date().toISOString(),
