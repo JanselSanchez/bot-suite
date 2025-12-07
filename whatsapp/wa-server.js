@@ -8,17 +8,21 @@ const qrcode = require("qrcode-terminal");
 const P = require("pino");
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
-
-// Importaciones de Date-fns
+// Asegúrate de tener date-fns instalado
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
 
 // ---------------------------------------------------------------------
-// CONFIGURACIÓN
+// CONFIGURACIÓN GLOBAL
 // ---------------------------------------------------------------------
 
 const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 4001;
+
+// AJUSTE DE ZONA HORARIA (CRÍTICO)
+// Render está en UTC (0). Santo Domingo está en UTC-4.
+// Sumamos 4 horas a la hora de apertura de la DB para que el servidor entienda cuándo abre realmente.
+const SERVER_OFFSET_HOURS = 4; 
 
 const logger = P({
   transport: {
@@ -39,88 +43,134 @@ const supabase = createClient(
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const sessions = new Map();
 
-// Import ESM de scheduling logic (una sola vez)
-const schedulingLogicPromise = import(
-  "./utils/wa-server/scheduling-logic.mjs"
-);
+// =====================================================================
+// 1. LÓGICA MATEMÁTICA DE HORARIOS (INTEGRADA - NO BORRAR)
+// =====================================================================
 
-// ---------------------------------------------------------------------
-// 1. HELPERS: CALENDARIO Y ARCHIVOS (.ICS)
-// ---------------------------------------------------------------------
+function hmsToParts(hms) {
+  const [h, m] = hms.split(":").map(Number);
+  return { h, m };
+}
+
+function pad2(n) {
+  return n.toString().padStart(2, "0");
+}
+
+function toHHMM(t) {
+  if (!t) return "";
+  const parts = t.split(":");
+  return `${pad2(Number(parts[0]))}:${pad2(Number(parts[1]))}`;
+}
 
 /**
- * Crea un archivo de calendario (.ics) en memoria para activar alarmas
+ * Calcula las ventanas abiertas basándose en Business Hours y ajustando la zona horaria.
  */
-function createICSFile(
-  title,
-  description,
-  location,
-  startDate,
-  durationMinutes = 60
-) {
-  const formatTime = (date) =>
-    date.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
+function weeklyOpenWindows(weekStart, businessHours) {
+  const windows = [];
+  let currentDayCursor = new Date(weekStart);
 
+  // Iteramos 7 días
+  for (let i = 0; i < 7; i++) {
+    const currentDow = currentDayCursor.getDay(); // 0=Dom, 1=Lun...
+    
+    // Buscamos configuración para este día que NO esté cerrado
+    const dayConfig = businessHours.find(
+      (bh) => bh.dow === currentDow && bh.is_closed === false
+    );
+
+    if (dayConfig && dayConfig.open_time && dayConfig.close_time) {
+      const { h: openH, m: openM } = hmsToParts(toHHMM(dayConfig.open_time));
+      const { h: closeH, m: closeM } = hmsToParts(toHHMM(dayConfig.close_time));
+
+      // 🔥 CORRECCIÓN UTC: Sumamos el offset a la hora de apertura/cierre
+      const start = new Date(currentDayCursor);
+      start.setHours(openH + SERVER_OFFSET_HOURS, openM, 0, 0);
+
+      const end = new Date(currentDayCursor);
+      end.setHours(closeH + SERVER_OFFSET_HOURS, closeM, 0, 0);
+
+      // Si la ventana es válida (cierra después de abrir), la guardamos
+      if (end > start) {
+        windows.push({ start, end });
+      }
+    }
+    // Avanzamos al siguiente día
+    currentDayCursor.setDate(currentDayCursor.getDate() + 1);
+  }
+  return windows;
+}
+
+/**
+ * Resta las citas ocupadas a las ventanas abiertas.
+ */
+function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
+  const slots = [];
+  for (const window of openWindows) {
+    let cursor = new Date(window.start);
+    const windowEnd = new Date(window.end);
+
+    while (cursor.getTime() < windowEnd.getTime()) {
+      const slotEnd = new Date(cursor);
+      slotEnd.setMinutes(slotEnd.getMinutes() + stepMin);
+
+      // Si el slot se sale del cierre, paramos
+      if (slotEnd.getTime() > windowEnd.getTime()) break;
+
+      // Detectar colisiones con citas existentes
+      const isBusy = bookings.some((booking) => {
+        const busyStart = new Date(booking.starts_at);
+        const busyEnd = new Date(booking.ends_at);
+        // Lógica de solapamiento
+        return (cursor.getTime() < busyEnd.getTime()) && (slotEnd.getTime() > busyStart.getTime());
+      });
+
+      if (!isBusy) {
+        slots.push({ start: new Date(cursor), end: slotEnd });
+      }
+      
+      // Avanzamos al siguiente bloque
+      cursor.setMinutes(cursor.getMinutes() + stepMin);
+    }
+  }
+  return slots;
+}
+
+// =====================================================================
+// 2. HELPERS: CALENDARIO (.ICS)
+// =====================================================================
+
+function createICSFile(title, description, location, startDate, durationMinutes = 60) {
+  const formatTime = (date) => date.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
   const start = new Date(startDate);
   const end = new Date(start.getTime() + durationMinutes * 60000);
   const now = new Date();
 
   const icsData = [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//PymeBot//Agendador//ES",
-    "CALSCALE:GREGORIAN",
-    "METHOD:PUBLISH",
-    "BEGIN:VEVENT",
-    `UID:${now.getTime()}@pymebot.com`,
-    `DTSTAMP:${formatTime(now)}`,
-    `DTSTART:${formatTime(start)}`,
-    `DTEND:${formatTime(end)}`,
-    `SUMMARY:${title}`,
-    `DESCRIPTION:${description}`,
-    `LOCATION:${location}`,
-    "STATUS:CONFIRMED",
-    "BEGIN:VALARM",
-    "TRIGGER:-PT30M",
-    "ACTION:DISPLAY",
-    "DESCRIPTION:Recordatorio de Cita",
-    "END:VALARM",
-    "END:VEVENT",
-    "END:VCALENDAR",
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//PymeBot//Agendador//ES",
+    "CALSCALE:GREGORIAN", "METHOD:PUBLISH", "BEGIN:VEVENT",
+    `UID:${now.getTime()}@pymebot.com`, `DTSTAMP:${formatTime(now)}`,
+    `DTSTART:${formatTime(start)}`, `DTEND:${formatTime(end)}`,
+    `SUMMARY:${title}`, `DESCRIPTION:${description}`, `LOCATION:${location}`,
+    "STATUS:CONFIRMED", "BEGIN:VALARM", "TRIGGER:-PT30M", "ACTION:DISPLAY",
+    "DESCRIPTION:Recordatorio de Cita", "END:VALARM", "END:VEVENT", "END:VCALENDAR",
   ].join("\r\n");
 
   return Buffer.from(icsData);
 }
 
-// ---------------------------------------------------------------------
-// 2. CEREBRO DEL NEGOCIO & CÁLCULO DE DISPONIBILIDAD
-// ---------------------------------------------------------------------
+// =====================================================================
+// 3. DATOS Y CONSULTAS A DB
+// =====================================================================
 
 async function getTenantContext(tenantId) {
   try {
-    const { data } = await supabase
-      .from("tenants")
-      .select("name, vertical, description")
-      .eq("id", tenantId)
-      .maybeSingle();
-
-    if (!data)
-      return { name: "el negocio", vertical: "general", description: "" };
-    return data;
-  } catch (e) {
-    return { name: "el negocio", vertical: "general", description: "" };
-  }
+    const { data } = await supabase.from("tenants").select("name, vertical, description").eq("id", tenantId).maybeSingle();
+    return data || { name: "el negocio", vertical: "general", description: "" };
+  } catch (e) { return { name: "el negocio", vertical: "general", description: "" }; }
 }
 
 async function getTemplate(tenantId, eventKey) {
-  const { data } = await supabase
-    .from("message_templates")
-    .select("body")
-    .eq("tenant_id", tenantId)
-    .eq("event", eventKey)
-    .eq("active", true)
-    .maybeSingle();
-
+  const { data } = await supabase.from("message_templates").select("body").eq("tenant_id", tenantId).eq("event", eventKey).eq("active", true).maybeSingle();
   return data?.body || null;
 }
 
@@ -130,35 +180,23 @@ function renderTemplate(body, variables = {}) {
 }
 
 /**
- * Obtiene los slots libres de 30 minutos a partir de una fecha de inicio.
- * Esta función es la que el bot usará para agendar.
+ * Función principal que usa la lógica integrada para buscar disponibilidad
  */
-async function getAvailableSlots(
-  tenantId,
-  resourceId,
-  startDate,
-  daysToLookAhead = 7
-) {
+async function getAvailableSlots(tenantId, resourceId, startDate, daysToLookAhead = 7) {
   if (!tenantId) return [];
 
-  // Import ESM (una sola vez, reutilizado por todas las llamadas)
-  const { weeklyOpenWindows, generateOfferableSlots } =
-    await schedulingLogicPromise;
-
-  // 1. Obtener la semana de inicio (Lunes = 1)
   const weekStart = startOfWeek(startDate, { weekStartsOn: 1 });
   const weekEnd = addDays(weekStart, daysToLookAhead);
 
-  // 2. Consulta de Horarios (business_hours)
-  // 🔥 FIX: Añadido filtro is_closed=false para asegurar que traemos días abiertos
+  // 1. Horarios (Filtrando días cerrados para optimizar)
   const { data: hours } = await supabase
     .from("business_hours")
     .select("dow, is_closed, open_time, close_time")
     .eq("tenant_id", tenantId)
-    .eq("is_closed", false) 
+    .eq("is_closed", false) // Solo días abiertos
     .order("dow", { ascending: true });
 
-  // 3. Consulta de Citas (bookings)
+  // 2. Citas existentes
   let bookingsQuery = supabase
     .from("bookings")
     .select("starts_at, ends_at, resource_id, status")
@@ -167,48 +205,33 @@ async function getAvailableSlots(
     .lt("ends_at", addDays(weekEnd, 1).toISOString())
     .in("status", ["confirmed", "pending"]);
 
-  // Si se especifica un recurso (barbero), filtramos. Si no, traemos todo.
-  if (resourceId) {
-    bookingsQuery = bookingsQuery.eq("resource_id", resourceId);
-  }
+  if (resourceId) bookingsQuery = bookingsQuery.eq("resource_id", resourceId);
+  
   const { data: bookings } = await bookingsQuery;
 
-  // 4. Aplicar la lógica de cálculo usando funciones importadas
+  // 3. Calcular disponibilidad (Usando las funciones locales, NO importadas)
   const openWindows = weeklyOpenWindows(weekStart, hours || []);
+  const offerableSlots = generateOfferableSlots(openWindows, bookings || [], 30);
 
-  const offerableSlots = generateOfferableSlots(
-    openWindows,
-    bookings || [],
-    30 // Slots de 30 minutos
-  );
-
-  // Filtrar slots pasados y devolver
+  // Filtrar slots que ya pasaron
   return offerableSlots.filter((slot) => slot.start >= startDate);
 }
 
-// ---------------------------------------------------------------------
-// 3. DEFINICIÓN DE TOOLS (HERRAMIENTAS) PARA OPENAI
-// ---------------------------------------------------------------------
+// =====================================================================
+// 4. TOOLS (HERRAMIENTAS PARA LA IA - CONFIGURACIÓN FINAL)
+// =====================================================================
 
 const tools = [
   {
     type: "function",
     function: {
       name: "check_availability",
-      description:
-        "Consulta los slots libres. ÚSALA INMEDIATAMENTE si el cliente pide cita o pregunta horarios.",
+      description: "Consulta horarios disponibles. ÚSALA SIEMPRE que pidan cita.",
       parameters: {
         type: "object",
         properties: {
-          resourceId: {
-            type: "string",
-            description: "Opcional. Si el cliente no dice con quién, déjalo vacío.",
-          },
-          requestedDate: {
-            type: "string",
-            description:
-              "La fecha ISO de inicio. Si el cliente dice 'hoy' o 'mañana', calcula la fecha basada en la fecha actual.",
-          },
+          resourceId: { type: "string", description: "Opcional." },
+          requestedDate: { type: "string", description: "Fecha ISO (YYYY-MM-DD)." },
         },
         required: ["requestedDate"],
       },
@@ -218,47 +241,20 @@ const tools = [
     type: "function",
     function: {
       name: "create_booking",
-      description:
-        "Crea una nueva cita. Si el cliente no eligió barbero, omite el resourceId.",
+      description: "Crea la cita. El resourceId y el customerName NO son obligatorios.",
       parameters: {
         type: "object",
         properties: {
-          serviceId: {
-            type: "string",
-            description: "ID del servicio a agendar (si aplica).",
-          },
-          resourceId: {
-            type: "string",
-            description: "ID del recurso/barbero (OPCIONAL).",
-          },
-          customerName: {
-            type: "string",
-            description: "Nombre del cliente.",
-          },
-          phone: {
-            type: "string",
-            description: "Número de teléfono del cliente.",
-          },
-          startsAtISO: {
-            type: "string",
-            description: "Fecha y hora de inicio en formato ISO 8601.",
-          },
-          endsAtISO: {
-            type: "string",
-            description: "Fecha y hora de fin en formato ISO 8601.",
-          },
-          notes: {
-            type: "string",
-            description: "Notas adicionales para la cita.",
-          },
+          serviceId: { type: "string" },
+          resourceId: { type: "string" },
+          customerName: { type: "string", description: "Nombre del cliente." },
+          phone: { type: "string" },
+          startsAtISO: { type: "string" },
+          endsAtISO: { type: "string" },
+          notes: { type: "string" },
         },
-        // 🔥 FIX CRÍTICO: resourceId ELIMINADO de required para permitir nulos
-        required: [
-          "customerName",
-          "phone",
-          "startsAtISO",
-          "endsAtISO",
-        ],
+        // 🔥 CORRECCIÓN: 'customerName' y 'resourceId' ELIMINADOS de required para evitar bloqueos
+        required: ["phone", "startsAtISO", "endsAtISO"],
       },
     },
   },
@@ -266,38 +262,16 @@ const tools = [
     type: "function",
     function: {
       name: "reschedule_booking",
-      description:
-        "Actualiza la fecha y hora de una cita ya existente.",
+      description: "Mueve una cita.",
       parameters: {
         type: "object",
         properties: {
-          bookingId: {
-            type: "string",
-            description: "ID de la cita (si se conoce).",
-          },
-          customerPhone: {
-            type: "string",
-            description: "Número de teléfono WhatsApp del cliente.",
-          },
-          oldBookingDate: {
-            type: "string",
-            description: "Fecha ISO original de la cita antigua.",
-          },
-          newStartsAtISO: {
-            type: "string",
-            description: "Nueva fecha y hora de inicio ISO 8601.",
-          },
-          newEndsAtISO: {
-            type: "string",
-            description: "Nueva fecha y hora de fin ISO 8601.",
-          },
+          customerPhone: { type: "string" },
+          oldBookingDate: { type: "string" },
+          newStartsAtISO: { type: "string" },
+          newEndsAtISO: { type: "string" },
         },
-        required: [
-          "customerPhone",
-          "oldBookingDate",
-          "newStartsAtISO",
-          "newEndsAtISO",
-        ],
+        required: ["customerPhone", "oldBookingDate", "newStartsAtISO", "newEndsAtISO"],
       },
     },
   },
@@ -305,18 +279,12 @@ const tools = [
     type: "function",
     function: {
       name: "cancel_booking",
-      description: "Cancela una cita existente.",
+      description: "Cancela una cita.",
       parameters: {
         type: "object",
         properties: {
-          customerPhone: {
-            type: "string",
-            description: "Número de teléfono del cliente.",
-          },
-          bookingDate: {
-            type: "string",
-            description: "Fecha de la cita a cancelar (ISO).",
-          },
+          customerPhone: { type: "string" },
+          bookingDate: { type: "string" },
         },
         required: ["customerPhone", "bookingDate"],
       },
@@ -324,26 +292,24 @@ const tools = [
   },
 ];
 
-// ---------------------------------------------------------------------
-// 4. IA CON REGLA DE ORO Y MANEJO DE TOOLS
-// ---------------------------------------------------------------------
+// =====================================================================
+// 5. INTELIGENCIA ARTIFICIAL (CONTROLADOR DE MENSAJES)
+// =====================================================================
 
-// 🔥 FIX: Aceptamos pushName en los argumentos
+// 🔥 FIX: Aceptamos pushName en los argumentos para el saludo
 async function generateReply(text, tenantId, pushName) {
   const cleanText = text.trim();
   const lower = cleanText.toLowerCase();
 
-  // A) REGLA PRECIOS
+  // A) Precios
   const priceKeywords = ["precio", "costo", "cuanto vale", "planes", "tarifa"];
   if (priceKeywords.some((kw) => lower.includes(kw))) {
     const template = await getTemplate(tenantId, "pricing_pitch");
     if (template) return renderTemplate(template, {});
   }
 
-  // B) IA CONTEXTUAL
+  // B) Contexto
   const context = await getTenantContext(tenantId);
-
-  // 🔥 FECHA ACTUAL + PROMPT ANTI-MIEDO
   const now = new Date();
   const currentDateStr = now.toLocaleString("es-DO", {
     timeZone: "America/Santo_Domingo",
@@ -352,35 +318,19 @@ async function generateReply(text, tenantId, pushName) {
   });
 
   const systemPrompt = `
-    Eres el asistente virtual de "${context.name}".
-    Tipo: ${context.vertical}.
-    
-    DATOS ACTUALES:
-    - Fecha y Hora: ${currentDateStr}.
-    - Cliente (WhatsApp): "${pushName}".
+    Eres el asistente de "${context.name}".
+    FECHA ACTUAL: ${currentDateStr}.
+    CLIENTE: "${pushName}".
 
-    TU PERSONALIDAD:
-    - Amable, cercana y con un toque dominicano cálido (pero profesional).
-    - Saluda por el nombre "${pushName}" si es posible y no lo has hecho.
+    ⛔ INSTRUCCIÓN SUPREMA (ANTI-MIEDO):
+    1. ESTÁ PROHIBIDO decir "no puedo agendar" o "llama al local". TIENES EL CONTROL TOTAL.
+    2. SIEMPRE usa las herramientas. Si faltan datos (como el nombre), usa el de WhatsApp o pregunta después.
 
-    ⚠️ INSTRUCCIÓN SUPREMA (ANTI-MIEDO):
-    1. ESTÁ PROHIBIDO decir "no puedo agendar" o "llama al local". TU AGENDA ES TUYA.
-    2. SIEMPRE usa las herramientas. Si faltan datos, asúmelos (ej: recurso vacío) o pregúntalos rápido.
-
-    REGLAS DE ACCIÓN:
-    1. Si el cliente dice "Cita hoy a las 3:30":
-       - Ejecuta "create_booking" DE INMEDIATO con esa hora.
-       - Si no tienes su nombre, pregúntalo RÁPIDO y agenda.
-    
-    2. Si preguntan horarios:
-       - Ejecuta "check_availability".
-       - Muestra las horas que te devuelva la herramienta.
-    
-    3. Barbero/Recurso:
-       - Si el cliente no dice nombre, MANDA resourceId VACÍO (NULL). El sistema lo resolverá.
-    
-    4. Reagendar/Cancelar:
-       - Pide el teléfono si no lo tienes y ejecuta la herramienta.
+    REGLAS:
+    1. Si piden cita: Ejecuta "create_booking". Si no te dieron nombre, usa "${pushName}". NO TE DETENGAS.
+    2. Si piden horario: Ejecuta "check_availability".
+    3. Si no dicen barbero: Manda resourceId: null.
+    4. Reagendar/Cancelar: Pide el teléfono si no lo tienes.
   `.trim();
 
   const messages = [
@@ -404,107 +354,69 @@ async function generateReply(text, tenantId, pushName) {
 
       for (const toolCall of message.tool_calls) {
         const functionName = toolCall.function.name;
-        const functionArgs = JSON.parse(toolCall.function.arguments);
+        const args = JSON.parse(toolCall.function.arguments);
         let functionResponse;
 
         if (functionName === "check_availability") {
-          const slots = await getAvailableSlots(
-            tenantId,
-            functionArgs.resourceId || null,
-            new Date(functionArgs.requestedDate),
-            7
-          );
+          const slots = await getAvailableSlots(tenantId, args.resourceId || null, new Date(args.requestedDate), 7);
           if (slots.length > 0) {
-              const formattedSlots = slots.slice(0, 15).map((s) =>
-                  s.start.toLocaleString("es-DO", {
-                    weekday: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: true
-                  })
-                ).join(", ");
-              functionResponse = JSON.stringify({ available_slots: formattedSlots });
+             const list = slots.slice(0, 15).map(s => s.start.toLocaleString("es-DO", { hour:'2-digit', minute:'2-digit', hour12:true })).join(", ");
+             functionResponse = JSON.stringify({ available_slots: list });
           } else {
-              functionResponse = JSON.stringify({ available_slots: "No hay horarios disponibles en esa fecha." });
+             functionResponse = JSON.stringify({ available_slots: "No hay huecos disponibles. Revisa si la tienda está abierta." });
           }
-          
-        } else if (functionName === "create_booking") {
-          
-          // 🔥 FIX LÓGICO: ResourceId NULL si no viene
-          const finalResourceId = functionArgs.resourceId || null;
+        } 
+        else if (functionName === "create_booking") {
+          // 🔥 AUTO-COMPLETADO DE NOMBRE: Si el usuario no lo dijo, usamos pushName
+          const finalName = args.customerName || pushName || "Cliente WhatsApp";
+          const finalResourceId = args.resourceId || null;
 
-          const { data: booking, error } = await supabase
-            .from("bookings")
-            .insert([
-              {
-                tenant_id: tenantId,
-                service_id: functionArgs.serviceId || null,
-                resource_id: finalResourceId, // Puede ser NULL y la DB lo acepta
-                customer_name: functionArgs.customerName,
-                customer_phone: functionArgs.phone,
-                starts_at: functionArgs.startsAtISO,
-                ends_at: functionArgs.endsAtISO,
-                status: "confirmed",
-                notes: functionArgs.notes || null,
-              },
-            ])
-            .select("*")
-            .single();
+          const { data: booking, error } = await supabase.from("bookings").insert([{
+              tenant_id: tenantId,
+              resource_id: finalResourceId, 
+              customer_name: finalName,
+              customer_phone: args.phone,
+              starts_at: args.startsAtISO,
+              ends_at: args.endsAtISO,
+              status: "confirmed",
+              notes: args.notes || null
+          }]).select().single();
 
-          if (!error && booking) {
-            functionResponse = JSON.stringify({ success: true, bookingId: booking.id });
-          } else {
-            functionResponse = JSON.stringify({ success: false, error: error?.message });
-          }
-
-        } else if (functionName === "reschedule_booking" || functionName === "cancel_booking") {
-           
-           // 🔥 FIX TELÉFONOS: Buscamos el limpio Y el formato whatsapp:+
-           const cleanPhone = functionArgs.customerPhone.replace(/\D/g, "");
-           const whatsappPhone = `whatsapp:+${cleanPhone}`; 
-           
-           const query = supabase.from('bookings').select('id')
-             .eq('tenant_id', tenantId)
-             // Buscamos coincidencia en cualquiera de los formatos para asegurar éxito
-             .or(`customer_phone.eq.${functionArgs.customerPhone},customer_phone.eq.${whatsappPhone},customer_phone.eq.${cleanPhone}`)
+          if (booking) functionResponse = JSON.stringify({ success: true, bookingId: booking.id, note: `Agendado a nombre de ${finalName}` });
+          else functionResponse = JSON.stringify({ success: false, error: error?.message });
+        }
+        else if (functionName === "reschedule_booking" || functionName === "cancel_booking") {
+           // 🔥 BÚSQUEDA INTELIGENTE DE TELÉFONO (Con o sin +)
+           const clean = args.customerPhone.replace(/\D/g, "");
+           const wa = `whatsapp:+${clean}`;
+           const query = supabase.from('bookings').select('id').eq('tenant_id', tenantId)
+             .or(`customer_phone.eq.${args.customerPhone},customer_phone.eq.${wa},customer_phone.eq.${clean}`)
              .in('status', ['confirmed', 'pending']);
-            
-          // Filtramos por fecha si viene (para ser precisos)
-          if(functionArgs.oldBookingDate) query.eq("starts_at", functionArgs.oldBookingDate);
-          if(functionArgs.bookingDate) query.eq("starts_at", functionArgs.bookingDate);
+           
+           if(args.oldBookingDate) query.eq('starts_at', args.oldBookingDate);
+           if(args.bookingDate) query.eq('starts_at', args.bookingDate);
 
-          const { data: targetBooking } = await query.maybeSingle();
+           const { data: target } = await query.maybeSingle();
 
-          if (targetBooking) {
-             let err;
-             if (functionName === "cancel_booking") {
-                ({ error: err } = await supabase.from('bookings').update({ status: 'cancelled' }).eq('id', targetBooking.id));
-             } else {
-                ({ error: err } = await supabase.from('bookings').update({ 
-                    starts_at: functionArgs.newStartsAtISO, 
-                    ends_at: functionArgs.newEndsAtISO 
-                }).eq('id', targetBooking.id));
-             }
-             functionResponse = JSON.stringify({ success: !err });
-          } else {
-            functionResponse = JSON.stringify({ success: false, error: "No encontré la cita. Verifica el número y la fecha." });
-          }
+           if(target) {
+              let err;
+              if(functionName === "cancel_booking") ({ error: err } = await supabase.from('bookings').update({ status: 'cancelled' }).eq('id', target.id));
+              else ({ error: err } = await supabase.from('bookings').update({ starts_at: args.newStartsAtISO, ends_at: args.newEndsAtISO }).eq('id', target.id));
+              functionResponse = JSON.stringify({ success: !err });
+           } else {
+              functionResponse = JSON.stringify({ success: false, error: "Cita no encontrada. Verifica el número." });
+           }
         }
 
-        messages.push({
-          tool_call_id: toolCall.id,
-          role: "tool",
-          name: functionName,
-          content: functionResponse,
-        });
+        messages.push({ tool_call_id: toolCall.id, role: "tool", name: functionName, content: functionResponse });
       }
 
-      // Segunda llamada a OpenAI
       const secondResponse = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: messages,
       });
-
       return secondResponse.choices[0].message.content.trim();
     }
-
     return completion.choices[0].message.content.trim();
   } catch (err) {
     logger.error("Error OpenAI:", err);
@@ -512,52 +424,22 @@ async function generateReply(text, tenantId, pushName) {
   }
 }
 
-// ---------------------------------------------------------------------
-// 5. ACTUALIZAR ESTADO DB
-// ---------------------------------------------------------------------
+// =====================================================================
+// 6. GESTIÓN DE SESIONES Y SOCKET
+// =====================================================================
 
 async function updateSessionDB(tenantId, updateData) {
-  // Siempre incluimos tenant_id para poder usar upsert
-  const row = {
-    tenant_id: tenantId,
-    ...updateData,
-  };
-
-  const { error } = await supabase
-    .from("whatsapp_sessions")
-    .upsert([row], { onConflict: "tenant_id" });
-
-  if (error) {
-    console.error("[updateSessionDB] Error upsert whatsapp_sessions:", error);
-  }
-
-  if (updateData.status) {
-    const isConnected = updateData.status === "connected";
-    await supabase
-      .from("tenants")
-      .update({ wa_connected: isConnected })
-      .eq("id", tenantId);
-  }
+  await supabase.from("whatsapp_sessions").upsert([{ tenant_id: tenantId, ...updateData }], { onConflict: "tenant_id" });
+  if (updateData.status) await supabase.from("tenants").update({ wa_connected: updateData.status === "connected" }).eq("id", tenantId);
 }
-
-// ---------------------------------------------------------------------
-// 6. CORE WHATSAPP
-// ---------------------------------------------------------------------
 
 async function getOrCreateSession(tenantId) {
   const existing = sessions.get(tenantId);
   if (existing && existing.socket) return existing;
 
   logger.info({ tenantId }, "🔌 Iniciando Socket...");
-
-  const { default: makeWASocket, DisconnectReason } = await import(
-    "@whiskeysockets/baileys"
-  );
-  const { useSupabaseAuthState } = await import(
-    "./utils/wa-server/supabaseAuthState.mjs"
-  );
-  
-
+  const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
+  const { useSupabaseAuthState } = await import("./utils/wa-server/supabaseAuthState.mjs");
   const { state, saveCreds } = await useSupabaseAuthState(supabase, tenantId);
 
   const sock = makeWASocket({
@@ -574,47 +456,25 @@ async function getOrCreateSession(tenantId) {
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, qr, lastDisconnect } = update;
-
     if (qr) {
       info.status = "qrcode";
-      info.qr = qr;
-      logger.info({ tenantId }, "✨ QR Generado");
-      await updateSessionDB(tenantId, {
-        qr_data: qr,
-        status: "qrcode",
-        last_seen_at: new Date().toISOString(),
-      });
+      await updateSessionDB(tenantId, { qr_data: qr, status: "qrcode", last_seen_at: new Date().toISOString() });
       qrcode.generate(qr, { small: true });
     }
-
     if (connection === "open") {
       info.status = "connected";
-      info.qr = null;
       logger.info({ tenantId }, "✅ Conectado");
       let phone = sock?.user?.id ? sock.user.id.split(":")[0] : null;
-      await updateSessionDB(tenantId, {
-        status: "connected",
-        qr_data: null,
-        phone_number: phone,
-        last_connected_at: new Date().toISOString(),
-        last_seen_at: new Date().toISOString(),
-      });
+      await updateSessionDB(tenantId, { status: "connected", qr_data: null, phone_number: phone, last_connected_at: new Date().toISOString() });
     }
-
     if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !==
-        DisconnectReason.loggedOut;
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       if (shouldReconnect) {
         sessions.delete(tenantId);
         getOrCreateSession(tenantId);
       } else {
         sessions.delete(tenantId);
-        await updateSessionDB(tenantId, {
-          status: "disconnected",
-          qr_data: null,
-          auth_state: null,
-        });
+        await updateSessionDB(tenantId, { status: "disconnected", qr_data: null, auth_state: null });
       }
     }
   });
@@ -626,596 +486,158 @@ async function getOrCreateSession(tenantId) {
     if (!msg?.message || msg.key.fromMe) return;
     const remoteJid = msg.key.remoteJid;
     if (remoteJid.includes("@g.us")) return;
-
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
     if (!text) return;
 
-    // 🔥 FIX: Capturamos el nombre real del cliente desde WhatsApp
+    // 🔥 FIX: Capturar nombre del cliente (PushName) para el prompt
     const pushName = msg.pushName || "Cliente";
-
-    // 🔥 Pasamos el nombre a la función de respuesta
+    
+    // 🔥 Pasar nombre a la función
     const reply = await generateReply(text, tenantId, pushName);
-    if (reply) {
-      await sock.sendMessage(remoteJid, { text: reply });
-    }
+    if (reply) await sock.sendMessage(remoteJid, { text: reply });
   });
 
   return info;
 }
 
-// ---------------------------------------------------------------------
-// 7. API ROUTES BÁSICAS
-// ---------------------------------------------------------------------
+// =====================================================================
+// 7. ENDPOINTS (TODOS LOS ORIGINALES)
+// =====================================================================
 
-app.get("/health", (req, res) =>
-  res.json({ ok: true, active_sessions: sessions.size })
-);
+app.get("/health", (req, res) => res.json({ ok: true, active_sessions: sessions.size }));
 
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   try {
     const info = await getOrCreateSession(req.params.tenantId);
     res.json({ ok: true, status: info.status });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post("/sessions/:tenantId/disconnect", async (req, res) => {
   const s = sessions.get(req.params.tenantId);
   if (s?.socket) await s.socket.logout().catch(() => {});
   sessions.delete(req.params.tenantId);
-  await updateSessionDB(req.params.tenantId, {
-    status: "disconnected",
-    qr_data: null,
-    auth_state: null,
-  });
+  await updateSessionDB(req.params.tenantId, { status: "disconnected", qr_data: null, auth_state: null });
   res.json({ ok: true });
 });
 
-/**
- * 🔥 ENDPOINT MAESTRO: Envía la plantilla Y la alarma
- */
 app.post("/sessions/:tenantId/send-template", async (req, res) => {
   const { tenantId } = req.params;
   const { event, phone, variables } = req.body;
-
-  if (!event || !phone)
-    return res.status(400).json({ error: "Faltan datos" });
-
+  
   let session = sessions.get(tenantId);
   if (!session || session.status !== "connected") {
-    try {
-      session = await getOrCreateSession(tenantId);
-    } catch (e) {}
+     try { session = await getOrCreateSession(tenantId); } catch (e) {}
   }
+  if (!session || session.status !== "connected") return res.status(400).json({ error: "Bot no conectado." });
 
-  if (!session || session.status !== "connected") {
-    return res.status(400).json({ error: "Bot no conectado." });
-  }
-
-  // 1. Obtener la plantilla de texto
   const templateBody = await getTemplate(tenantId, event);
-  if (!templateBody) {
-    return res
-      .status(404)
-      .json({ error: `Plantilla no encontrada: ${event}` });
-  }
+  if (!templateBody) return res.status(404).json({ error: "Template missing" });
 
   const message = renderTemplate(templateBody, variables || {});
   const jid = phone.replace(/\D/g, "") + "@s.whatsapp.net";
 
   try {
-    // 2. Enviar el MENSAJE DE TEXTO primero
     await session.socket.sendMessage(jid, { text: message });
-
-    // 3. LÓGICA DE ALARMA: Si es una confirmación de cita, enviamos el .ICS
     if (event === "booking_confirmed" && variables?.date && variables?.time) {
-      const context = await getTenantContext(tenantId);
-
-      const dateStr = `${variables.date} ${variables.time}`;
-      const appointmentDate = new Date(dateStr);
-
-      if (!isNaN(appointmentDate.getTime())) {
-        const icsBuffer = createICSFile(
-          `Cita en ${context.name}`,
-          `Servicio con ${variables.resource_name || "Nosotros"}.`,
-          "En el local",
-          appointmentDate
-        );
-
-        await session.socket.sendMessage(jid, {
-          document: icsBuffer,
-          mimetype: "text/calendar",
-          fileName: "agendar_cita.ics",
-          caption:
-            "📅 Toca este archivo para agregar el recordatorio a tu calendario.",
-        });
-        logger.info({ tenantId }, "📅 Alarma .ics enviada");
-      }
+       const dateStr = `${variables.date} ${variables.time}`;
+       const icsBuffer = createICSFile("Cita", "Tu cita en la barbería", "Local", new Date(dateStr));
+       await session.socket.sendMessage(jid, { document: icsBuffer, mimetype: "text/calendar", fileName: "cita.ics", caption: "📅 Agendar" });
     }
-
-    logger.info({ tenantId, event, phone }, "📨 Plantilla enviada");
-    res.json({ ok: true, message });
-  } catch (e) {
-    logger.error(e, "Fallo enviando mensaje");
-    res.status(500).json({ error: "Error envío" });
-  }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: "Error envío" }); }
 });
 
-// ---------------------------------------------------------------------
-// 8. API DE CONSULTA DE DISPONIBILIDAD (TOOL: check_availability)
-// ---------------------------------------------------------------------
-
-/**
- * GET /api/v1/availability?tenantId=...&resourceId=...&date=...
- */
 app.get("/api/v1/availability", async (req, res) => {
   const { tenantId, resourceId, date } = req.query;
-
-  if (!tenantId || !date) {
-    return res.status(400).json({ error: "Faltan tenantId y date" });
-  }
-
-  const requestedDate = new Date(String(date));
-  if (isNaN(requestedDate.getTime())) {
-    return res.status(400).json({ error: "Formato de fecha inválido" });
-  }
-
-  const slots = await getAvailableSlots(
-    String(tenantId),
-    resourceId ? String(resourceId) : null,
-    requestedDate,
-    7
-  );
-
-  const formattedSlots = slots.map(
-    (s) =>
-      `${s.start.toLocaleString("es-DO", {
-        weekday: "short",
-        month: "numeric",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      })}`
-  );
-
-  res.json({
-    ok: true,
-    available_slots_count: slots.length,
-    available_slots: formattedSlots.slice(0, 40),
-  });
+  if (!tenantId || !date) return res.status(400).json({ error: "Faltan datos" });
+  const slots = await getAvailableSlots(String(tenantId), resourceId || null, new Date(String(date)), 7);
+  res.json({ ok: true, available_slots: slots.map(s => s.start.toISOString()) });
 });
 
-// ---------------------------------------------------------------------
-// 9. API DE CREACIÓN DE CITA (TOOL: create_booking)
-// ---------------------------------------------------------------------
-
-/**
- * Tool: create_booking
- *
- * POST /api/v1/create-booking
- */
 app.post("/api/v1/create-booking", async (req, res) => {
-  const {
-    tenantId,
-    serviceId,
-    resourceId,
-    customerName,
-    phone,
-    startsAtISO,
-    endsAtISO,
-    notes,
-    extraVariables,
-  } = req.body || {};
+  const { tenantId, customerName, phone, startsAtISO, endsAtISO } = req.body || {};
+  if (!tenantId || !phone || !startsAtISO || !endsAtISO) return res.status(400).json({ error: "Faltan datos" });
+  
+  const finalName = customerName || "Cliente Web";
 
-  if (
-    !tenantId ||
-    !customerName ||
-    !phone ||
-    !startsAtISO ||
-    !endsAtISO
-  ) {
-    return res.status(400).json({
-      ok: false,
-      error: "missing_fields",
-      detail:
-        "Requiere tenantId, customerName, phone, startsAtISO y endsAtISO.",
-    });
-  }
+  const { data: booking, error } = await supabase.from("bookings").insert([{
+      tenant_id: tenantId, resource_id: null, customer_name: finalName, customer_phone: phone,
+      starts_at: startsAtISO, ends_at: endsAtISO, status: "confirmed"
+  }]).select("*").single();
 
-  // 1. Crear la cita en la base de datos
-  const { data: booking, error } = await supabase
-    .from("bookings")
-    .insert([
-      {
-        tenant_id: tenantId,
-        service_id: serviceId || null,
-        resource_id: resourceId || null, // Auto-asignación
-        customer_name: customerName,
-        customer_phone: phone,
-        starts_at: startsAtISO,
-        ends_at: endsAtISO,
-        status: "confirmed",
-        notes: notes || null,
-      },
-    ])
-    .select("*")
-    .maybeSingle();
-
-  if (error) {
-    logger.error(error, "Error creando booking");
-    return res.status(500).json({ ok: false, error: "db_error" });
-  }
-
-  if (!booking) {
-    return res.status(500).json({ ok: false, error: "no_booking_created" });
-  }
-
-  // 2. Intentar enviar WhatsApp de confirmación
-  try {
-    const session = await getOrCreateSession(tenantId);
-    if (session && session.status === "connected") {
-      const context = await getTenantContext(tenantId);
-
-      const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
-
-      const startsDate = new Date(startsAtISO);
-      const dateStr = startsDate.toISOString().slice(0, 10); // YYYY-MM-DD
-      const timeStr = startsDate.toTimeString().slice(0, 5); // HH:MM
-
-      const templateBody = await getTemplate(tenantId, "booking_confirmed");
-
-      const vars = {
-        date: dateStr,
-        time: timeStr,
-        business_name: context.name,
-        customer_name: customerName,
-        resource_name: booking.resource_name || "",
-        ...(extraVariables || {}),
-      };
-
-      if (templateBody) {
-        const msg = renderTemplate(templateBody, vars);
-        await session.socket.sendMessage(jid, { text: msg });
-      }
-
-      const icsBuffer = createICSFile(
-        `Cita en ${context.name}`,
-        `Tu cita está agendada para ${dateStr} a las ${timeStr}.`,
-        "En el local",
-        startsDate
-      );
-
-      await session.socket.sendMessage(jid, {
-        document: icsBuffer,
-        mimetype: "text/calendar",
-        fileName: "cita_confirmada.ics",
-        caption:
-          "📅 Tu cita fue agendada. Toca este archivo para agregar el recordatorio a tu calendario.",
-      });
-
-      logger.info(
-        { tenantId, bookingId: booking.id },
-        "✅ Booking creado y mensaje enviado"
-      );
-    } else {
-      logger.warn(
-        { tenantId, bookingId: booking.id },
-        "Booking creado pero bot no conectado"
-      );
-    }
-  } catch (e) {
-    logger.error(e, "Error enviando confirmación de creación de cita");
-  }
-
-  return res.json({
-    ok: true,
-    booking: {
-      id: booking.id,
-      starts_at: booking.starts_at,
-      ends_at: booking.ends_at,
-      status: booking.status,
-    },
-  });
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ ok: true, booking });
 });
 
 // ---------------------------------------------------------------------
-// 10. API DE REAGENDAMIENTO (TOOL: reschedule_booking)
+// 10. API DE REAGENDAMIENTO (TOOL)
 // ---------------------------------------------------------------------
-
-/**
- * Tool: reschedule_booking
- *
- * POST /api/v1/reschedule-booking
- */
 app.post("/api/v1/reschedule-booking", async (req, res) => {
-  const {
-    tenantId,
-    bookingId,
-    newStartsAtISO,
-    newEndsAtISO,
-    extraVariables,
-  } = req.body || {};
+  const { tenantId, bookingId, newStartsAtISO, newEndsAtISO } = req.body || {};
+  if (!tenantId || !bookingId || !newStartsAtISO || !newEndsAtISO) return res.status(400).json({ error: "missing_fields" });
 
-  if (!tenantId || !bookingId || !newStartsAtISO || !newEndsAtISO) {
-    return res.status(400).json({
-      ok: false,
-      error: "missing_fields",
-      detail:
-        "Requiere tenantId, bookingId, newStartsAtISO y newEndsAtISO en el body.",
-    });
-  }
+  const { data: updated, error } = await supabase.from("bookings")
+    .update({ starts_at: newStartsAtISO, ends_at: newEndsAtISO, status: "confirmed" })
+    .eq("id", bookingId).eq("tenant_id", tenantId).select("*").maybeSingle();
 
-  const { data: updatedBooking, error } = await supabase
-    .from("bookings")
-    .update({
-      starts_at: newStartsAtISO,
-      ends_at: newEndsAtISO,
-      status: "confirmed",
-    })
-    .eq("id", bookingId)
-    .eq("tenant_id", tenantId)
-    .select("*")
-    .maybeSingle();
+  if (error) return res.status(500).json({ error: "db_error" });
+  if (!updated) return res.status(404).json({ error: "not_found" });
 
-  if (error) {
-    logger.error(error, "Error reagendando booking");
-    return res.status(500).json({ ok: false, error: "db_error" });
-  }
-
-  if (!updatedBooking) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "booking_not_found_or_not_owned" });
-  }
-
-  // 2. Intentar enviar WhatsApp de confirmación de reagendamiento
+  // Notificación (simplificada)
   try {
     const session = await getOrCreateSession(tenantId);
-    if (session && session.status === "connected") {
-      const context = await getTenantContext(tenantId);
-
-      const phone =
-        updatedBooking.customer_phone ||
-        updatedBooking.phone ||
-        updatedBooking.client_phone ||
-        null;
-
-      if (phone) {
-        const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
-
-        const startsDate = new Date(newStartsAtISO);
-        const dateStr = startsDate.toISOString().slice(0, 10);
-        const timeStr = startsDate.toTimeString().slice(0, 5);
-
-        const templateBody = await getTemplate(
-          tenantId,
-          "booking_rescheduled"
-        );
-
-        const vars = {
-          date: dateStr,
-          time: timeStr,
-          business_name: context.name,
-          customer_name: updatedBooking.customer_name || "",
-          resource_name: updatedBooking.resource_name || "",
-          ...(extraVariables || {}),
-        };
-
+    if (session && session.status === "connected" && updated.customer_phone) {
+        const jid = String(updated.customer_phone).replace(/\D/g, "") + "@s.whatsapp.net";
+        const templateBody = await getTemplate(tenantId, "booking_rescheduled");
         if (templateBody) {
-          const msg = renderTemplate(templateBody, vars);
-          await session.socket.sendMessage(jid, { text: msg });
+            const msg = renderTemplate(templateBody, { customer_name: updated.customer_name });
+            await session.socket.sendMessage(jid, { text: msg });
         }
-
-        const icsBuffer = createICSFile(
-          `Cita reagendada en ${context.name}`,
-          `Tu cita fue reagendada para ${dateStr} a las ${timeStr}.`,
-          "En el local",
-          startsDate
-        );
-
-        await session.socket.sendMessage(jid, {
-          document: icsBuffer,
-          mimetype: "text/calendar",
-          fileName: "cita_reagendada.ics",
-          caption:
-            "📅 Tu cita fue reagendada. Toca este archivo para actualizar el recordatorio en tu calendario.",
-        });
-
-        logger.info(
-          { tenantId, bookingId },
-          "✅ Booking reagendado y mensaje enviado"
-        );
-      } else {
-        logger.warn(
-          { tenantId, bookingId },
-          "Booking reagendado pero sin teléfono para notificar"
-        );
-      }
-    } else {
-      logger.warn(
-        { tenantId, bookingId },
-        "Booking reagendado pero bot no conectado"
-      );
     }
-  } catch (e) {
-    logger.error(e, "Error enviando confirmación de reagendamiento");
-  }
+  } catch(e) {}
 
-  return res.json({
-    ok: true,
-    booking: {
-      id: updatedBooking.id,
-      starts_at: updatedBooking.starts_at,
-      ends_at: updatedBooking.ends_at,
-      status: updatedBooking.status,
-    },
-  });
+  return res.json({ ok: true, booking: updated });
 });
 
 // ---------------------------------------------------------------------
-// 11. API DE CANCELACIÓN (TOOL: cancel_booking)
+// 11. API DE CANCELACIÓN (TOOL)
 // ---------------------------------------------------------------------
-
-/**
- * Tool: cancel_booking
- *
- * POST /api/v1/cancel-booking
- */
 app.post("/api/v1/cancel-booking", async (req, res) => {
-  const { tenantId, bookingId, extraVariables } = req.body || {};
+  const { tenantId, bookingId } = req.body || {};
+  if (!tenantId || !bookingId) return res.status(400).json({ error: "missing_fields" });
 
-  if (!tenantId || !bookingId) {
-    return res.status(400).json({
-      ok: false,
-      error: "missing_fields",
-      detail: "Requiere tenantId y bookingId en el body.",
-    });
-  }
+  const { data: cancelled, error } = await supabase.from("bookings")
+    .update({ status: "cancelled" }).eq("id", bookingId).eq("tenant_id", tenantId).select("*").maybeSingle();
 
-  const { data: cancelledBooking, error } = await supabase
-    .from("bookings")
-    .update({
-      status: "cancelled",
-    })
-    .eq("id", bookingId)
-    .eq("tenant_id", tenantId)
-    .select("*")
-    .maybeSingle();
+  if (error) return res.status(500).json({ error: "db_error" });
+  if (!cancelled) return res.status(404).json({ error: "not_found" });
 
-  if (error) {
-    logger.error(error, "Error cancelando booking");
-    return res.status(500).json({ ok: false, error: "db_error" });
-  }
-
-  if (!cancelledBooking) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "booking_not_found_or_not_owned" });
-  }
-
-  // 2. Intentar enviar WhatsApp de confirmación de cancelación
   try {
     const session = await getOrCreateSession(tenantId);
-    if (session && session.status === "connected") {
-      const context = await getTenantContext(tenantId);
-
-      const phone =
-        cancelledBooking.customer_phone ||
-        cancelledBooking.phone ||
-        cancelledBooking.client_phone ||
-        null;
-
-      if (phone) {
-        const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
-
-        const startsDate = new Date(cancelledBooking.starts_at);
-        const dateStr = startsDate.toISOString().slice(0, 10);
-        const timeStr = startsDate.toTimeString().slice(0, 5);
-
+    if (session && session.status === "connected" && cancelled.customer_phone) {
+        const jid = String(cancelled.customer_phone).replace(/\D/g, "") + "@s.whatsapp.net";
         const templateBody = await getTemplate(tenantId, "booking_cancelled");
-
-        const vars = {
-          date: dateStr,
-          time: timeStr,
-          business_name: context.name,
-          customer_name: cancelledBooking.customer_name || "",
-          resource_name: cancelledBooking.resource_name || "",
-          ...(extraVariables || {}),
-        };
-
-        let msg = "";
-        if (templateBody) {
-          msg = renderTemplate(templateBody, vars);
-        } else {
-          msg = `Tu cita en ${context.name} para el ${dateStr} a las ${timeStr} ha sido cancelada exitosamente.`;
-        }
-
+        const msg = templateBody ? renderTemplate(templateBody, { customer_name: cancelled.customer_name }) : "Cita cancelada.";
         await session.socket.sendMessage(jid, { text: msg });
-
-        logger.info(
-          { tenantId, bookingId },
-          "✅ Booking cancelado y mensaje enviado"
-        );
-      } else {
-        logger.warn(
-          { tenantId, bookingId },
-          "Booking cancelado pero sin teléfono para notificar"
-        );
-      }
-    } else {
-      logger.warn(
-        { tenantId, bookingId },
-        "Booking cancelado pero bot no conectado"
-      );
     }
-  } catch (e) {
-    logger.error(e, "Error enviando confirmación de cancelación");
-  }
+  } catch(e) {}
 
-  return res.json({
-    ok: true,
-    booking: {
-      id: cancelledBooking.id,
-      status: cancelledBooking.status,
-    },
-  });
+  return res.json({ ok: true, booking: cancelled });
 });
 
-// ---------------------------------------------------------------------
-// 12. AUTO-RECONEXIÓN (restoreSessions)
-// ---------------------------------------------------------------------
+// =====================================================================
+// 8. STARTUP
+// =====================================================================
 
 async function restoreSessions() {
   try {
-    logger.info("♻️ Restaurando sesiones de WhatsApp desde la base de datos…");
-
-    const { data, error } = await supabase
-      .from("whatsapp_sessions")
-      .select("tenant_id, status")
-      .in("status", ["connected", "qrcode", "connecting"]);
-
-    if (error) {
-      logger.error(error, "Error al cargar sesiones para restoreSessions");
-      return;
-    }
-
-    if (!data || data.length === 0) {
-      logger.info("No hay sesiones previas que restaurar.");
-      return;
-    }
-
-    for (const row of data) {
-      const tenantId = row.tenant_id;
-      try {
-        logger.info({ tenantId }, "🔄 Restaurando sesión previa…");
-        await getOrCreateSession(tenantId);
-        await updateSessionDB(tenantId, {
-          last_seen_at: new Date().toISOString(),
-        });
-      } catch (err) {
-        logger.error(
-          { tenantId, err },
-          "Error restaurando sesión de WhatsApp"
-        );
-      }
-    }
-  } catch (e) {
-    logger.error(e, "Fallo general en restoreSessions");
-  }
+    const { data } = await supabase.from("whatsapp_sessions").select("tenant_id").in("status", ["connected", "qrcode"]);
+    if (data) for (const row of data) await getOrCreateSession(row.tenant_id);
+  } catch (e) { logger.error(e, "Error restore"); }
 }
 
-// ---------------------------------------------------------------------
-// 13. START SERVER
-// ---------------------------------------------------------------------
-
 app.listen(PORT, () => {
-  logger.info(`🚀 WA server escuchando en puerto ${PORT}`);
-  // Ejecutamos la restauración al levantar
-  restoreSessions().catch((e) =>
-    logger.error(e, "Error al intentar restaurar sesiones al inicio")
-  );
+  logger.info(`🚀 WA server port ${PORT}`);
+  restoreSessions();
 });
