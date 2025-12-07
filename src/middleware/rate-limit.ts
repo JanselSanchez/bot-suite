@@ -1,11 +1,8 @@
-import IORedis from 'ioredis'
-const redis = new IORedis(process.env.REDIS_URL!)
+// Versión sin Redis (Pasarela libre)
+// Esto permite que el proyecto compile sin romper las importaciones en otros archivos.
 
 export async function rateLimit(key: string, limit = 60, windowSec = 60) {
-  const k = `rl:${key}`
-  const tx = redis.multi()
-  tx.incr(k)
-  tx.expire(k, windowSec)
-  const [count] = (await tx.exec()) as any[]
-  return Number(count[1]) <= limit
+  // Como eliminamos Redis, desactivamos el rate limit temporalmente.
+  // Devolvemos siempre 'true' (permitido) para no bloquear nada.
+  return true;
 }
