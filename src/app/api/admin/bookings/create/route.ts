@@ -1,7 +1,6 @@
 // src/app/api/admin/bookings/create/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
-// ❌ ELIMINADO: import { enqueueWhatsapp } from "@/server/queue";
 
 // 🔹 GET solo para probar en el navegador
 export async function GET() {
@@ -82,7 +81,6 @@ export async function POST(req: Request) {
 
     try {
       // Intentamos contactar al bot que corre localmente en el puerto 4001
-      // Si tienes WA_SERVER_URL en variables de entorno lo usa, si no, usa localhost
       const waServerUrl = process.env.WA_SERVER_URL || "http://localhost:4001";
       
       // Parseamos fecha y hora simple para la plantilla

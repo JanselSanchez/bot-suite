@@ -1,7 +1,6 @@
 // src/app/api/webhook/messages/send/route.ts
 import { NextRequest } from "next/server";
 import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
-// ❌ ELIMINADO: import { enqueueWhatsapp } from "@/server/queue";
 
 export async function GET() {
   return Response.json({ ok: true, route: "/api/webhook/messages/send" });
@@ -133,13 +132,6 @@ export async function POST(req: NextRequest) {
     }
 
     // 3) PROCESAMIENTO DIRECTO (Sin Redis)
-    // Aquí podrías llamar a tu lógica de IA directamente si fuera necesario.
-    // Como eliminamos la cola, solo confirmamos que se guardó.
-    
-    // Si necesitas que el bot responda a estos mensajes web, 
-    // tendrías que invocar la IA aquí mismo o notificar al wa-server.
-    // Por ahora, solo guardamos para no romper el flujo.
-
     return Response.json({ ok: true, id: inserted.id, status: "saved_only_no_queue", debug });
   } catch (e: any) {
     return Response.json(
