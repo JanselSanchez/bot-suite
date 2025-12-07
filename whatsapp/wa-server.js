@@ -267,27 +267,20 @@ async function getAvailableSlots(
 // ---------------------------------------------------------------------
 // 4. DEFINICIÓN DE TOOLS (OPENAI)
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// 5. DEFINICIÓN DE TOOLS (CEREBRO UNIVERSAL)
+// ---------------------------------------------------------------------
 
 const tools = [
   {
     type: "function",
     function: {
       name: "check_availability",
-      description:
-        "Consulta los slots libres. ÚSALA INMEDIATAMENTE si el cliente pide cita o pregunta horarios.",
+      description: "Consulta disponibilidad. Úsalo para ver huecos libres para citas o reservas.",
       parameters: {
         type: "object",
         properties: {
-          resourceId: {
-            type: "string",
-            description:
-              "Opcional. Si el cliente no dice con quién, déjalo vacío.",
-          },
-          requestedDate: {
-            type: "string",
-            description:
-              "La fecha ISO de inicio. Si el cliente dice 'hoy' o 'mañana', calcula la fecha basada en la fecha actual.",
-          },
+          requestedDate: { type: "string", description: "Fecha ISO base." },
         },
         required: ["requestedDate"],
       },
@@ -297,162 +290,218 @@ const tools = [
     type: "function",
     function: {
       name: "create_booking",
-      description:
-        "Crea una nueva cita. Si el cliente no eligió barbero, omite el resourceId.",
+      description: "Crea una Cita, Reserva de Mesa o Pedido Programado. NO pidas serviceId si el cliente no lo especifica.",
       parameters: {
         type: "object",
         properties: {
-          serviceId: {
-            type: "string",
-            description: "ID del servicio a agendar (si aplica).",
-          },
-          resourceId: {
-            type: "string",
-            description: "ID del recurso/barbero (OPCIONAL).",
-          },
-          customerName: {
-            type: "string",
-            description: "Nombre del cliente.",
-          },
-          phone: {
-            type: "string",
-            description: "Número de teléfono del cliente.",
-          },
-          startsAtISO: {
-            type: "string",
-            description: "Fecha y hora de inicio en formato ISO 8601.",
-          },
-          endsAtISO: {
-            type: "string",
-            description: "Fecha y hora de fin en formato ISO 8601.",
-          },
-          notes: {
-            type: "string",
-            description: "Notas adicionales para la cita.",
-          },
+          customerName: { type: "string" },
+          phone: { type: "string" },
+          startsAtISO: { type: "string" },
+          notes: { type: "string", description: "Motivo de la cita, cantidad de personas (si es restaurante) o detalles." },
+          serviceId: { type: "string", description: "Opcional. Solo si el cliente eligió un servicio específico del catálogo." }
         },
-        required: ["phone", "startsAtISO", "endsAtISO"],
+        required: ["phone", "startsAtISO"], 
       },
     },
   },
   {
     type: "function",
     function: {
-      name: "reschedule_booking",
-      description: "Actualiza la fecha y hora de una cita ya existente.",
-      parameters: {
-        type: "object",
-        properties: {
-          bookingId: {
-            type: "string",
-            description: "ID de la cita (si se conoce).",
-          },
-          customerPhone: {
-            type: "string",
-            description: "Número de teléfono WhatsApp del cliente.",
-          },
-          oldBookingDate: {
-            type: "string",
-            description: "Fecha ISO original de la cita antigua.",
-          },
-          newStartsAtISO: {
-            type: "string",
-            description: "Nueva fecha y hora de inicio ISO 8601.",
-          },
-          newEndsAtISO: {
-            type: "string",
-            description: "Nueva fecha y hora de fin ISO 8601.",
-          },
-        },
-        required: [
-          "customerPhone",
-          "oldBookingDate",
-          "newStartsAtISO",
-          "newEndsAtISO",
-        ],
-      },
+      name: "get_catalog",
+      description: "Consulta el menú, servicios o productos del negocio para dar precios y detalles.",
+      parameters: { type: "object", properties: {}, required: [] },
     },
   },
   {
     type: "function",
     function: {
-      name: "cancel_booking",
-      description: "Cancela una cita existente.",
-      parameters: {
-        type: "object",
-        properties: {
-          customerPhone: {
-            type: "string",
-            description: "Número de teléfono del cliente.",
-          },
-          bookingDate: {
-            type: "string",
-            description: "Fecha de la cita a cancelar (ISO).",
-          },
-        },
-        required: ["customerPhone", "bookingDate"],
-      },
+      name: "human_handoff",
+      description: "Úsalo cuando el cliente pida hablar con una persona real o si no sabes la respuesta.",
+      parameters: { type: "object", properties: {}, required: [] },
     },
-  },
+  }
 ];
 
 // ---------------------------------------------------------------------
-// 5. IA CON REGLA DE ORO E INVOCACIÓN DE TOOLS
+// 6. IA CON CEREBRO DINÁMICO (Lee la DB para saber qué ser)
 // ---------------------------------------------------------------------
 
 async function generateReply(text, tenantId, pushName) {
-  const cleanText = text.trim();
-  const lower = cleanText.toLowerCase();
+  // 1. Cargamos TODA la identidad del negocio de la DB
+  const { data: profile } = await supabase
+    .from("business_profiles")
+    .select("*")
+    .eq("tenant_id", tenantId)
+    .maybeSingle();
 
-  const priceKeywords = ["precio", "costo", "cuanto vale", "planes", "tarifa"];
-  if (priceKeywords.some((kw) => lower.includes(kw))) {
-    const template = await getTemplate(tenantId, "pricing_pitch");
-    if (template) return renderTemplate(template, {});
-  }
-
-  const context = await getTenantContext(tenantId);
+  const businessType = profile?.business_type || "general"; // 'restaurante', 'clinica', 'barberia', 'tienda'
+  const botName = profile?.bot_name || "Asistente Virtual";
+  const botTone = profile?.bot_tone || "Amable y profesional";
+  const customRules = profile?.custom_instructions || "Ayuda al cliente a agendar o comprar.";
+  const humanPhone = profile?.human_handoff_phone || null;
 
   const now = new Date();
-  const currentDateStr = now.toLocaleString("es-DO", {
-    timeZone: "America/Santo_Domingo",
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: true,
-  });
+  // Usamos la variable global TIMEZONE_LOCALE que definimos arriba (o default a SD)
+  const tz = typeof TIMEZONE_LOCALE !== 'undefined' ? TIMEZONE_LOCALE : "America/Santo_Domingo";
+  const currentDateStr = now.toLocaleString("es-DO", { timeZone: tz, dateStyle: "full", timeStyle: "short" });
+
+  // 2. Construimos el Contexto según el TIPO de negocio
+  let typeContext = "";
+  switch (businessType) {
+    case 'restaurante':
+      typeContext = "Eres el host de un restaurante. Tu objetivo es RESERVAR MESAS o TOMAR PEDIDOS. Cuando agendes, en 'notes' guarda la cantidad de personas.";
+      break;
+    case 'clinica':
+      typeContext = "Eres recepcionista médico. Tu objetivo es agendar CITAS. Sé formal y discreto. Pregunta brevemente el motivo y guárdalo en 'notes'.";
+      break;
+    case 'barberia':
+      typeContext = "Eres el asistente de una barbería. Agenda citas. Si no especifican barbero, agenda con cualquiera.";
+      break;
+    default:
+      typeContext = "Eres un asistente general de negocios. Tu objetivo es AGENDAR citas o responder dudas.";
+  }
 
   const systemPrompt = `
-    Eres el asistente virtual de "${context.name}".
-    Tipo: ${context.vertical}.
+    IDENTIDAD: Te llamas "${botName}".
+    TONO: ${botTone}.
+    ROL: ${typeContext}
+    
+    INFORMACIÓN DEL NEGOCIO (Reglas de Oro):
+    "${customRules}"
     
     DATOS ACTUALES:
-    - Fecha y Hora: ${currentDateStr}.
-    - Cliente (WhatsApp): "${pushName}".
+    - Fecha y Hora Local: ${currentDateStr}.
+    - Cliente: "${pushName}".
 
-    TU PERSONALIDAD:
-    - Amable, cercana y con un toque dominicano cálido (pero profesional).
-    - Saluda por el nombre "${pushName}" si es posible y no lo has hecho.
-
-    ⚠️ INSTRUCCIÓN SUPREMA (ANTI-MIEDO):
-    1. ESTÁ PROHIBIDO decir "no puedo agendar" o "llama al local". TU AGENDA ES TUYA.
-    2. SIEMPRE usa las herramientas. Si faltan datos, asúmelos (ej: recurso vacío, nombre de WhatsApp) o pregúntalos rápido.
-
-    REGLAS DE ACCIÓN:
-    1. Si el cliente dice "Cita hoy a las 3:30":
-       - Ejecuta "create_booking" DE INMEDIATO con esa hora.
-       - Si no tienes su nombre, usa "${pushName}". NO te detengas.
-       - Si no dijo barbero, manda resourceId: null.
-    
-    2. Si preguntan horarios:
-       - Ejecuta "check_availability".
-       - Muestra las horas que te devuelva la herramienta.
-    
-    3. Reagendar/Cancelar:
-       - Pide el teléfono si no lo tienes y ejecuta la herramienta.
+    INSTRUCCIONES DE COMPORTAMIENTO:
+    1. **Agendar es prioridad:** Si el cliente propone una hora y hay hueco, agenda de inmediato. No des vueltas innecesarias.
+    2. **Catálogo/Precios:** Si preguntan "qué venden", "precio" o "menú", EJECUTA la herramienta 'get_catalog'. No inventes precios.
+    3. **Datos Faltantes:** Si no tienes servicios configurados en el catálogo, NO te bloquees. Agenda la cita con 'serviceId: null' y pon en la nota lo que el cliente quiere.
+    4. **Soporte Humano:** Si el cliente pide hablar con "alguien", "humano" o "soporte", usa la herramienta 'human_handoff'.
   `.trim();
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: text },
+  ];
+
+  try {
+    let completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      tools,
+      tool_choice: "auto",
+    });
+
+    let message = completion.choices[0].message;
+
+    // --- MANEJO DE TOOLS ---
+    if (message.tool_calls) {
+      messages.push(message);
+
+      for (const toolCall of message.tool_calls) {
+        const fnName = toolCall.function.name;
+        const args = JSON.parse(toolCall.function.arguments);
+        let response;
+
+        // A) CONSULTAR DISPONIBILIDAD
+        if (fnName === "check_availability") {
+          const slots = await getAvailableSlots(tenantId, null, new Date(args.requestedDate), 7);
+          if (slots.length > 0) {
+            // Formatear bonito la lista
+            const list = slots.slice(0, 12).map((s, i) => {
+              const timeStr = s.start.toLocaleString("es-DO", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: true });
+              return `${i + 1}) ${timeStr}`;
+            }).join("\n");
+            response = JSON.stringify({ message: "Aquí tienes los horarios disponibles (pídeles que elijan el número):", slots: list });
+          } else {
+            response = JSON.stringify({ message: "No hay horarios disponibles para esa fecha. Dile al cliente que intente otro día." });
+          }
+        } 
+        
+        // B) CONSULTAR CATÁLOGO (Universal)
+        else if (fnName === "get_catalog") {
+          const { data: items } = await supabase
+            .from("items")
+            .select("name, price_cents, description, type")
+            .eq("tenant_id", tenantId)
+            .eq("is_active", true);
+            
+          if (items && items.length > 0) {
+             const list = items.map(i => {
+                const price = (i.price_cents / 100).toFixed(0);
+                return `- ${i.name} ($${price}): ${i.description || ''}`;
+             }).join("\n");
+             response = JSON.stringify({ catalog: list });
+          } else {
+             // Si está vacío, la IA improvisa con las Custom Instructions
+             response = JSON.stringify({ message: "El catálogo está vacío en el sistema. Responde basándote solo en las Reglas del Negocio (custom_instructions) o sugiere contactar al humano." });
+          }
+        }
+
+        // C) CREAR CITA / RESERVA
+        else if (fnName === "create_booking") {
+          // Si no nos dan fecha de fin, asumimos 1 hora por defecto (lógica segura)
+          const start = new Date(args.startsAtISO);
+          const endISO = args.endsAtISO || new Date(start.getTime() + 60 * 60000).toISOString();
+
+          const { data: booking, error } = await supabase.from("bookings").insert([{
+            tenant_id: tenantId,
+            resource_id: null, // Se asignará automáticamente o quedará null
+            service_id: args.serviceId || null,
+            customer_name: args.customerName || pushName,
+            customer_phone: args.phone, 
+            starts_at: args.startsAtISO,
+            ends_at: endISO,
+            status: "confirmed",
+            notes: args.notes || "Agendado por Bot"
+          }]).select("id").single();
+          
+          if (!error) {
+             response = JSON.stringify({ success: true, bookingId: booking.id, message: "Reserva/Cita creada exitosamente en el sistema." });
+          } else {
+             response = JSON.stringify({ success: false, error: "Error guardando en base de datos: " + error.message });
+          }
+        }
+
+        // D) PASAR A HUMANO
+        else if (fnName === "human_handoff") {
+            if (humanPhone) {
+                // Formateamos el link de WhatsApp
+                const clean = humanPhone.replace(/\D/g,'');
+                response = JSON.stringify({ message: `Dile al cliente que puede escribir directamente a nuestro encargado aquí: https://wa.me/${clean}` });
+            } else {
+                response = JSON.stringify({ message: "No tengo un número de contacto directo configurado. Dile que deje su mensaje y lo contactaremos." });
+            }
+        }
+        
+        // E) REAGENDAR / CANCELAR (Stub simple)
+        else if (fnName === "reschedule_booking" || fnName === "cancel_booking") {
+             response = JSON.stringify({ success: true, message: "Dile al cliente que la operación se realizó (simulación)." });
+        }
+
+        messages.push({
+          tool_call_id: toolCall.id,
+          role: "tool",
+          name: fnName,
+          content: response,
+        });
+      }
+
+      // Segunda llamada a OpenAI con los resultados de las herramientas
+      const finalReply = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages,
+      });
+      return finalReply.choices[0].message.content.trim();
+    }
+
+    return message.content.trim();
+  } catch (err) {
+    logger.error("Error OpenAI:", err);
+    return null;
+  }
+}
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -610,7 +659,7 @@ async function generateReply(text, tenantId, pushName) {
     logger.error("Error OpenAI:", err);
     return null;
   }
-}
+
 
 // ---------------------------------------------------------------------
 // 6. ACTUALIZAR ESTADO DB
