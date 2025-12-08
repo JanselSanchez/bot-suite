@@ -46,6 +46,16 @@ const supabase = createClient(
 );
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+/**
+ * sessions: Map<tenantId, {
+ *   tenantId,
+ *   socket,
+ *   status,
+ *   qr,
+ *   conversations: Map<phone, { history: Array<{role, content}> }>
+ * }>
+ */
 const sessions = new Map();
 
 // =====================================================================
@@ -270,7 +280,92 @@ async function getAvailableSlots(
 }
 
 // ---------------------------------------------------------------------
-// 4. DEFINICIÓN DE TOOLS (CEREBRO UNIVERSAL)
+// 4. INTENT_KEYWORDS ENGINE
+// ---------------------------------------------------------------------
+
+function normalizeForIntent(str = "") {
+  return str
+    .toString()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // quitar acentos
+    .toLowerCase()
+    .trim();
+}
+
+/**
+ * Lee intent_keywords y devuelve un resumen JSON de las intenciones detectadas.
+ */
+async function buildIntentHints(tenantId, userText) {
+  try {
+    const normalizedUser = normalizeForIntent(userText);
+
+    const { data, error } = await supabase
+      .from("intent_keywords")
+      .select("intent, frase, peso, es_error, locale, term, tenant_id")
+      .or(`tenant_id.eq.${tenantId},tenant_id.is.null`);
+
+    if (error || !data || data.length === 0) {
+      return "";
+    }
+
+    const scores = {}; // intent -> { score, terms: Set<string> }
+
+    for (const row of data) {
+      // Filtrar por locale si viene
+      if (
+        row.locale &&
+        normalizeForIntent(row.locale) !== normalizeForIntent("es-DO") &&
+        normalizeForIntent(row.locale) !== normalizeForIntent("es")
+      ) {
+        continue;
+      }
+
+      if (row.es_error) continue; // ignoramos ejemplos marcados como error
+
+      const term = row.term || row.frase;
+      if (!term) continue;
+
+      const normTerm = normalizeForIntent(term);
+      if (!normTerm) continue;
+
+      if (normalizedUser.includes(normTerm)) {
+        const intent = row.intent || "desconocido";
+        if (!scores[intent]) {
+          scores[intent] = {
+            intent,
+            score: 0,
+            terms: new Set(),
+          };
+        }
+        const peso = typeof row.peso === "number" ? row.peso : 1;
+        scores[intent].score += peso;
+        scores[intent].terms.add(term);
+      }
+    }
+
+    const intentsArr = Object.values(scores);
+    if (intentsArr.length === 0) return "";
+
+    // Ordenar por score desc y limitar a top 3
+    intentsArr.sort((a, b) => b.score - a.score);
+    const topIntents = intentsArr.slice(0, 3).map((i) => ({
+      intent: i.intent,
+      score: i.score,
+      terms: Array.from(i.terms),
+    }));
+
+    return JSON.stringify({
+      engine: "intent_keywords",
+      intents: topIntents,
+    });
+  } catch (e) {
+    console.error("[buildIntentHints] error:", e);
+    return "";
+  }
+}
+
+// ---------------------------------------------------------------------
+// 5. DEFINICIÓN DE TOOLS (CEREBRO UNIVERSAL)
 // ---------------------------------------------------------------------
 
 const tools = [
@@ -382,10 +477,13 @@ const tools = [
 ];
 
 // ---------------------------------------------------------------------
-// 5. IA CON CEREBRO DINÁMICO (Lee la DB para saber qué ser)
+// 6. IA CON CEREBRO DINÁMICO (Lee la DB para saber qué ser)
 // ---------------------------------------------------------------------
 
-async function generateReply(text, tenantId, pushName) {
+/**
+ * historyMessages: array de mensajes previos [{role, content}] del chat con ese cliente.
+ */
+async function generateReply(text, tenantId, pushName, historyMessages = []) {
   // 1. Cargamos TODA la identidad del negocio de la DB
   const { data: profile } = await supabase
     .from("business_profiles")
@@ -408,7 +506,10 @@ async function generateReply(text, tenantId, pushName) {
     timeStyle: "short",
   });
 
-  // 2. Construimos el Contexto según el TIPO de negocio
+  // 2. Intentos detectados por intent_keywords
+  const intentHints = await buildIntentHints(tenantId, text);
+
+  // 3. Construimos el Contexto según el TIPO de negocio
   let typeContext = "";
   switch (businessType) {
     case "restaurante":
@@ -439,16 +540,32 @@ async function generateReply(text, tenantId, pushName) {
     DATOS ACTUALES:
     - Fecha y Hora Local: ${currentDateStr}.
     - Cliente: "${pushName}".
+    - INTENTOS DETECTADOS POR PALABRAS CLAVE (intent_keywords): ${
+      intentHints || "ninguno claro"
+    }.
+
+    INTERPRETACIÓN DE INTENTOS:
+    - Si intent_keywords indica claramente algo como "reservar", "reprogramar", "cancelar" o "disponibilidad",
+      úsalo como pista fuerte para decidir qué herramienta usar primero.
+    - No contradigas el contenido literal del mensaje del cliente; úsalo como refuerzo.
 
     INSTRUCCIONES DE COMPORTAMIENTO:
     1. **Agendar es prioridad:** Si el cliente propone una hora y hay hueco, agenda de inmediato. No des vueltas innecesarias.
     2. **Catálogo/Precios:** Si preguntan "qué venden", "precio" o "menú", EJECUTA la herramienta 'get_catalog'. No inventes precios.
     3. **Datos Faltantes:** Si no tienes servicios configurados en el catálogo, NO te bloquees. Agenda la cita con 'serviceId: null' y pon en la nota lo que el cliente quiere.
     4. **Soporte Humano:** Si el cliente pide hablar con "alguien", "humano" o "soporte", usa la herramienta 'human_handoff'.
+    5. **Listas de horarios:** Cuando uses 'check_availability' recibirás un JSON con 'slots', cada uno con:
+       - index (1,2,3,...)
+       - label (texto amigable para mostrar al cliente)
+       - isoStart (fecha/hora en ISO 8601)
+       Debes mostrar al cliente la lista usando 'label' y decirle que elija un número.
+    6. **Interpretar opciones:** Si el cliente dice "opción 3", "la 3", "la número 2", etc. DESPUÉS de haber visto una lista de horarios, SIEMPRE se refiere a esos 'slots', NO a productos del catálogo. Debes tomar el slot correspondiente por 'index' y llamar a 'create_booking' con 'startsAtISO = isoStart' (y un 'notes' adecuado).
+    7. **Confirmaciones vagas:** Si tú acabas de proponer un horario concreto (por ejemplo "12:00 p. m.") y el cliente responde "sí", "está bien", "perfecto", etc., interpreta eso como confirmación y llama de inmediato a 'create_booking' usando esa última hora acordada. No vuelvas a preguntar lo mismo.
   `.trim();
 
   const messages = [
     { role: "system", content: systemPrompt },
+    ...(Array.isArray(historyMessages) ? historyMessages : []),
     { role: "user", content: text },
   ];
 
@@ -473,34 +590,48 @@ async function generateReply(text, tenantId, pushName) {
 
         // A) CONSULTAR DISPONIBILIDAD
         if (fnName === "check_availability") {
-          const slots = await getAvailableSlots(
+          const rawSlots = await getAvailableSlots(
             tenantId,
             null,
             new Date(args.requestedDate),
             7
           );
-          if (slots.length > 0) {
-            const list = slots
-              .slice(0, 12)
-              .map((s, i) => {
-                const timeStr = s.start.toLocaleString("es-DO", {
-                  timeZone: tz,
-                  hour: "2-digit",
-                  minute: "2-digit",
-                  hour12: true,
-                });
-                return `${i + 1}) ${timeStr}`;
-              })
-              .join("\n");
+
+          // 🔥 Ordenamos cronológicamente
+          const sortedSlots = (rawSlots || []).sort(
+            (a, b) => a.start.getTime() - b.start.getTime()
+          );
+
+          if (sortedSlots.length > 0) {
+            // "Trampa" ISO: devolvemos estructura rica para que la IA pueda mapear número → ISO
+            const slotObjects = sortedSlots.slice(0, 12).map((s, i) => {
+              const timeStr = s.start.toLocaleString("es-DO", {
+                timeZone: tz,
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: true,
+              });
+              return {
+                index: i + 1,
+                label: `${i + 1}) ${timeStr}`,
+                isoStart: s.start.toISOString(),
+                isoEnd: s.end.toISOString(),
+              };
+            });
+
+            const listText = slotObjects.map((s) => s.label).join("\n");
+
             response = JSON.stringify({
               message:
-                "Aquí tienes los horarios disponibles (pídeles que elijan el número):",
-              slots: list,
+                "Aquí tienes los horarios disponibles (el cliente elegirá por número). Usa SIEMPRE 'index' + 'isoStart' para agendar.",
+              slots: slotObjects,
+              plain_list: listText,
             });
           } else {
             response = JSON.stringify({
               message:
                 "No hay horarios disponibles para esa fecha. Dile al cliente que intente otro día.",
+              slots: [],
             });
           }
         }
@@ -689,7 +820,7 @@ async function generateReply(text, tenantId, pushName) {
 }
 
 // ---------------------------------------------------------------------
-// 6. ACTUALIZAR ESTADO DB
+// 7. ACTUALIZAR ESTADO DB
 // ---------------------------------------------------------------------
 
 async function updateSessionDB(tenantId, updateData) {
@@ -702,7 +833,7 @@ async function updateSessionDB(tenantId, updateData) {
       .eq("tenant_id", tenantId)
       .maybeSingle();
 
-    if (selectError) {
+  if (selectError) {
       console.error(
         "[updateSessionDB] Error select whatsapp_sessions:",
         selectError
@@ -760,7 +891,7 @@ async function updateSessionDB(tenantId, updateData) {
 }
 
 // ---------------------------------------------------------------------
-// 7. AUTH STATE MONOLÍTICO
+// 8. AUTH STATE MONOLÍTICO
 // ---------------------------------------------------------------------
 
 const WA_SESSIONS_ROOT =
@@ -786,7 +917,7 @@ async function useSupabaseAuthState(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 8. CORE WHATSAPP
+// 9. CORE WHATSAPP
 // ---------------------------------------------------------------------
 
 async function getOrCreateSession(tenantId) {
@@ -810,7 +941,13 @@ async function getOrCreateSession(tenantId) {
     connectTimeoutMs: 60000,
   });
 
-  const info = { tenantId, socket: sock, status: "connecting", qr: null };
+  const info = {
+    tenantId,
+    socket: sock,
+    status: "connecting",
+    qr: null,
+    conversations: new Map(), // phone -> { history: [...] }
+  };
   sessions.set(tenantId, info);
 
   sock.ev.on("connection.update", async (update) => {
@@ -874,10 +1011,36 @@ async function getOrCreateSession(tenantId) {
     if (!text) return;
 
     const pushName = msg.pushName || "Cliente";
+    const userPhone = remoteJid.split("@")[0];
 
-    const reply = await generateReply(text, tenantId, pushName);
+    // --- Memoria por conversación (teléfono) ---
+    if (!info.conversations) {
+      info.conversations = new Map();
+    }
+    let convo = info.conversations.get(userPhone);
+    if (!convo) {
+      convo = { history: [] };
+      info.conversations.set(userPhone, convo);
+    }
+
+    const history = convo.history || [];
+
+    const reply = await generateReply(text, tenantId, pushName, history);
     if (reply) {
       await sock.sendMessage(remoteJid, { text: reply });
+
+      // Actualizamos historial: user + assistant
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+
+      // Limitamos tamaño del historial (por ejemplo, últimas 10 interacciones = 20 mensajes)
+      const MAX_MESSAGES = 20;
+      if (history.length > MAX_MESSAGES) {
+        history.splice(0, history.length - MAX_MESSAGES);
+      }
+
+      convo.history = history;
+      info.conversations.set(userPhone, convo);
     }
   });
 
@@ -885,7 +1048,7 @@ async function getOrCreateSession(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 9. API ROUTES BÁSICAS
+// 10. API ROUTES BÁSICAS
 // ---------------------------------------------------------------------
 
 app.get("/health", (req, res) =>
@@ -1022,7 +1185,7 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 10. API DE CONSULTA DE DISPONIBILIDAD
+// 11. API DE CONSULTA DE DISPONIBILIDAD
 // ---------------------------------------------------------------------
 
 app.get("/api/v1/availability", async (req, res) => {
@@ -1044,7 +1207,12 @@ app.get("/api/v1/availability", async (req, res) => {
     7
   );
 
-  const formattedSlots = slots.map(
+  // Ordenamos también aquí, por si acaso
+  const sorted = (slots || []).sort(
+    (a, b) => a.start.getTime() - b.start.getTime()
+  );
+
+  const formattedSlots = sorted.map(
     (s) =>
       `${s.start.toLocaleString("es-DO", {
         weekday: "short",
@@ -1057,13 +1225,13 @@ app.get("/api/v1/availability", async (req, res) => {
 
   res.json({
     ok: true,
-    available_slots_count: slots.length,
+    available_slots_count: sorted.length,
     available_slots: formattedSlots.slice(0, 40),
   });
 });
 
 // ---------------------------------------------------------------------
-// 11. API DE CREACIÓN DE CITA
+// 12. API DE CREACIÓN DE CITA
 // ---------------------------------------------------------------------
 
 app.post("/api/v1/create-booking", async (req, res) => {
@@ -1185,7 +1353,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 12. API DE REAGENDAMIENTO
+// 13. API DE REAGENDAMIENTO
 // ---------------------------------------------------------------------
 
 app.post("/api/v1/reschedule-booking", async (req, res) => {
@@ -1313,7 +1481,7 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 13. API DE CANCELACIÓN
+// 14. API DE CANCELACIÓN
 // ---------------------------------------------------------------------
 
 app.post("/api/v1/cancel-booking", async (req, res) => {
@@ -1416,7 +1584,7 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 14. AUTO-RECONEXIÓN (restoreSessions)
+// 15. AUTO-RECONEXIÓN (restoreSessions)
 // ---------------------------------------------------------------------
 
 async function restoreSessions() {
@@ -1459,7 +1627,7 @@ async function restoreSessions() {
 }
 
 // ---------------------------------------------------------------------
-// 15. START SERVER
+// 16. START SERVER
 // ---------------------------------------------------------------------
 
 app.listen(PORT, () => {
