@@ -23,7 +23,6 @@ app.use(express.json());
 const PORT = process.env.PORT || 4001;
 
 // 🔥 AJUSTE DE ZONA HORARIA (CRÍTICO)
-// Sumamos 4 horas para que el servidor UTC coincida con la hora de apertura en RD (UTC-4)
 const SERVER_OFFSET_HOURS = 4;
 
 // Timezone configurable (fallback RD)
@@ -49,14 +48,17 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /**
  * sessions: Map<tenantId, {
- *   tenantId,
- *   socket,
- *   status,
- *   qr,
- *   conversations: Map<phone, { history: Array<{role, content}> }>
+ * tenantId,
+ * socket,
+ * status,
+ * qr,
+ * conversations: Map<phone, { history: Array<{role, content}> }>
  * }>
  */
 const sessions = new Map();
+
+// Definimos la carpeta donde se guardarán las sesiones (Persistencia)
+const WA_SESSIONS_ROOT = process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
 
 // =====================================================================
 // 1. LÓGICA DE SCHEDULING
@@ -871,6 +873,7 @@ async function updateSessionDB(tenantId, updateData) {
   if (!tenantId) return;
 
   try {
+    // 1) Ver si ya existe una fila para este tenant
     const { data: existing, error: selectError } = await supabase
       .from("whatsapp_sessions")
       .select("id")
@@ -885,6 +888,7 @@ async function updateSessionDB(tenantId, updateData) {
       return;
     }
 
+    // 2) Si existe, hacemos UPDATE; si no, INSERT
     if (existing) {
       const { error: updateError } = await supabase
         .from("whatsapp_sessions")
@@ -915,6 +919,7 @@ async function updateSessionDB(tenantId, updateData) {
       }
     }
 
+    // 3) Sincronizamos también la columna wa_connected en tenants (si viene status)
     if (updateData.status) {
       const isConnected = updateData.status === "connected";
       const { error: tenantError } = await supabase
@@ -938,9 +943,6 @@ async function updateSessionDB(tenantId, updateData) {
 // 8. AUTH STATE MONOLÍTICO
 // ---------------------------------------------------------------------
 
-const WA_SESSIONS_ROOT =
-  process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
-
 /**
  * Wrapper sobre useMultiFileAuthState de Baileys.
  * Crea una carpeta por tenant dentro de .wa-sessions (o la que definas).
@@ -952,6 +954,7 @@ async function useSupabaseAuthState(tenantId) {
 
   const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
 
+  // Nos aseguramos de que la carpeta exista
   if (!fs.existsSync(sessionFolder)) {
     fs.mkdirSync(sessionFolder, { recursive: true });
   }
