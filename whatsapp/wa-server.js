@@ -396,6 +396,7 @@ const tools = [
           customerName: { type: "string" },
           phone: { type: "string" },
           startsAtISO: { type: "string" },
+          endsAtISO: { type: "string" },
           notes: {
             type: "string",
             description:
@@ -482,8 +483,15 @@ const tools = [
 
 /**
  * historyMessages: array de mensajes previos [{role, content}] del chat con ese cliente.
+ * userPhone: número de WhatsApp SIN @s.whatsapp.net
  */
-async function generateReply(text, tenantId, pushName, historyMessages = []) {
+async function generateReply(
+  text,
+  tenantId,
+  pushName,
+  historyMessages = [],
+  userPhone = null
+) {
   // 1. Cargamos TODA la identidad del negocio de la DB
   const { data: profile } = await supabase
     .from("business_profiles")
@@ -540,6 +548,7 @@ async function generateReply(text, tenantId, pushName, historyMessages = []) {
     DATOS ACTUALES:
     - Fecha y Hora Local: ${currentDateStr}.
     - Cliente: "${pushName}".
+    - Teléfono WhatsApp del cliente (úsalo SIEMPRE como "phone" / "customerPhone" en las herramientas): ${userPhone || "desconocido"}.
     - INTENTOS DETECTADOS POR PALABRAS CLAVE (intent_keywords): ${
       intentHints || "ninguno claro"
     }.
@@ -559,7 +568,9 @@ async function generateReply(text, tenantId, pushName, historyMessages = []) {
        - label (texto amigable para mostrar al cliente)
        - isoStart (fecha/hora en ISO 8601)
        Debes mostrar al cliente la lista usando 'label' y decirle que elija un número.
-    6. **Interpretar opciones:** Si el cliente dice "opción 3", "la 3", "la número 2", etc. DESPUÉS de haber visto una lista de horarios, SIEMPRE se refiere a esos 'slots', NO a productos del catálogo. Debes tomar el slot correspondiente por 'index' y llamar a 'create_booking' con 'startsAtISO = isoStart' (y un 'notes' adecuado).
+    6. **Interpretar opciones:** Si el cliente dice "opción 3", "la 3", "la número 2", etc. DESPUÉS de haber visto una lista de horarios, SIEMPRE se refiere a esos 'slots', NO a productos del catálogo. Debes tomar el slot correspondiente por 'index' y llamar a 'create_booking' con:
+       - phone = "${userPhone || "el número del cliente en WhatsApp"}"
+       - startsAtISO = isoStart del slot elegido
     7. **Confirmaciones vagas:** Si tú acabas de proponer un horario concreto (por ejemplo "12:00 p. m.") y el cliente responde "sí", "está bien", "perfecto", etc., interpreta eso como confirmación y llama de inmediato a 'create_booking' usando esa última hora acordada. No vuelvas a preguntar lo mismo.
   `.trim();
 
@@ -585,7 +596,7 @@ async function generateReply(text, tenantId, pushName, historyMessages = []) {
 
       for (const toolCall of message.tool_calls) {
         const fnName = toolCall.function.name;
-        const args = JSON.parse(toolCall.function.arguments);
+        const args = JSON.parse(toolCall.function.arguments || "{}");
         let response;
 
         // A) CONSULTAR DISPONIBILIDAD
@@ -662,42 +673,53 @@ async function generateReply(text, tenantId, pushName, historyMessages = []) {
 
         // C) CREAR CITA / RESERVA
         else if (fnName === "create_booking") {
-          const start = new Date(args.startsAtISO);
-          const endISO =
-            args.endsAtISO ||
-            new Date(start.getTime() + 60 * 60000).toISOString();
+          const phoneArg = args.phone || userPhone;
+          const startsISO = args.startsAtISO;
 
-          const { data: booking, error } = await supabase
-            .from("bookings")
-            .insert([
-              {
-                tenant_id: tenantId,
-                resource_id: null,
-                service_id: args.serviceId || null,
-                customer_name: args.customerName || pushName,
-                customer_phone: args.phone,
-                starts_at: args.startsAtISO,
-                ends_at: endISO,
-                status: "confirmed",
-                notes: args.notes || "Agendado por Bot",
-              },
-            ])
-            .select("id")
-            .single();
-
-          if (!error) {
-            response = JSON.stringify({
-              success: true,
-              bookingId: booking.id,
-              message: "Reserva/Cita creada exitosamente en el sistema.",
-            });
-          } else {
+          if (!phoneArg || !startsISO) {
             response = JSON.stringify({
               success: false,
               error:
-                "Error guardando en base de datos: " +
-                (error?.message || "desconocido"),
+                "missing_phone_or_start: falta phone o startsAtISO para crear la cita.",
             });
+          } else {
+            const start = new Date(startsISO);
+            const endISO =
+              args.endsAtISO ||
+              new Date(start.getTime() + 60 * 60000).toISOString();
+
+            const { data: booking, error } = await supabase
+              .from("bookings")
+              .insert([
+                {
+                  tenant_id: tenantId,
+                  resource_id: null,
+                  service_id: args.serviceId || null,
+                  customer_name: args.customerName || pushName,
+                  customer_phone: phoneArg,
+                  starts_at: startsISO,
+                  ends_at: endISO,
+                  status: "confirmed",
+                  notes: args.notes || "Agendado por Bot",
+                },
+              ])
+              .select("id")
+              .single();
+
+            if (!error) {
+              response = JSON.stringify({
+                success: true,
+                bookingId: booking.id,
+                message: "Reserva/Cita creada exitosamente en el sistema.",
+              });
+            } else {
+              response = JSON.stringify({
+                success: false,
+                error:
+                  "Error guardando en base de datos: " +
+                  (error?.message || "desconocido"),
+              });
+            }
           }
         }
 
@@ -718,81 +740,103 @@ async function generateReply(text, tenantId, pushName, historyMessages = []) {
 
         // E) REAGENDAR (REAL)
         else if (fnName === "reschedule_booking") {
-          const { data: booking } = await supabase
-            .from("bookings")
-            .select("id")
-            .eq("tenant_id", tenantId)
-            .eq("customer_phone", args.customerPhone || args.phone)
-            .in("status", ["confirmed", "pending"])
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
+          const phoneFilter =
+            args.customerPhone || args.phone || userPhone || null;
 
-          if (booking) {
-            const newStart = args.newStartsAtISO;
-            const newEnd =
-              args.newEndsAtISO ||
-              new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
-
-            const { error } = await supabase
-              .from("bookings")
-              .update({ starts_at: newStart, ends_at: newEnd })
-              .eq("id", booking.id);
-
-            if (!error) {
-              response = JSON.stringify({
-                success: true,
-                message: "Cita reagendada correctamente.",
-              });
-            } else {
-              response = JSON.stringify({
-                success: false,
-                error: "Error actualizando la cita en base de datos.",
-              });
-            }
-          } else {
+          if (!phoneFilter) {
             response = JSON.stringify({
               success: false,
               error:
-                "No encontré ninguna cita activa con ese número de teléfono.",
+                "missing_phone: necesito el teléfono del cliente para reagendar.",
             });
+          } else {
+            const { data: booking } = await supabase
+              .from("bookings")
+              .select("id")
+              .eq("tenant_id", tenantId)
+              .eq("customer_phone", phoneFilter)
+              .in("status", ["confirmed", "pending"])
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+            if (booking) {
+              const newStart = args.newStartsAtISO;
+              const newEnd =
+                args.newEndsAtISO ||
+                new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
+
+              const { error } = await supabase
+                .from("bookings")
+                .update({ starts_at: newStart, ends_at: newEnd })
+                .eq("id", booking.id);
+
+              if (!error) {
+                response = JSON.stringify({
+                  success: true,
+                  message: "Cita reagendada correctamente.",
+                });
+              } else {
+                response = JSON.stringify({
+                  success: false,
+                  error: "Error actualizando la cita en base de datos.",
+                });
+              }
+            } else {
+              response = JSON.stringify({
+                success: false,
+                error:
+                  "No encontré ninguna cita activa con ese número de teléfono.",
+              });
+            }
           }
         }
 
         // F) CANCELAR (REAL)
         else if (fnName === "cancel_booking") {
-          const { data: booking } = await supabase
-            .from("bookings")
-            .select("id")
-            .eq("tenant_id", tenantId)
-            .eq("customer_phone", args.customerPhone || args.phone)
-            .in("status", ["confirmed", "pending"])
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
+          const phoneFilter =
+            args.customerPhone || args.phone || userPhone || null;
 
-          if (booking) {
-            const { error } = await supabase
+          if (!phoneFilter) {
+            response = JSON.stringify({
+              success: false,
+              error:
+                "missing_phone: necesito el teléfono del cliente para cancelar.",
+            });
+          } else {
+            const { data: booking } = await supabase
               .from("bookings")
-              .update({ status: "cancelled" })
-              .eq("id", booking.id);
+              .select("id")
+              .eq("tenant_id", tenantId)
+              .eq("customer_phone", phoneFilter)
+              .in("status", ["confirmed", "pending"])
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
 
-            if (!error) {
-              response = JSON.stringify({
-                success: true,
-                message: "Cita cancelada correctamente.",
-              });
+            if (booking) {
+              const { error } = await supabase
+                .from("bookings")
+                .update({ status: "cancelled" })
+                .eq("id", booking.id);
+
+              if (!error) {
+                response = JSON.stringify({
+                  success: true,
+                  message: "Cita cancelada correctamente.",
+                });
+              } else {
+                response = JSON.stringify({
+                  success: false,
+                  error: "Error cancelando la cita.",
+                });
+              }
             } else {
               response = JSON.stringify({
                 success: false,
-                error: "Error cancelando la cita.",
+                error: "No encontré ninguna cita activa para cancelar.",
               });
             }
-          } else {
-            response = JSON.stringify({
-              success: false,
-              error: "No encontré ninguna cita activa para cancelar.",
-            });
           }
         }
 
@@ -833,7 +877,7 @@ async function updateSessionDB(tenantId, updateData) {
       .eq("tenant_id", tenantId)
       .maybeSingle();
 
-  if (selectError) {
+    if (selectError) {
       console.error(
         "[updateSessionDB] Error select whatsapp_sessions:",
         selectError
@@ -1002,7 +1046,7 @@ async function getOrCreateSession(tenantId) {
     const msg = m.messages?.[0];
     if (!msg?.message || msg.key.fromMe) return;
     const remoteJid = msg.key.remoteJid;
-    if (remoteJid.includes("@g.us")) return;
+    if (!remoteJid || remoteJid.includes("@g.us")) return;
 
     const text =
       msg.message.conversation ||
@@ -1025,7 +1069,13 @@ async function getOrCreateSession(tenantId) {
 
     const history = convo.history || [];
 
-    const reply = await generateReply(text, tenantId, pushName, history);
+    const reply = await generateReply(
+      text,
+      tenantId,
+      pushName,
+      history,
+      userPhone
+    );
     if (reply) {
       await sock.sendMessage(remoteJid, { text: reply });
 
