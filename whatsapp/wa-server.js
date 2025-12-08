@@ -10,9 +10,13 @@ const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
 const fs = require("fs");
+const axios = require("axios"); // 👈 nuevo: para llamar al bot de Next
 
 // Importaciones de Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
+
+// 👇 nuevo: estado de conversación en Supabase
+const convoState = require("./conversationState");
 
 // ---------------------------------------------------------------------
 // CONFIGURACIÓN GLOBAL
@@ -20,7 +24,7 @@ const { startOfWeek, addDays, startOfDay } = require("date-fns");
 
 const app = express();
 app.use(express.json());
-const PORT = process.env.PORT || 4001;
+const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
 // 🔥 AJUSTE DE ZONA HORARIA (CRÍTICO)
 const SERVER_OFFSET_HOURS = 4;
@@ -40,7 +44,7 @@ const logger = P({
 });
 
 const supabase = createClient(
-  process.env.SUPABASE_URL,
+  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
@@ -58,7 +62,8 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const sessions = new Map();
 
 // Definimos la carpeta donde se guardarán las sesiones (Persistencia)
-const WA_SESSIONS_ROOT = process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
+const WA_SESSIONS_ROOT =
+  process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
 
 // =====================================================================
 // 1. LÓGICA DE SCHEDULING
@@ -766,7 +771,9 @@ async function generateReply(
               const newStart = args.newStartsAtISO;
               const newEnd =
                 args.newEndsAtISO ||
-                new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
+                new Date(
+                  new Date(newStart).getTime() + 60 * 60000
+                ).toISOString();
 
               const { error } = await supabase
                 .from("bookings")
@@ -866,7 +873,7 @@ async function generateReply(
 }
 
 // ---------------------------------------------------------------------
-// 7. ACTUALIZAR ESTADO DB
+// 7. ACTUALIZAR ESTADO DB (whatsapp_sessions + tenants.wa_connected)
 // ---------------------------------------------------------------------
 
 async function updateSessionDB(tenantId, updateData) {
@@ -940,7 +947,141 @@ async function updateSessionDB(tenantId, updateData) {
 }
 
 // ---------------------------------------------------------------------
-// 8. AUTH STATE MONOLÍTICO
+// 8. HELPERS NUEVOS: customers + eventos de booking
+// ---------------------------------------------------------------------
+
+async function getOrCreateCustomer(tenantId, phoneNumber) {
+  if (!tenantId || !phoneNumber) {
+    throw new Error(
+      "[wa-server] tenantId y phoneNumber requeridos para customer."
+    );
+  }
+
+  // Buscar
+  const { data, error } = await supabase
+    .from("customers") // 👈 asegúrate de que la tabla se llame así
+    .select("id")
+    .eq("tenant_id", tenantId)
+    .eq("phone_number", phoneNumber)
+    .maybeSingle();
+
+  if (error) {
+    logger.error("[wa-server] Error al buscar customer:", error);
+    throw error;
+  }
+
+  if (data) return data.id;
+
+  // Crear
+  const { data: created, error: insertError } = await supabase
+    .from("customers")
+    .insert({
+      tenant_id: tenantId,
+      phone_number: phoneNumber,
+    })
+    .select("id")
+    .single();
+
+  if (insertError) {
+    logger.error("[wa-server] Error al crear customer:", insertError);
+    throw insertError;
+  }
+
+  return created.id;
+}
+
+function buildBookingEventFromMessage(text, session) {
+  const lower = (text || "").toLowerCase().trim();
+  const currentFlow = session.current_flow;
+  const step = session.step;
+
+  // Si usuario dice cancelar flujo
+  if (lower === "cancelar" || lower === "olvídalo" || lower === "olvidalo") {
+    return { type: "CANCEL_FLOW" };
+  }
+
+  // 1) Si no hay flujo activo → iniciar booking
+  if (!currentFlow) {
+    if (
+      lower.includes("cita") ||
+      lower.includes("agendar") ||
+      lower.includes("agenda") ||
+      lower.includes("corte") ||
+      lower.includes("barba")
+    ) {
+      return { type: "START_BOOKING" };
+    }
+
+    // Fallback: arrancar booking igual
+    return { type: "START_BOOKING" };
+  }
+
+  // 2) Flujos activos de BOOKING
+  if (currentFlow === "BOOKING") {
+    if (step === "SELECT_SERVICE") {
+      // 🔴 Aquí conecta con tus services reales
+      // De momento: IDs simbólicos a reemplazar por UUID reales
+      let serviceId = null;
+
+      if (lower.includes("corte") && lower.includes("barba")) {
+        serviceId = "service_corte_barba"; // TODO: reemplazar
+      } else if (lower.includes("corte")) {
+        serviceId = "service_corte"; // TODO: reemplazar
+      } else if (lower.includes("barba")) {
+        serviceId = "service_barba"; // TODO: reemplazar
+      }
+
+      return {
+        type: "SERVICE_PROVIDED",
+        serviceId,
+      };
+    }
+
+    if (step === "SELECT_DATE") {
+      const today = new Date();
+      const yyyy = today.getFullYear();
+      const mm = String(today.getMonth() + 1).padStart(2, "0");
+      const dd = String(today.getDate()).padStart(2, "0");
+      let targetDate = `${yyyy}-${mm}-${dd}`;
+
+      const isTomorrow =
+        lower.includes("mañana") || lower.includes("manana");
+
+      if (isTomorrow) {
+        const t2 = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+        const yyyy2 = t2.getFullYear();
+        const mm2 = String(t2.getMonth() + 1).padStart(2, "0");
+        const dd2 = String(t2.getDate()).padStart(2, "0");
+        targetDate = `${yyyy2}-${mm2}-${dd2}`;
+      }
+
+      return {
+        type: "DATE_PROVIDED",
+        date: targetDate,
+      };
+    }
+
+    if (step === "SELECT_HOUR") {
+      const num = parseInt(lower, 10);
+      if (!isNaN(num)) {
+        return {
+          type: "HOUR_PROVIDED",
+          slotIndex: num,
+        };
+      }
+
+      return {
+        type: "HOUR_PROVIDED",
+      };
+    }
+  }
+
+  // Fallback
+  return { type: "START_BOOKING" };
+}
+
+// ---------------------------------------------------------------------
+// 9. AUTH STATE MONOLÍTICO
 // ---------------------------------------------------------------------
 
 /**
@@ -964,7 +1105,7 @@ async function useSupabaseAuthState(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 9. CORE WHATSAPP
+// 10. CORE WHATSAPP (Baileys + integración bot Next)
 // ---------------------------------------------------------------------
 
 async function getOrCreateSession(tenantId) {
@@ -1045,48 +1186,140 @@ async function getOrCreateSession(tenantId) {
 
   sock.ev.on("creds.update", saveCreds);
 
+  // 🔥 Handler de mensajes: ahora primero intentamos /api/whatsapp-bot
   sock.ev.on("messages.upsert", async (m) => {
-    const msg = m.messages?.[0];
-    if (!msg?.message || msg.key.fromMe) return;
-    const remoteJid = msg.key.remoteJid;
-    if (!remoteJid || remoteJid.includes("@g.us")) return;
+    try {
+      const msg = m.messages?.[0];
+      if (!msg?.message || msg.key.fromMe) return;
+      const remoteJid = msg.key.remoteJid;
+      if (!remoteJid || remoteJid.includes("@g.us")) return;
 
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
-    if (!text) return;
+      const text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
+      if (!text) return;
 
-    const pushName = msg.pushName || "Cliente";
-    const userPhone = remoteJid.split("@")[0];
+      const pushName = msg.pushName || "Cliente";
+      const userPhone = remoteJid.split("@")[0];
 
-    // --- Memoria por conversación (teléfono) ---
-    if (!info.conversations) {
-      info.conversations = new Map();
-    }
-    let convo = info.conversations.get(userPhone);
-    if (!convo) {
-      convo = { history: [] };
-      info.conversations.set(userPhone, convo);
-    }
+      // --- Memoria por conversación (teléfono) en RAM (para OpenAI fallback) ---
+      if (!info.conversations) {
+        info.conversations = new Map();
+      }
+      let convo = info.conversations.get(userPhone);
+      if (!convo) {
+        convo = { history: [] };
+        info.conversations.set(userPhone, convo);
+      }
+      const history = convo.history || [];
 
-    const history = convo.history || [];
+      // ---------------------------
+      // 1) Estado de conversación en DB (conversation_sessions)
+      // ---------------------------
+      const convoSession =
+        await convoState.getOrCreateSession(tenantId, userPhone);
 
-    const reply = await generateReply(
-      text,
-      tenantId,
-      pushName,
-      history,
-      userPhone
-    );
-    if (reply) {
-      await sock.sendMessage(remoteJid, { text: reply });
+      // ---------------------------
+      // 2) Customer en DB
+      // ---------------------------
+      const customerId = await getOrCreateCustomer(tenantId, userPhone);
 
-      // Actualizamos historial: user + assistant
+      // ---------------------------
+      // 3) Evento de booking
+      // ---------------------------
+      const event = buildBookingEventFromMessage(text, convoSession);
+
+      // ---------------------------
+      // 4) Llamar al bot de Next (/api/whatsapp-bot)
+      // ---------------------------
+      const botApiUrl = process.env.BOT_API_URL;
+      let replyText = null;
+      let newState = null;
+
+      if (!botApiUrl) {
+        logger.error("[wa-server] BOT_API_URL no está configurado.");
+      } else {
+        const payload = {
+          tenantId,
+          customerId,
+          phoneNumber: userPhone,
+          text,
+          state: {
+            current_flow: convoSession.current_flow,
+            step: convoSession.step,
+            payload: convoSession.payload || {},
+          },
+          event,
+        };
+
+        try {
+          const response = await axios.post(botApiUrl, payload, {
+            timeout: 15000,
+          });
+
+          if (response.data && response.data.ok) {
+            replyText = response.data.reply;
+            newState = response.data.newState;
+          } else {
+            logger.error(
+              "[wa-server] Respuesta no OK de /api/whatsapp-bot:",
+              response.data
+            );
+          }
+        } catch (err) {
+          logger.error(
+            "[wa-server] Error al llamar a /api/whatsapp-bot:",
+            err?.response?.data || err.message
+          );
+        }
+      }
+
+      // ---------------------------
+      // 5) Fallback a OpenAI tools si algo falla
+      // ---------------------------
+      if (!replyText) {
+        const fallback = await generateReply(
+          text,
+          tenantId,
+          pushName,
+          history,
+          userPhone
+        );
+        replyText =
+          fallback ||
+          "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
+        newState = {
+          current_flow: convoSession.current_flow,
+          step: convoSession.step,
+          payload: convoSession.payload || {},
+        };
+      }
+
+      // ---------------------------
+      // 6) Actualizar estado de conversation_sessions en DB
+      // ---------------------------
+      if (newState) {
+        try {
+          await convoState.updateSession(convoSession.id, {
+            current_flow: newState.current_flow,
+            step: newState.step,
+            payload: newState.payload,
+          });
+        } catch (err) {
+          logger.error("[wa-server] Error al actualizar conversación:", err);
+        }
+      }
+
+      // ---------------------------
+      // 7) Enviar respuesta por WhatsApp
+      // ---------------------------
+      await sock.sendMessage(remoteJid, { text: replyText });
+
+      // Guardar historial para OpenAI (solo si usamos fallback)
       history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: reply });
+      history.push({ role: "assistant", content: replyText });
 
-      // Limitamos tamaño del historial (por ejemplo, últimas 10 interacciones = 20 mensajes)
       const MAX_MESSAGES = 20;
       if (history.length > MAX_MESSAGES) {
         history.splice(0, history.length - MAX_MESSAGES);
@@ -1094,6 +1327,8 @@ async function getOrCreateSession(tenantId) {
 
       convo.history = history;
       info.conversations.set(userPhone, convo);
+    } catch (e) {
+      logger.error("[wa-server] Error en messages.upsert:", e);
     }
   });
 
@@ -1101,7 +1336,7 @@ async function getOrCreateSession(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 10. API ROUTES BÁSICAS
+// 11. API ROUTES BÁSICAS
 // ---------------------------------------------------------------------
 
 app.get("/health", (req, res) =>
@@ -1238,7 +1473,7 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 11. API DE CONSULTA DE DISPONIBILIDAD
+// 12. API DE CONSULTA DE DISPONIBILIDAD
 // ---------------------------------------------------------------------
 
 app.get("/api/v1/availability", async (req, res) => {
@@ -1284,7 +1519,7 @@ app.get("/api/v1/availability", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 12. API DE CREACIÓN DE CITA
+// 13. API DE CREACIÓN DE CITA
 // ---------------------------------------------------------------------
 
 app.post("/api/v1/create-booking", async (req, res) => {
@@ -1406,7 +1641,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 13. API DE REAGENDAMIENTO
+// 14. API DE REAGENDAMIENTO
 // ---------------------------------------------------------------------
 
 app.post("/api/v1/reschedule-booking", async (req, res) => {
@@ -1416,7 +1651,7 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
     newStartsAtISO,
     newEndsAtISO,
     extraVariables,
-  } = req.body || {};
+  } = req.body || {} ;
 
   if (!tenantId || !bookingId || !newStartsAtISO || !newEndsAtISO) {
     return res.status(400).json({
@@ -1534,7 +1769,7 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 14. API DE CANCELACIÓN
+// 15. API DE CANCELACIÓN
 // ---------------------------------------------------------------------
 
 app.post("/api/v1/cancel-booking", async (req, res) => {
@@ -1637,7 +1872,7 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 15. AUTO-RECONEXIÓN (restoreSessions)
+// 16. AUTO-RECONEXIÓN (restoreSessions)
 // ---------------------------------------------------------------------
 
 async function restoreSessions() {
@@ -1680,7 +1915,7 @@ async function restoreSessions() {
 }
 
 // ---------------------------------------------------------------------
-// 16. START SERVER
+// 17. START SERVER
 // ---------------------------------------------------------------------
 
 app.listen(PORT, () => {
