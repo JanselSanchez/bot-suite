@@ -9,7 +9,7 @@ const P = require("pino");
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
-const fs = require("fs"); // Agregamos fs para manejar carpetas si hace falta
+const fs = require("fs");
 
 // Importaciones de Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -25,6 +25,9 @@ const PORT = process.env.PORT || 4001;
 // 🔥 AJUSTE DE ZONA HORARIA (CRÍTICO)
 // Sumamos 4 horas para que el servidor UTC coincida con la hora de apertura en RD (UTC-4)
 const SERVER_OFFSET_HOURS = 4;
+
+// Timezone configurable (fallback RD)
+const TIMEZONE_LOCALE = process.env.TIMEZONE_LOCALE || "America/Santo_Domingo";
 
 const logger = P({
   transport: {
@@ -82,7 +85,9 @@ function weeklyOpenWindows(weekStart, businessHours) {
 
     if (dayConfig && dayConfig.open_time && dayConfig.close_time) {
       const { h: openH, m: openM } = hmsToParts(toHHMM(dayConfig.open_time));
-      const { h: closeH, m: closeM } = hmsToParts(toHHMM(dayConfig.close_time));
+      const { h: closeH, m: closeM } = hmsToParts(
+        toHHMM(dayConfig.close_time)
+      );
 
       // 🔥 CORRECCIÓN UTC: Sumamos el offset a la hora de apertura/cierre
       const start = new Date(currentDayCursor);
@@ -265,10 +270,7 @@ async function getAvailableSlots(
 }
 
 // ---------------------------------------------------------------------
-// 4. DEFINICIÓN DE TOOLS (OPENAI)
-// ---------------------------------------------------------------------
-// ---------------------------------------------------------------------
-// 5. DEFINICIÓN DE TOOLS (CEREBRO UNIVERSAL)
+// 4. DEFINICIÓN DE TOOLS (CEREBRO UNIVERSAL)
 // ---------------------------------------------------------------------
 
 const tools = [
@@ -276,7 +278,8 @@ const tools = [
     type: "function",
     function: {
       name: "check_availability",
-      description: "Consulta disponibilidad. Úsalo para ver huecos libres para citas o reservas.",
+      description:
+        "Consulta disponibilidad. Úsalo para ver huecos libres para citas o reservas.",
       parameters: {
         type: "object",
         properties: {
@@ -290,17 +293,26 @@ const tools = [
     type: "function",
     function: {
       name: "create_booking",
-      description: "Crea una Cita, Reserva de Mesa o Pedido Programado. NO pidas serviceId si el cliente no lo especifica.",
+      description:
+        "Crea una Cita, Reserva de Mesa o Pedido Programado. NO pidas serviceId si el cliente no lo especifica.",
       parameters: {
         type: "object",
         properties: {
           customerName: { type: "string" },
           phone: { type: "string" },
           startsAtISO: { type: "string" },
-          notes: { type: "string", description: "Motivo de la cita, cantidad de personas (si es restaurante) o detalles." },
-          serviceId: { type: "string", description: "Opcional. Solo si el cliente eligió un servicio específico del catálogo." }
+          notes: {
+            type: "string",
+            description:
+              "Motivo de la cita, cantidad de personas (si es restaurante) o detalles.",
+          },
+          serviceId: {
+            type: "string",
+            description:
+              "Opcional. Solo si el cliente eligió un servicio específico del catálogo.",
+          },
         },
-        required: ["phone", "startsAtISO"], 
+        required: ["phone", "startsAtISO"],
       },
     },
   },
@@ -308,7 +320,8 @@ const tools = [
     type: "function",
     function: {
       name: "get_catalog",
-      description: "Consulta el menú, servicios o productos del negocio para dar precios y detalles.",
+      description:
+        "Consulta el menú, servicios o productos del negocio para dar precios y detalles.",
       parameters: { type: "object", properties: {}, required: [] },
     },
   },
@@ -316,14 +329,60 @@ const tools = [
     type: "function",
     function: {
       name: "human_handoff",
-      description: "Úsalo cuando el cliente pida hablar con una persona real o si no sabes la respuesta.",
+      description:
+        "Úsalo cuando el cliente pida hablar con una persona real o si no sabes la respuesta.",
       parameters: { type: "object", properties: {}, required: [] },
     },
-  }
+  },
+  {
+    type: "function",
+    function: {
+      name: "reschedule_booking",
+      description:
+        "Reagenda una cita activa del cliente usando su teléfono y nueva fecha/hora.",
+      parameters: {
+        type: "object",
+        properties: {
+          customerPhone: {
+            type: "string",
+            description: "Teléfono del cliente (WhatsApp).",
+          },
+          newStartsAtISO: {
+            type: "string",
+            description: "Nueva fecha/hora inicio en formato ISO 8601.",
+          },
+          newEndsAtISO: {
+            type: "string",
+            description:
+              "Nueva fecha/hora fin en formato ISO 8601. Opcional; si no se envía se asume 1 hora.",
+          },
+        },
+        required: ["customerPhone", "newStartsAtISO"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "cancel_booking",
+      description:
+        "Cancela la última cita activa de un cliente usando su teléfono.",
+      parameters: {
+        type: "object",
+        properties: {
+          customerPhone: {
+            type: "string",
+            description: "Teléfono del cliente (WhatsApp).",
+          },
+        },
+        required: ["customerPhone"],
+      },
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------
-// 6. IA CON CEREBRO DINÁMICO (Lee la DB para saber qué ser)
+// 5. IA CON CEREBRO DINÁMICO (Lee la DB para saber qué ser)
 // ---------------------------------------------------------------------
 
 async function generateReply(text, tenantId, pushName) {
@@ -337,28 +396,36 @@ async function generateReply(text, tenantId, pushName) {
   const businessType = profile?.business_type || "general"; // 'restaurante', 'clinica', 'barberia', 'tienda'
   const botName = profile?.bot_name || "Asistente Virtual";
   const botTone = profile?.bot_tone || "Amable y profesional";
-  const customRules = profile?.custom_instructions || "Ayuda al cliente a agendar o comprar.";
+  const customRules =
+    profile?.custom_instructions || "Ayuda al cliente a agendar o comprar.";
   const humanPhone = profile?.human_handoff_phone || null;
 
   const now = new Date();
-  // Usamos la variable global TIMEZONE_LOCALE que definimos arriba (o default a SD)
-  const tz = typeof TIMEZONE_LOCALE !== 'undefined' ? TIMEZONE_LOCALE : "America/Santo_Domingo";
-  const currentDateStr = now.toLocaleString("es-DO", { timeZone: tz, dateStyle: "full", timeStyle: "short" });
+  const tz = TIMEZONE_LOCALE || "America/Santo_Domingo";
+  const currentDateStr = now.toLocaleString("es-DO", {
+    timeZone: tz,
+    dateStyle: "full",
+    timeStyle: "short",
+  });
 
   // 2. Construimos el Contexto según el TIPO de negocio
   let typeContext = "";
   switch (businessType) {
-    case 'restaurante':
-      typeContext = "Eres el host de un restaurante. Tu objetivo es RESERVAR MESAS o TOMAR PEDIDOS. Cuando agendes, en 'notes' guarda la cantidad de personas.";
+    case "restaurante":
+      typeContext =
+        "Eres el host de un restaurante. Tu objetivo es RESERVAR MESAS o TOMAR PEDIDOS. Cuando agendes, en 'notes' guarda la cantidad de personas.";
       break;
-    case 'clinica':
-      typeContext = "Eres recepcionista médico. Tu objetivo es agendar CITAS. Sé formal y discreto. Pregunta brevemente el motivo y guárdalo en 'notes'.";
+    case "clinica":
+      typeContext =
+        "Eres recepcionista médico. Tu objetivo es agendar CITAS. Sé formal y discreto. Pregunta brevemente el motivo y guárdalo en 'notes'.";
       break;
-    case 'barberia':
-      typeContext = "Eres el asistente de una barbería. Agenda citas. Si no especifican barbero, agenda con cualquiera.";
+    case "barberia":
+      typeContext =
+        "Eres el asistente de una barbería. Agenda citas. Si no especifican barbero, agenda con cualquiera.";
       break;
     default:
-      typeContext = "Eres un asistente general de negocios. Tu objetivo es AGENDAR citas o responder dudas.";
+      typeContext =
+        "Eres un asistente general de negocios. Tu objetivo es AGENDAR citas o responder dudas.";
   }
 
   const systemPrompt = `
@@ -406,19 +473,38 @@ async function generateReply(text, tenantId, pushName) {
 
         // A) CONSULTAR DISPONIBILIDAD
         if (fnName === "check_availability") {
-          const slots = await getAvailableSlots(tenantId, null, new Date(args.requestedDate), 7);
+          const slots = await getAvailableSlots(
+            tenantId,
+            null,
+            new Date(args.requestedDate),
+            7
+          );
           if (slots.length > 0) {
-            // Formatear bonito la lista
-            const list = slots.slice(0, 12).map((s, i) => {
-              const timeStr = s.start.toLocaleString("es-DO", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: true });
-              return `${i + 1}) ${timeStr}`;
-            }).join("\n");
-            response = JSON.stringify({ message: "Aquí tienes los horarios disponibles (pídeles que elijan el número):", slots: list });
+            const list = slots
+              .slice(0, 12)
+              .map((s, i) => {
+                const timeStr = s.start.toLocaleString("es-DO", {
+                  timeZone: tz,
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  hour12: true,
+                });
+                return `${i + 1}) ${timeStr}`;
+              })
+              .join("\n");
+            response = JSON.stringify({
+              message:
+                "Aquí tienes los horarios disponibles (pídeles que elijan el número):",
+              slots: list,
+            });
           } else {
-            response = JSON.stringify({ message: "No hay horarios disponibles para esa fecha. Dile al cliente que intente otro día." });
+            response = JSON.stringify({
+              message:
+                "No hay horarios disponibles para esa fecha. Dile al cliente que intente otro día.",
+            });
           }
-        } 
-        
+        }
+
         // B) CONSULTAR CATÁLOGO (Universal)
         else if (fnName === "get_catalog") {
           const { data: items } = await supabase
@@ -426,111 +512,157 @@ async function generateReply(text, tenantId, pushName) {
             .select("name, price_cents, description, type")
             .eq("tenant_id", tenantId)
             .eq("is_active", true);
-            
+
           if (items && items.length > 0) {
-             const list = items.map(i => {
+            const list = items
+              .map((i) => {
                 const price = (i.price_cents / 100).toFixed(0);
-                return `- ${i.name} ($${price}): ${i.description || ''}`;
-             }).join("\n");
-             response = JSON.stringify({ catalog: list });
+                return `- ${i.name} ($${price}): ${i.description || ""}`;
+              })
+              .join("\n");
+            response = JSON.stringify({ catalog: list });
           } else {
-             // Si está vacío, la IA improvisa con las Custom Instructions
-             response = JSON.stringify({ message: "El catálogo está vacío en el sistema. Responde basándote solo en las Reglas del Negocio (custom_instructions) o sugiere contactar al humano." });
+            response = JSON.stringify({
+              message:
+                "El catálogo está vacío en el sistema. Responde basándote solo en las Reglas del Negocio (custom_instructions) o sugiere contactar al humano.",
+            });
           }
         }
 
         // C) CREAR CITA / RESERVA
         else if (fnName === "create_booking") {
-          // Si no nos dan fecha de fin, asumimos 1 hora por defecto (lógica segura)
           const start = new Date(args.startsAtISO);
-          const endISO = args.endsAtISO || new Date(start.getTime() + 60 * 60000).toISOString();
+          const endISO =
+            args.endsAtISO ||
+            new Date(start.getTime() + 60 * 60000).toISOString();
 
-          const { data: booking, error } = await supabase.from("bookings").insert([{
-            tenant_id: tenantId,
-            resource_id: null, // Se asignará automáticamente o quedará null
-            service_id: args.serviceId || null,
-            customer_name: args.customerName || pushName,
-            customer_phone: args.phone, 
-            starts_at: args.startsAtISO,
-            ends_at: endISO,
-            status: "confirmed",
-            notes: args.notes || "Agendado por Bot"
-          }]).select("id").single();
-          
+          const { data: booking, error } = await supabase
+            .from("bookings")
+            .insert([
+              {
+                tenant_id: tenantId,
+                resource_id: null,
+                service_id: args.serviceId || null,
+                customer_name: args.customerName || pushName,
+                customer_phone: args.phone,
+                starts_at: args.startsAtISO,
+                ends_at: endISO,
+                status: "confirmed",
+                notes: args.notes || "Agendado por Bot",
+              },
+            ])
+            .select("id")
+            .single();
+
           if (!error) {
-             response = JSON.stringify({ success: true, bookingId: booking.id, message: "Reserva/Cita creada exitosamente en el sistema." });
+            response = JSON.stringify({
+              success: true,
+              bookingId: booking.id,
+              message: "Reserva/Cita creada exitosamente en el sistema.",
+            });
           } else {
-             response = JSON.stringify({ success: false, error: "Error guardando en base de datos: " + error.message });
+            response = JSON.stringify({
+              success: false,
+              error:
+                "Error guardando en base de datos: " +
+                (error?.message || "desconocido"),
+            });
           }
         }
 
         // D) PASAR A HUMANO
         else if (fnName === "human_handoff") {
-            if (humanPhone) {
-                // Formateamos el link de WhatsApp
-                const clean = humanPhone.replace(/\D/g,'');
-                response = JSON.stringify({ message: `Dile al cliente que puede escribir directamente a nuestro encargado aquí: https://wa.me/${clean}` });
-            } else {
-                response = JSON.stringify({ message: "No tengo un número de contacto directo configurado. Dile que deje su mensaje y lo contactaremos." });
-            }
+          if (humanPhone) {
+            const clean = humanPhone.replace(/\D/g, "");
+            response = JSON.stringify({
+              message: `Dile al cliente que puede escribir directamente a nuestro encargado aquí: https://wa.me/${clean}`,
+            });
+          } else {
+            response = JSON.stringify({
+              message:
+                "No tengo un número de contacto directo configurado. Dile que deje su mensaje y lo contactaremos.",
+            });
+          }
         }
-        
-        // E) REAGENDAR / CANCELAR (Stub simple)
-   // E) REAGENDAR (REAL)
+
+        // E) REAGENDAR (REAL)
         else if (fnName === "reschedule_booking") {
-             // 1. Buscamos la cita del cliente
-             // Nota: En producción idealmente pedirías el bookingId, pero aquí buscamos por teléfono la última activa
-             const { data: booking } = await supabase.from("bookings")
-                .select("id")
-                .eq("tenant_id", tenantId)
-                .eq("customer_phone", args.customerPhone || args.phone) // El bot debe haber pedido el teléfono
-                .in("status", ["confirmed", "pending"])
-                .order("created_at", { ascending: false })
-                .limit(1)
-                .maybeSingle();
+          const { data: booking } = await supabase
+            .from("bookings")
+            .select("id")
+            .eq("tenant_id", tenantId)
+            .eq("customer_phone", args.customerPhone || args.phone)
+            .in("status", ["confirmed", "pending"])
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
 
-             if (booking) {
-                 const newStart = args.newStartsAtISO;
-                 const newEnd = args.newEndsAtISO || new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
-                 
-                 const { error } = await supabase.from("bookings")
-                    .update({ starts_at: newStart, ends_at: newEnd })
-                    .eq("id", booking.id);
+          if (booking) {
+            const newStart = args.newStartsAtISO;
+            const newEnd =
+              args.newEndsAtISO ||
+              new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
 
-                 if (!error) {
-                     response = JSON.stringify({ success: true, message: "Cita reagendada correctamente." });
-                 } else {
-                     response = JSON.stringify({ success: false, error: "Error actualizando la cita en base de datos." });
-                 }
-             } else {
-                 response = JSON.stringify({ success: false, error: "No encontré ninguna cita activa con ese número de teléfono." });
-             }
+            const { error } = await supabase
+              .from("bookings")
+              .update({ starts_at: newStart, ends_at: newEnd })
+              .eq("id", booking.id);
+
+            if (!error) {
+              response = JSON.stringify({
+                success: true,
+                message: "Cita reagendada correctamente.",
+              });
+            } else {
+              response = JSON.stringify({
+                success: false,
+                error: "Error actualizando la cita en base de datos.",
+              });
+            }
+          } else {
+            response = JSON.stringify({
+              success: false,
+              error:
+                "No encontré ninguna cita activa con ese número de teléfono.",
+            });
+          }
         }
 
         // F) CANCELAR (REAL)
         else if (fnName === "cancel_booking") {
-             const { data: booking } = await supabase.from("bookings")
-                .select("id")
-                .eq("tenant_id", tenantId)
-                .eq("customer_phone", args.customerPhone || args.phone)
-                .in("status", ["confirmed", "pending"])
-                .order("created_at", { ascending: false })
-                .limit(1)
-                .maybeSingle();
+          const { data: booking } = await supabase
+            .from("bookings")
+            .select("id")
+            .eq("tenant_id", tenantId)
+            .eq("customer_phone", args.customerPhone || args.phone)
+            .in("status", ["confirmed", "pending"])
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
 
-             if (booking) {
-                 const { error } = await supabase.from("bookings")
-                    .update({ status: "cancelled" })
-                    .eq("id", booking.id);
+          if (booking) {
+            const { error } = await supabase
+              .from("bookings")
+              .update({ status: "cancelled" })
+              .eq("id", booking.id);
 
-                 if (!error) {
-                     response = JSON.stringify({ success: true, message: "Cita cancelada correctamente." });
-                 } else {
-                     response = JSON.stringify({ success: false, error: "Error cancelando la cita." });
-                 }
-             } else {
-                 response = JSON.stringify({ success: false, error: "No encontré ninguna cita activa para cancelar." });
-             }
+            if (!error) {
+              response = JSON.stringify({
+                success: true,
+                message: "Cita cancelada correctamente.",
+              });
+            } else {
+              response = JSON.stringify({
+                success: false,
+                error: "Error cancelando la cita.",
+              });
+            }
+          } else {
+            response = JSON.stringify({
+              success: false,
+              error: "No encontré ninguna cita activa para cancelar.",
+            });
+          }
         }
 
         messages.push({
@@ -549,170 +681,12 @@ async function generateReply(text, tenantId, pushName) {
       return finalReply.choices[0].message.content.trim();
     }
 
-    return message.content.trim();
+    return message.content?.trim() || "";
   } catch (err) {
     logger.error("Error OpenAI:", err);
     return null;
   }
 }
-
-  const messages = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: cleanText },
-  ];
-
-  try {
-    let completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages,
-      tools,
-      tool_choice: "auto",
-    });
-
-    let message = completion.choices[0].message;
-
-    if (message.tool_calls) {
-      messages.push(message);
-
-      for (const toolCall of message.tool_calls) {
-        const functionName = toolCall.function.name;
-        const functionArgs = JSON.parse(toolCall.function.arguments);
-        let functionResponse;
-
-        if (functionName === "check_availability") {
-          const slots = await getAvailableSlots(
-            tenantId,
-            functionArgs.resourceId || null,
-            new Date(functionArgs.requestedDate),
-            7
-          );
-          if (slots.length > 0) {
-            const formattedSlots = slots
-              .slice(0, 15)
-              .map((s) =>
-                s.start.toLocaleString("es-DO", {
-                  weekday: "short",
-                  day: "numeric",
-                  hour: "2-digit",
-                  minute: "2-digit",
-                  hour12: true,
-                })
-              )
-              .join(", ");
-            functionResponse = JSON.stringify({
-              available_slots: formattedSlots,
-            });
-          } else {
-            functionResponse = JSON.stringify({
-              available_slots:
-                "No hay horarios disponibles. (Verifica si la tienda cerró)",
-            });
-          }
-        } else if (functionName === "create_booking") {
-          const finalResourceId = functionArgs.resourceId || null;
-          const finalCustomerName =
-            functionArgs.customerName || pushName || "Cliente WhatsApp";
-
-          const { data: booking, error } = await supabase
-            .from("bookings")
-            .insert([
-              {
-                tenant_id: tenantId,
-                service_id: functionArgs.serviceId || null,
-                resource_id: finalResourceId,
-                customer_name: finalCustomerName,
-                customer_phone: functionArgs.phone,
-                starts_at: functionArgs.startsAtISO,
-                ends_at: functionArgs.endsAtISO,
-                status: "confirmed",
-                notes: functionArgs.notes || null,
-              },
-            ])
-            .select("*")
-            .single();
-
-          if (!error && booking) {
-            functionResponse = JSON.stringify({
-              success: true,
-              bookingId: booking.id,
-              assignedName: finalCustomerName,
-            });
-          } else {
-            functionResponse = JSON.stringify({
-              success: false,
-              error: error?.message,
-            });
-          }
-        } else if (
-          functionName === "reschedule_booking" ||
-          functionName === "cancel_booking"
-        ) {
-          const cleanPhone = functionArgs.customerPhone.replace(/\D/g, "");
-          const whatsappPhone = `whatsapp:+${cleanPhone}`;
-
-          let query = supabase
-            .from("bookings")
-            .select("id")
-            .eq("tenant_id", tenantId)
-            .or(
-              `customer_phone.eq.${functionArgs.customerPhone},customer_phone.eq.${whatsappPhone},customer_phone.eq.${cleanPhone}`
-            )
-            .in("status", ["confirmed", "pending"]);
-
-          if (functionArgs.oldBookingDate)
-            query = query.eq("starts_at", functionArgs.oldBookingDate);
-          if (functionArgs.bookingDate)
-            query = query.eq("starts_at", functionArgs.bookingDate);
-
-          const { data: targetBooking } = await query.maybeSingle();
-
-          if (targetBooking) {
-            let err;
-            if (functionName === "cancel_booking") {
-              ({ error: err } = await supabase
-                .from("bookings")
-                .update({ status: "cancelled" })
-                .eq("id", targetBooking.id));
-            } else {
-              ({ error: err } = await supabase
-                .from("bookings")
-                .update({
-                  starts_at: functionArgs.newStartsAtISO,
-                  ends_at: functionArgs.newEndsAtISO,
-                })
-                .eq("id", targetBooking.id));
-            }
-            functionResponse = JSON.stringify({ success: !err });
-          } else {
-            functionResponse = JSON.stringify({
-              success: false,
-              error: "No encontré la cita. Verifica el número y la fecha.",
-            });
-          }
-        }
-
-        messages.push({
-          tool_call_id: toolCall.id,
-          role: "tool",
-          name: functionName,
-          content: functionResponse,
-        });
-      }
-
-      const secondResponse = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages,
-      });
-
-      return secondResponse.choices[0].message.content.trim();
-    }
-
-    return completion.choices[0].message.content.trim();
-  } catch (err) {
-    logger.error("Error OpenAI:", err);
-    return null;
-  }
-
 
 // ---------------------------------------------------------------------
 // 6. ACTUALIZAR ESTADO DB
@@ -722,7 +696,6 @@ async function updateSessionDB(tenantId, updateData) {
   if (!tenantId) return;
 
   try {
-    // 1) Ver si ya existe una fila para este tenant
     const { data: existing, error: selectError } = await supabase
       .from("whatsapp_sessions")
       .select("id")
@@ -737,7 +710,6 @@ async function updateSessionDB(tenantId, updateData) {
       return;
     }
 
-    // 2) Si existe, hacemos UPDATE; si no, INSERT
     if (existing) {
       const { error: updateError } = await supabase
         .from("whatsapp_sessions")
@@ -768,7 +740,6 @@ async function updateSessionDB(tenantId, updateData) {
       }
     }
 
-    // 3) Sincronizamos también la columna wa_connected en tenants (si viene status)
     if (updateData.status) {
       const isConnected = updateData.status === "connected";
       const { error: tenantError } = await supabase
@@ -806,7 +777,6 @@ async function useSupabaseAuthState(tenantId) {
 
   const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
 
-  // Nos aseguramos de que la carpeta exista
   if (!fs.existsSync(sessionFolder)) {
     fs.mkdirSync(sessionFolder, { recursive: true });
   }
@@ -922,20 +892,19 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, active_sessions: sessions.size })
 );
 
-// 🔥🔥🔥 RUTA NUEVA: Esta es la que devuelve el QR a la web 🔥🔥🔥
+// Ruta para que el dashboard lea estado y QR
 app.get("/sessions/:tenantId", async (req, res) => {
   const tenantId = req.params.tenantId;
   const info = sessions.get(tenantId);
 
-  // Si no está en memoria, asumimos desconectado
   if (!info) {
-    return res.json({ 
-      ok: true, 
-      session: { 
-        id: tenantId, 
-        status: "disconnected", 
-        qr_data: null 
-      } 
+    return res.json({
+      ok: true,
+      session: {
+        id: tenantId,
+        status: "disconnected",
+        qr_data: null,
+      },
     });
   }
 
@@ -944,14 +913,13 @@ app.get("/sessions/:tenantId", async (req, res) => {
     session: {
       id: tenantId,
       status: info.status,
-      qr_data: info.qr || null, // Aquí va el string del QR
-      phone_number: info.socket?.user?.id?.split(":")[0] || null
-    }
+      qr_data: info.qr || null,
+      phone_number: info.socket?.user?.id?.split(":")[0] || null,
+    },
   });
 });
-// ---------------------------------------------------------------------
 
-// 👉 Endpoint para iniciar/conectar la sesión de un tenant (botón "Conectar")
+// Endpoint para iniciar/conectar la sesión de un tenant
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
 
@@ -983,7 +951,7 @@ app.post("/sessions/:tenantId/disconnect", async (req, res) => {
 });
 
 /**
- * 🔥 ENDPOINT MAESTRO: Envía la plantilla Y la alarma
+ * ENDPOINT: Envía plantilla + archivo ICS
  */
 app.post("/sessions/:tenantId/send-template", async (req, res) => {
   const { tenantId } = req.params;
