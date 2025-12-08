@@ -1,135 +1,204 @@
 // whatsapp/conversationState.js
-//
-// Helper para manejar conversation_sessions desde el servidor de WhatsApp.
-//
-// - getOrCreateSession(tenantId, phoneNumber)
-// - updateSession(sessionId, patch)
-//
-// Esto se usa desde wa-server.js:
-//   1) recibes el mensaje
-//   2) resuelves tenantId + phoneNumber
-//   3) llamas a getOrCreateSession(...)
-//   4) envías estado al backend / bookingFlow
-//   5) después de procesar respuesta, llamas a updateSession(...)
-//
+// Persistencia de flujo de conversación en Supabase
+// Tablas usadas:
+//  - customers
+//  - conversation_sessions
 
 const { createClient } = require("@supabase/supabase-js");
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn(
-    "[conversationState] Faltan variables NEXT_PUBLIC_SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el entorno."
-  );
+if (!supabaseUrl || !serviceKey) {
+  console.warn("[conversationState] Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en env.");
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: {
-    persistSession: false,
-  },
-});
+const supabase = createClient(supabaseUrl, serviceKey);
 
 /**
- * Obtiene o crea una sesión de conversación para un tenant + phoneNumber.
- *
- * Devuelve la fila completa de conversation_sessions.
+ * Normaliza el teléfono a solo dígitos.
+ */
+function normalizePhone(phone) {
+  if (!phone) return null;
+  return String(phone).replace(/\D/g, "");
+}
+
+/**
+ * Crea o devuelve un customer + session para (tenantId, phone).
+ * Devuelve siempre un objeto de sesión:
+ * {
+ *   id,
+ *   tenant_id,
+ *   phone_number,
+ *   current_flow,
+ *   step,
+ *   payload
+ * }
  */
 async function getOrCreateSession(tenantId, phoneNumber) {
-  if (!tenantId || !phoneNumber) {
-    throw new Error(
-      "[conversationState] tenantId y phoneNumber son obligatorios."
-    );
+  const cleanPhone = normalizePhone(phoneNumber);
+  if (!tenantId || !cleanPhone) {
+    throw new Error("[getOrCreateSession] tenantId y phoneNumber son requeridos");
   }
 
-  // 1) Buscar sesión existente
-  const { data, error } = await supabase
-    .from("conversation_sessions")
-    .select("*")
-    .eq("tenant_id", tenantId)
-    .eq("phone_number", phoneNumber)
-    .maybeSingle();
+  // 1) Asegurar customer
+  let customerId = null;
+  try {
+    const { data: existingCustomer, error: customerErr } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("tenant_id", tenantId)
+      .eq("phone_number", cleanPhone)
+      .maybeSingle();
 
-  if (error) {
-    console.error("[conversationState] Error al buscar sesión:", error);
-    throw error;
+    if (customerErr) {
+      console.error("[getOrCreateSession] Error buscando customer:", customerErr);
+    }
+
+    if (existingCustomer) {
+      customerId = existingCustomer.id;
+    } else {
+      const { data: newCustomer, error: insertCustomerErr } = await supabase
+        .from("customers")
+        .insert([
+          {
+            tenant_id: tenantId,
+            phone_number: cleanPhone,
+          },
+        ])
+        .select("id")
+        .single();
+
+      if (insertCustomerErr) {
+        console.error("[getOrCreateSession] Error insertando customer:", insertCustomerErr);
+      } else {
+        customerId = newCustomer.id;
+      }
+    }
+  } catch (e) {
+    console.error("[getOrCreateSession] Error general en customers:", e);
   }
 
-  if (data) {
-    return data;
+  // 2) Buscar session existente
+  let sessionRow = null;
+  try {
+    const { data: existingSession, error: sessionErr } = await supabase
+      .from("conversation_sessions")
+      .select("*")
+      .eq("tenant_id", tenantId)
+      .eq("phone_number", cleanPhone)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (sessionErr) {
+      console.error("[getOrCreateSession] Error buscando session:", sessionErr);
+    }
+
+    if (existingSession) {
+      // Normalizamos payload
+      const payload =
+        typeof existingSession.payload === "string"
+          ? safeJsonParse(existingSession.payload)
+          : existingSession.payload || {};
+
+      sessionRow = {
+        ...existingSession,
+        payload,
+      };
+    }
+  } catch (e) {
+    console.error("[getOrCreateSession] Error general en sessions:", e);
   }
 
-  // 2) No existe → crear nueva sesión
-  const now = new Date().toISOString();
+  // 3) Si no hay session, crear una nueva
+  if (!sessionRow) {
+    try {
+      const now = new Date().toISOString();
+      const base = {
+        tenant_id: tenantId,
+        phone_number: cleanPhone,
+        current_flow: null,
+        step: null,
+        payload: {},
+        created_at: now,
+        updated_at: now,
+      };
 
-  const { data: created, error: insertError } = await supabase
-    .from("conversation_sessions")
-    .insert({
-      tenant_id: tenantId,
-      phone_number: phoneNumber,
-      current_flow: null,
-      step: null,
-      payload: {},
-      created_at: now,
-      updated_at: now,
-      last_message_at: now,
-    })
-    .select("*")
-    .single();
+      const { data: newSession, error: insertSessionErr } = await supabase
+        .from("conversation_sessions")
+        .insert([base])
+        .select("*")
+        .single();
 
-  if (insertError) {
-    console.error("[conversationState] Error al crear sesión:", insertError);
-    throw insertError;
+      if (insertSessionErr) {
+        console.error("[getOrCreateSession] Error creando session:", insertSessionErr);
+        throw insertSessionErr;
+      }
+
+      sessionRow = {
+        ...newSession,
+        payload: newSession.payload || {},
+      };
+    } catch (e) {
+      console.error("[getOrCreateSession] Error final creando session:", e);
+      throw e;
+    }
   }
 
-  return created;
+  return sessionRow;
+}
+
+function safeJsonParse(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
 }
 
 /**
- * Actualiza una sesión ya existente.
+ * Actualiza la sesión.
+ * Permite dos formas:
+ *  - updateSession(sessionId, fields)
+ *  - updateSession(sessionObject, fields)  (usa sessionObject.id)
  *
- * patch puede incluir:
- *  - current_flow
- *  - step
- *  - payload (objeto serializable)
+ * Los campos permitidos típicos:
+ *  - current_flow (string | null)
+ *  - step (string | null)
+ *  - payload (object)
  */
-async function updateSession(sessionId, patch) {
+async function updateSession(sessionOrId, fields = {}) {
+  if (!sessionOrId) return;
+
+  const sessionId = typeof sessionOrId === "string" ? sessionOrId : sessionOrId.id;
   if (!sessionId) {
-    throw new Error("[conversationState] sessionId es obligatorio en updateSession.");
+    console.warn("[updateSession] Sin sessionId, no se puede actualizar");
+    return;
   }
 
-  const updateFields = {
-    updated_at: new Date().toISOString(),
-    last_message_at: new Date().toISOString(),
-  };
+  const patch = { ...fields, updated_at: new Date().toISOString() };
 
-  if (Object.prototype.hasOwnProperty.call(patch, "current_flow")) {
-    updateFields.current_flow = patch.current_flow;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "step")) {
-    updateFields.step = patch.step;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "payload")) {
-    updateFields.payload = patch.payload;
+  // Si payload viene como objeto, lo guardamos como JSON.
+  if (patch.payload && typeof patch.payload === "object") {
+    patch.payload = patch.payload;
   }
 
-  const { data, error } = await supabase
-    .from("conversation_sessions")
-    .update(updateFields)
-    .eq("id", sessionId)
-    .select("*")
-    .single();
+  try {
+    const { error } = await supabase
+      .from("conversation_sessions")
+      .update(patch)
+      .eq("id", sessionId);
 
-  if (error) {
-    console.error("[conversationState] Error al actualizar sesión:", error);
-    throw error;
+    if (error) {
+      console.error("[updateSession] Error actualizando session:", error);
+    }
+  } catch (e) {
+    console.error("[updateSession] Error general:", e);
   }
-
-  return data;
 }
 
 module.exports = {
-  supabase,
   getOrCreateSession,
   updateSession,
 };
