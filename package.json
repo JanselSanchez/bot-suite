@@ -12,6 +12,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@ai-sdk/openai": "^2.0.80",
     "@radix-ui/react-separator": "^1.1.7",
     "@radix-ui/react-slot": "^1.2.3",
     "@sentry/nextjs": "^10.20.0",
@@ -21,6 +22,7 @@
     "@supabase/supabase-js": "^2.86.2",
     "@tailwindcss/vite": "^4.1.14",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "ai": "^5.0.108",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "concurrently": "^9.1.0",
@@ -45,7 +47,7 @@
     "supabase": "^2.54.11",
     "tailwind-merge": "^3.3.1",
     "twilio": "^5.10.2",
-    "zod": "^4.1.12"
+    "zod": "^4.1.13"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",

@@ -1290,6 +1290,7 @@ async function getOrCreateSession(tenantId) {
       const botApiUrl = process.env.BOT_API_URL;
       let replyText = null;
       let newState = null;
+      let icsData = null; // Variable nueva para capturar el archivo
 
       if (!botApiUrl) {
         logger.error("[wa-server] BOT_API_URL no está configurado.");
@@ -1320,6 +1321,8 @@ async function getOrCreateSession(tenantId) {
           if (response.data && response.data.ok) {
             replyText = response.data.reply;
             newState = response.data.newState;
+            icsData = response.data.icsData; // Capturamos el ICS si viene
+            
             logger.info(
               { tenantId },
               "[wa-server] Respuesta OK de /api/whatsapp-bot"
@@ -1382,6 +1385,19 @@ async function getOrCreateSession(tenantId) {
       // 7) Enviar respuesta por WhatsApp
       // ---------------------------
       await sock.sendMessage(remoteJid, { text: replyText });
+      
+      // 8) Enviar Archivo ICS si vino en la respuesta del Bot
+      if (icsData) {
+          const icsBuffer = Buffer.from(icsData); // Ya es string, lo hacemos buffer
+          await sock.sendMessage(remoteJid, {
+              document: icsBuffer,
+              mimetype: 'text/calendar',
+              fileName: 'cita_confirmada.ics',
+              caption: '📅 Toca aquí para guardar en tu calendario'
+          });
+          logger.info({ tenantId }, "📎 Archivo ICS enviado automáticamente");
+      }
+
       logger.info(
         { tenantId, remoteJid },
         "[wa-server] ✅ Respuesta enviada por WhatsApp"
@@ -1540,6 +1556,70 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
   } catch (e) {
     logger.error(e, "Fallo enviando mensaje");
     res.status(500).json({ error: "Error envío" });
+  }
+});
+
+// ---------------------------------------------------------------------
+// ENDPOINT NUEVO: Enviar Archivos/Media (ICS, PDF, IMG) desde Next.js
+// ---------------------------------------------------------------------
+app.post("/sessions/:tenantId/send-media", async (req, res) => {
+  const { tenantId } = req.params;
+  const { phone, type, base64, fileName, mimetype, caption } = req.body;
+
+  if (!phone || !base64 || !type) {
+    return res.status(400).json({ error: "Faltan datos (phone, base64, type)" });
+  }
+
+  // Verificar sesión
+  let session = sessions.get(tenantId);
+  if (!session || session.status !== "connected") {
+    // Intento rápido de reconexión si está en memoria pero desconectado
+    try { session = await getOrCreateSession(tenantId); } catch (e) {}
+  }
+
+  // Doble chequeo por si falló la reconexión
+  session = sessions.get(tenantId);
+  if (!session || session.status !== "connected") {
+    return res.status(400).json({ error: "Bot no conectado." });
+  }
+
+  const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
+
+  try {
+    // 1. Convertir Base64 a Buffer
+    const mediaBuffer = Buffer.from(base64, 'base64');
+
+    // 2. Construir payload según tipo
+    let messagePayload = {};
+
+    if (type === 'document') {
+      messagePayload = {
+        document: mediaBuffer,
+        mimetype: mimetype || 'application/octet-stream',
+        fileName: fileName || 'archivo.bin',
+        caption: caption || ''
+      };
+    } else if (type === 'image') {
+      messagePayload = {
+        image: mediaBuffer,
+        caption: caption || ''
+      };
+    } else if (type === 'audio') {
+      messagePayload = {
+        audio: mediaBuffer,
+        mimetype: mimetype || 'audio/mp4'
+      };
+    }
+
+    // 3. Enviar con Baileys
+    await session.socket.sendMessage(jid, messagePayload);
+
+    logger.info({ tenantId, phone, type }, "📎 Archivo enviado por API externa");
+    res.json({ ok: true });
+
+  } catch (e) {
+    logger.error(e, "Error enviando media");
+    res.status(500).json({ error: "Error enviando archivo: " + e.message });
   }
 });
 
