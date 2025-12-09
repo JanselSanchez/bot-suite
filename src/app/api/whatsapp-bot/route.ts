@@ -1,9 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
-import { createBookingTool, getMyBookingsTool, cancelBookingTool } from "@/utils/booking-tools";
+import { 
+  createBookingTool, 
+  getMyBookingsTool, 
+  cancelBookingTool, 
+  getServicesTool, 
+  checkAvailabilityTool 
+} from "@/utils/booking-tools";
 
-// Tipado del body que viene de tu servidor de WhatsApp
 interface WhatsappBotRequestBody {
   tenantId: string;
   phoneNumber: string; 
@@ -11,93 +16,88 @@ interface WhatsappBotRequestBody {
   customerName?: string; 
 }
 
+export const maxDuration = 60;
+
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as WhatsappBotRequestBody;
     const { tenantId, phoneNumber, text, customerName } = body;
 
-    // 1. Validaciones básicas
     if (!tenantId || !phoneNumber || !text) {
-      return NextResponse.json(
-        { ok: false, message: "Faltan datos obligatorios (tenantId, phoneNumber, text)." },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, message: "Faltan datos." }, { status: 400 });
     }
 
-    // 2. Definir el "Ahora" para la IA
     const now = new Date().toLocaleString("es-DO", { 
       timeZone: "America/Santo_Domingo",
       dateStyle: "full",
       timeStyle: "short"
     });
 
-    // 3. EL CEREBRO: Llamada a OpenAI con las Tools
     const { text: aiResponse, toolResults } = await generateText({
       model: openai("gpt-4o"), 
       system: `
-        ROL:
-        Eres el asistente virtual del negocio con ID: "${tenantId}".
-        Estás hablando con el cliente: "${customerName || 'Usuario'}" (Tel: ${phoneNumber}).
-        
-        CONTEXTO TEMPORAL:
-        Hoy es: ${now}.
-        Usa esta fecha para calcular referencias relativas (mañana, el viernes, etc).
+        ROL: Eres el asistente de reservas del negocio "${tenantId}".
+        CLIENTE: ${customerName || 'Usuario'} (Tel: ${phoneNumber}).
+        FECHA: ${now}.
 
-        TUS HERRAMIENTAS:
-        Tienes acceso directo a la base de datos para Agendar, Cancelar y Consultar citas.
-        
-        REGLAS DE ORO:
-        1. ID DEL SERVICIO: Si el usuario menciona un servicio, GUARDA mentalmente cuál es.
-        2. AL AGENDAR: Usa la herramienta 'createBooking'. Debes pasar el 'serviceId' correcto. Si no sabes cuál es, pregunta.
-        3. AL CANCELAR: Primero usa 'getMyBookings' para ver qué tiene, luego 'cancelBooking'.
-        
-        TONO:
-        Amable, breve y profesional.
+        OBJETIVO ÚNICO: CONCRETAR LA CITA Y MANDAR EL ARCHIVO.
+
+        REGLAS DE COMPORTAMIENTO (MODO AGRESIVO):
+        1. **PRIORIDAD MÁXIMA: AGENDAR.**
+           - Si el cliente dice una hora ("quiero a las 3"), intenta agendar DE INMEDIATO.
+           - No des vueltas preguntando detalles innecesarios.
+
+        2. **SOBRE EL SERVICIO (ID):**
+           - Intenta buscar el servicio con 'getServices' rápido.
+           - **IMPORTANTE:** Si NO encuentras el servicio o el cliente no fue específico, **NO TE DETENGAS**.
+           - Llama a 'createBooking' enviando 'serviceId': null.
+           - Es mejor guardar una cita "sin servicio especificado" que perder al cliente.
+
+        3. **SOBRE LA DISPONIBILIDAD:**
+           - Si el cliente pregunta "¿qué horas tienes?", usa 'checkAvailability'.
+           - Si el cliente dice "Agéndame a las 4", usa 'createBooking' directamente. Si la base de datos rebota por horario ocupado, entonces ofrécele otros horarios.
+
+        4. **CONFIRMACIÓN:**
+           - Una vez ejecutes 'createBooking' y salga exitoso ("success: true"), dile al cliente: "Listo, cita confirmada. Aquí tienes tu recordatorio." y no digas nada más que pueda confundirlo.
+
+        TONO: Seguro, eficiente y servicial.
       `,
       prompt: text, 
       
-      // Forzamos 'as any' para evitar conflictos de versiones de TS
       tools: {
+        getServices: getServicesTool as any,
+        checkAvailability: checkAvailabilityTool as any,
         createBooking: createBookingTool as any,
         getMyBookings: getMyBookingsTool as any,
         cancelBooking: cancelBookingTool as any,
       },
       
       // @ts-ignore
-      maxSteps: 5, 
+      maxSteps: 8, 
     });
 
-    // 4. Preparar la respuesta para el servidor de WhatsApp
+    // Detectar si se generó el archivo de calendario
     let icsData: string | null = null;
-    
     if (toolResults) {
       for (const tool of toolResults) {
-        // CORRECCIÓN FINAL: Casteamos 'tool' a 'any' para acceder a .result sin que TS llore
         const t = tool as any;
-        
         if (t.toolName === 'createBooking' && t.result?.icsData) {
            icsData = t.result.icsData; 
         }
       }
     }
 
-    // 5. Devolver JSON al wa-server
-    return NextResponse.json({
-      ok: true,
-      reply: aiResponse, 
-      icsData: icsData   
-    });
+    return NextResponse.json({ ok: true, reply: aiResponse, icsData: icsData });
 
   } catch (error: any) {
     console.error("[/api/whatsapp-bot] Error:", error);
     return NextResponse.json(
-      { ok: false, message: "Error interno del bot." },
+      { ok: false, message: "Error interno: " + error.message },
       { status: 500 }
     );
   }
 }
 
-// Bloquear GET
 export function GET() {
   return NextResponse.json({ ok: false, message: "Method not allowed" }, { status: 405 });
 }

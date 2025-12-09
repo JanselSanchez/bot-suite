@@ -11,22 +11,25 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// --- DEFINICIÓN DE PARAMETROS (Schemas Zod) ---
+// --- SCHEMAS (Validación de datos) ---
 
-// 1. SCHEMA PARA BUSCAR SERVICIOS (NUEVO)
-const getServicesSchema = z.object({
-  tenantId: z.string().describe("El ID del negocio"),
-  query: z.string().optional().describe("Palabra clave para buscar (ej: 'corte', 'barba')"),
+const createBookingSchema = z.object({
+  tenantId: z.string(),
+  customerPhone: z.string(),
+  customerName: z.string().optional(),
+  serviceId: z.string().optional().nullable(),
+  startTime: z.string(),
+  durationMinutes: z.number().default(60),
 });
 
-// 2. SCHEMA AGENDAR (Modificado: serviceId es opcional)
-const createBookingSchema = z.object({
-  tenantId: z.string().describe("El ID del negocio (tenant)"),
-  customerPhone: z.string().describe("El número de WhatsApp del cliente"),
-  customerName: z.string().optional().describe("El nombre del cliente (si se conoce)"),
-  serviceId: z.string().optional().nullable().describe("El UUID del servicio. SI NO ESTÁS SEGURO, ENVÍA NULL."),
-  startTime: z.string().describe("Fecha y hora de inicio en formato ISO (ej: 2025-12-09T14:30:00Z)"),
-  durationMinutes: z.number().describe("Duración del servicio en minutos (ej: 30, 60)"),
+const checkAvailabilitySchema = z.object({
+  tenantId: z.string(),
+  date: z.string().describe("Fecha en formato YYYY-MM-DD"),
+});
+
+const getServicesSchema = z.object({
+  tenantId: z.string(),
+  query: z.string().optional(),
 });
 
 const getMyBookingsSchema = z.object({
@@ -35,167 +38,150 @@ const getMyBookingsSchema = z.object({
 });
 
 const cancelBookingSchema = z.object({
-  bookingId: z.string().describe("El UUID de la cita a cancelar"),
+  bookingId: z.string(),
 });
 
-// --- LÓGICA PURA (Sin dependencias de IA) ---
+// --- HERRAMIENTAS (Lógica Pura) ---
 
-// 1. HERRAMIENTA DE BÚSQUEDA (La pieza que faltaba)
+// 1. DISPONIBILIDAD (Esta es la que te faltaba)
+export const checkAvailabilityTool = {
+  description: "Consulta horarios disponibles para una fecha específica.",
+  parameters: checkAvailabilitySchema,
+  execute: async ({ tenantId, date }: z.infer<typeof checkAvailabilitySchema>) => {
+    try {
+      const requestedDate = new Date(date);
+      const dayOfWeek = requestedDate.getDay(); // 0=Dom, 1=Lun...
+
+      // A) Buscar Horario del Negocio para ese día
+      const { data: hours } = await supabase
+        .from("business_hours")
+        .select("open_time, close_time, is_closed")
+        .eq("tenant_id", tenantId)
+        .eq("dow", dayOfWeek)
+        .maybeSingle();
+
+      if (!hours || hours.is_closed) {
+        return { available: false, message: "El negocio está cerrado ese día." };
+      }
+
+      // B) Buscar Citas Existentes para restar huecos
+      const startOfDay = new Date(date); startOfDay.setHours(0,0,0,0);
+      const endOfDay = new Date(date); endOfDay.setHours(23,59,59,999);
+
+      const { data: bookings } = await supabase
+        .from("bookings")
+        .select("starts_at, ends_at")
+        .eq("tenant_id", tenantId)
+        .in("status", ["confirmed", "pending"])
+        .gte("starts_at", startOfDay.toISOString())
+        .lte("ends_at", endOfDay.toISOString());
+
+      // C) Calcular Slots Libres (Simple: cada 30 min)
+      const slots = [];
+      // Parsear horas "08:00:00"
+      const [openH, openM] = hours.open_time.split(':').map(Number);
+      const [closeH, closeM] = hours.close_time.split(':').map(Number);
+      
+      let cursor = new Date(date);
+      cursor.setHours(openH, openM, 0, 0);
+      
+      const closeTime = new Date(date);
+      closeTime.setHours(closeH, closeM, 0, 0);
+
+      while (cursor < closeTime) {
+        const slotEnd = new Date(cursor.getTime() + 30 * 60000); // Slots de 30 mins
+        
+        // Verificar si choca con alguna cita
+        const isBusy = bookings?.some((b: any) => {
+          const bStart = new Date(b.starts_at);
+          const bEnd = new Date(b.ends_at);
+          // Lógica de colisión
+          return (cursor < bEnd && slotEnd > bStart);
+        });
+
+        if (!isBusy) {
+          slots.push(cursor.toLocaleTimeString('es-DO', { hour: '2-digit', minute: '2-digit', hour12: true }));
+        }
+        
+        cursor.setMinutes(cursor.getMinutes() + 30); // Siguiente slot
+      }
+
+      return { available: true, slots: slots.slice(0, 15) };
+    } catch (e) {
+      console.error(e);
+      return { available: false, message: "Error verificando disponibilidad." };
+    }
+  }
+};
+
+// 2. BUSCAR SERVICIOS
 export const getServicesTool = {
-  description: "Busca servicios en el catálogo para obtener su ID y precio. Úsala cuando el cliente pida un servicio por nombre.",
+  description: "Busca servicios en el catálogo para obtener su ID.",
   parameters: getServicesSchema,
   execute: async ({ tenantId, query }: z.infer<typeof getServicesSchema>) => {
     try {
-      let queryBuilder = supabase
-        .from("items") // Buscamos en la tabla de productos/servicios
-        .select("id, name, price_cents, description")
-        .eq("tenant_id", tenantId)
-        .eq("is_active", true);
-
-      if (query) {
-        queryBuilder = queryBuilder.ilike("name", `%${query}%`);
-      }
-
-      const { data, error } = await queryBuilder.limit(5);
-
-      if (error) throw error;
-
-      if (!data || data.length === 0) {
-        return { found: false, message: "No encontré servicios con ese nombre." };
-      }
-
-      // Formateamos para que la IA entienda fácil
-      const services = data.map(item => ({
-        id: item.id, // <--- AQUÍ ESTÁ EL ID QUE LA IA NECESITA
-        name: item.name,
-        price: (item.price_cents / 100).toFixed(2)
-      }));
-
-      return { found: true, services: services };
-    } catch (error) {
-      console.error("Error buscando servicios:", error);
-      return { found: false, message: "Error técnico buscando servicios." };
-    }
-  },
+      let q = supabase.from("items").select("id, name, price_cents").eq("tenant_id", tenantId).eq("is_active", true);
+      if (query) q = q.ilike("name", `%${query}%`);
+      const { data } = await q.limit(5);
+      
+      if (!data?.length) return { found: false, message: "No encontré servicios." };
+      return { 
+        found: true, 
+        services: data.map(i => ({ id: i.id, name: i.name, price: i.price_cents/100 })) 
+      };
+    } catch (e) { return { found: false }; }
+  }
 };
 
-// 2. HERRAMIENTA AGENDAR (Más robusta)
+// 3. AGENDAR (ICS + DB)
 export const createBookingTool = {
-  description: "Registra una nueva cita. Si tienes el serviceId úsalo, si no, envíalo como null.",
+  description: "Registra una cita.",
   parameters: createBookingSchema,
   execute: async ({ tenantId, customerPhone, customerName, serviceId, startTime, durationMinutes }: z.infer<typeof createBookingSchema>) => {
-    // 1. Calcular tiempos
     const start = new Date(startTime);
     const end = new Date(start.getTime() + durationMinutes * 60000);
-
-    // Helper para formatear fecha al estilo iCalendar
-    const formatDateICS = (date: Date) => date.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+    const formatDateICS = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
 
     try {
-      // 2. Insertar en Supabase
-      const { data, error } = await supabase
-        .from("bookings")
-        .insert({
-          tenant_id: tenantId,
-          service_id: serviceId || null, // Aceptamos nulos para no bloquear
-          customer_phone: customerPhone,
-          customer_name: customerName || "Cliente WhatsApp",
-          starts_at: start.toISOString(),
-          ends_at: end.toISOString(),
-          status: "confirmed",
-        })
-        .select("id")
-        .single();
+      const { data, error } = await supabase.from("bookings").insert({
+        tenant_id: tenantId,
+        service_id: serviceId || null,
+        customer_phone: customerPhone,
+        customer_name: customerName || "Cliente",
+        starts_at: start.toISOString(),
+        ends_at: end.toISOString(),
+        status: "confirmed"
+      }).select("id").single();
 
       if (error) throw error;
 
-      // 3. GENERAR CONTENIDO .ICS
-      const icsContent = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//PymeBOT//Agendamiento//ES",
-        "METHOD:PUBLISH",
-        "BEGIN:VEVENT",
-        `UID:${data.id}`,
-        `DTSTAMP:${formatDateICS(new Date())}`,
-        `DTSTART:${formatDateICS(start)}`,
-        `DTEND:${formatDateICS(end)}`,
-        "SUMMARY:Cita Confirmada",
-        `DESCRIPTION:Reserva para ${customerName || 'Cliente'} en ${tenantId}.`,
-        "STATUS:CONFIRMED",
-        "END:VEVENT",
-        "END:VCALENDAR"
+      const ics = [
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//PymeBOT//ES", "METHOD:PUBLISH", "BEGIN:VEVENT",
+        `UID:${data.id}`, `DTSTAMP:${formatDateICS(new Date())}`,
+        `DTSTART:${formatDateICS(start)}`, `DTEND:${formatDateICS(end)}`,
+        "SUMMARY:Cita Confirmada", `DESCRIPTION:Reserva en ${tenantId}.`, "STATUS:CONFIRMED", "END:VEVENT", "END:VCALENDAR"
       ].join("\r\n");
 
-      return {
-        success: true,
-        bookingId: data.id,
-        message: `✅ Cita agendada para el ${start.toLocaleString()} correctamente.`,
-        icsData: icsContent,
-        fileName: 'cita.ics'
-      };
-
-    } catch (error) {
-      console.error("Error creating booking:", error);
-      return { success: false, message: "Hubo un error técnico al guardar la cita." };
-    }
-  },
+      return { success: true, bookingId: data.id, message: "✅ Cita confirmada.", icsData: ics };
+    } catch (e) { return { success: false, message: "Error al guardar." }; }
+  }
 };
 
+// 4. MIS CITAS & CANCELAR
 export const getMyBookingsTool = {
-  description: "Busca las citas activas futuras de un cliente usando su teléfono.",
+  description: "Busca citas futuras.",
   parameters: getMyBookingsSchema,
-  execute: async ({ tenantId, customerPhone }: z.infer<typeof getMyBookingsSchema>) => {
-    try {
-      const { data: bookings, error } = await supabase
-        .from("bookings")
-        .select(`
-          id, 
-          starts_at,
-          service_id
-        `) // Simplificamos el select para evitar errores de JOIN si la relación falla
-        .eq("tenant_id", tenantId)
-        .eq("customer_phone", customerPhone)
-        .eq("status", "confirmed")
-        .gt("starts_at", new Date().toISOString())
-        .order("starts_at", { ascending: true });
-
-      if (error) throw error;
-
-      if (!bookings || bookings.length === 0) {
-        return { found: false, message: "No encontré citas futuras agendadas con tu número." };
-      }
-
-      const formattedBookings = bookings.map((b: any) => ({
-        id: b.id,
-        date: b.starts_at,
-        service: "Servicio Reservado" // Texto genérico para asegurar que funcione
-      }));
-
-      return { found: true, bookings: formattedBookings };
-    } catch (error) {
-      console.error("Error getting bookings:", error);
-      return { found: false, message: "Error consultando las citas." };
-    }
-  },
+  execute: async ({ tenantId, customerPhone }: any) => {
+    const { data } = await supabase.from("bookings").select("id, starts_at").eq("tenant_id", tenantId).eq("customer_phone", customerPhone).eq("status", "confirmed").gt("starts_at", new Date().toISOString());
+    return { found: !!data?.length, bookings: data };
+  }
 };
 
 export const cancelBookingTool = {
-  description: "Cancela una cita existente dado su ID.",
+  description: "Cancela cita.",
   parameters: cancelBookingSchema,
-  execute: async ({ bookingId }: z.infer<typeof cancelBookingSchema>) => {
-    try {
-      const { error } = await supabase
-        .from("bookings")
-        .update({ status: "cancelled" })
-        .eq("id", bookingId);
-
-      if (error) throw error;
-
-      return { success: true, message: "La cita ha sido cancelada exitosamente." };
-    } catch (error) {
-      console.error("Error canceling booking:", error);
-      return { success: false, message: "No se pudo cancelar la cita." };
-    }
-  },
+  execute: async ({ bookingId }: any) => {
+    await supabase.from("bookings").update({ status: "cancelled" }).eq("id", bookingId);
+    return { success: true };
+  }
 };
