@@ -6,7 +6,8 @@ import {
   getMyBookingsTool, 
   cancelBookingTool, 
   getServicesTool, 
-  checkAvailabilityTool 
+  checkAvailabilityTool,
+  rescheduleBookingTool // <--- IMPORTAMOS LA NUEVA
 } from "@/utils/booking-tools";
 
 interface WhatsappBotRequestBody {
@@ -27,32 +28,24 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, message: "Faltan datos." }, { status: 400 });
     }
 
-    const now = new Date().toLocaleString("es-DO", { 
-      timeZone: "America/Santo_Domingo",
-      dateStyle: "full",
-      timeStyle: "short"
-    });
+    const now = new Date().toLocaleString("es-DO", { timeZone: "America/Santo_Domingo", dateStyle: "full", timeStyle: "short" });
 
     const { text: aiResponse, toolResults } = await generateText({
       model: openai("gpt-4o"), 
       system: `
-        ROL: Asistente de reservas de "${tenantId}". Cliente: ${customerName} (${phoneNumber}). FECHA: ${now}.
+        ROL: Asistente de reservas "${tenantId}". Cliente: ${customerName} (${phoneNumber}). FECHA: ${now}.
+        
+        OBJETIVO: CONCRETAR LA ACCIÓN Y MANDAR EL ARCHIVO.
 
-        OBJETIVO: CERRAR LA CITA Y MANDAR EL ARCHIVO.
+        REGLAS:
+        1. **PRECIOS:** Usa 'getServices'.
+        2. **HORARIOS:** Usa 'checkAvailability'.
+        3. **AGENDAR (Nuevo):** Usa 'createBooking'. (Si no sabes serviceId, manda null).
+        4. **REAGENDAR (Cambio):** Usa 'rescheduleBooking'.
+        5. **CANCELAR:** Usa 'cancelBooking'.
 
-        REGLAS DE ORO (MODO VENTAS):
-        1. **CATÁLOGO:** Si preguntan precios, usa 'getServices'.
-        2. **DISPONIBILIDAD:** Si preguntan "¿qué horas tienes?", usa 'checkAvailability'.
-        3. **AGENDAR (PRIORIDAD MÁXIMA):**
-           - Si el cliente dice "Agéndame a las 3", HAZLO DE INMEDIATO.
-           - Intenta buscar el ID del servicio con 'getServices' internamente.
-           - **SI NO ENCUENTRAS EL ID:** No importa. Llama a 'createBooking' enviando 'serviceId': null.
-           - **NUNCA** digas "no tengo información del servicio". AGENDA IGUAL.
-
-        4. **CONFIRMACIÓN:**
-           - Cuando 'createBooking' responda "success", di solo: "Listo, cita confirmada. Aquí tienes tu recordatorio."
-
-        TONO: Seguro y eficiente.
+        CONFIRMACIÓN:
+        - Si la herramienta funciona (success: true), di solo: "Listo, cambio realizado. Aquí tienes el recordatorio."
       `,
       prompt: text, 
       
@@ -60,6 +53,7 @@ export async function POST(req: NextRequest) {
         getServices: getServicesTool as any,
         checkAvailability: checkAvailabilityTool as any,
         createBooking: createBookingTool as any,
+        rescheduleBooking: rescheduleBookingTool as any, // <--- REGISTRADA
         getMyBookings: getMyBookingsTool as any,
         cancelBooking: cancelBookingTool as any,
       },
@@ -68,11 +62,13 @@ export async function POST(req: NextRequest) {
       maxSteps: 8, 
     });
 
+    // --- MAGIA DEL ARCHIVO ICS ---
     let icsData: string | null = null;
     if (toolResults) {
       for (const tool of toolResults) {
         const t = tool as any;
-        if (t.toolName === 'createBooking' && t.result?.icsData) {
+        // Ahora buscamos el archivo en createBooking O en rescheduleBooking
+        if ((t.toolName === 'createBooking' || t.toolName === 'rescheduleBooking') && t.result?.icsData) {
            icsData = t.result.icsData; 
         }
       }
@@ -82,10 +78,7 @@ export async function POST(req: NextRequest) {
 
   } catch (error: any) {
     console.error("[/api/whatsapp-bot] Error:", error);
-    return NextResponse.json(
-      { ok: false, message: "Error: " + error.message },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, message: "Error: " + error.message }, { status: 500 });
   }
 }
 

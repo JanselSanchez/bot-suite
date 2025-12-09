@@ -1,11 +1,10 @@
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 
-// CONFIGURACIÓN SUPABASE
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
-if (!supabaseUrl || !supabaseKey) throw new Error("Faltan credenciales de Supabase");
+if (!supabaseUrl || !supabaseKey) throw new Error("Faltan credenciales Supabase");
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- SCHEMAS ---
@@ -21,7 +20,7 @@ const createBookingSchema = z.object({
 
 const checkAvailabilitySchema = z.object({
   tenantId: z.string(),
-  date: z.string().describe("Fecha en formato YYYY-MM-DD"),
+  date: z.string().describe("Fecha YYYY-MM-DD"),
 });
 
 const getServicesSchema = z.object({
@@ -38,99 +37,71 @@ const cancelBookingSchema = z.object({
   bookingId: z.string(),
 });
 
+// NUEVO: Schema para Reagendar
+const rescheduleBookingSchema = z.object({
+  tenantId: z.string(),
+  customerPhone: z.string(),
+  newStartTime: z.string().describe("Nueva fecha ISO"),
+});
+
 // --- TOOLS ---
 
 // 1. DISPONIBILIDAD
 export const checkAvailabilityTool = {
-  description: "Consulta horarios disponibles para una fecha específica.",
+  description: "Consulta horarios disponibles.",
   parameters: checkAvailabilitySchema,
   execute: async ({ tenantId, date }: z.infer<typeof checkAvailabilitySchema>) => {
     try {
       const requestedDate = new Date(date);
-      const dayOfWeek = requestedDate.getDay(); // 0=Dom, 1=Lun...
+      const dayOfWeek = requestedDate.getDay(); 
 
-      // A) Buscar Horario del Negocio para ese día
-      const { data: hours } = await supabase
-        .from("business_hours")
-        .select("open_time, close_time, is_closed")
-        .eq("tenant_id", tenantId)
-        .eq("dow", dayOfWeek)
-        .maybeSingle();
+      const { data: hours } = await supabase.from("business_hours").select("open_time, close_time, is_closed").eq("tenant_id", tenantId).eq("dow", dayOfWeek).maybeSingle();
+      if (!hours || hours.is_closed) return { available: false, message: "Cerrado ese día." };
 
-      if (!hours || hours.is_closed) {
-        return { available: false, message: "El negocio está cerrado ese día." };
-      }
-
-      // B) Buscar Citas Existentes
       const startOfDay = new Date(date); startOfDay.setHours(0,0,0,0);
       const endOfDay = new Date(date); endOfDay.setHours(23,59,59,999);
 
-      const { data: bookings } = await supabase
-        .from("bookings")
-        .select("starts_at, ends_at")
-        .eq("tenant_id", tenantId)
-        .in("status", ["confirmed", "pending"])
-        .gte("starts_at", startOfDay.toISOString())
-        .lte("ends_at", endOfDay.toISOString());
+      const { data: bookings } = await supabase.from("bookings").select("starts_at, ends_at").eq("tenant_id", tenantId).in("status", ["confirmed", "pending"]).gte("starts_at", startOfDay.toISOString()).lte("ends_at", endOfDay.toISOString());
 
-      // C) Calcular Slots Libres (Cada 30 min)
       const slots = [];
       const [openH, openM] = hours.open_time.split(':').map(Number);
       const [closeH, closeM] = hours.close_time.split(':').map(Number);
-      
-      let cursor = new Date(date);
-      cursor.setHours(openH, openM, 0, 0);
-      
-      const closeTime = new Date(date);
-      closeTime.setHours(closeH, closeM, 0, 0);
+      let cursor = new Date(date); cursor.setHours(openH, openM, 0, 0);
+      const closeTime = new Date(date); closeTime.setHours(closeH, closeM, 0, 0);
 
       while (cursor < closeTime) {
-        const slotEnd = new Date(cursor.getTime() + 60 * 60000); // Duración estándar 1h
-        
-        // Verificar colisión
+        const slotEnd = new Date(cursor.getTime() + 60 * 60000);
         const isBusy = bookings?.some((b: any) => {
           const bStart = new Date(b.starts_at);
           const bEnd = new Date(b.ends_at);
           return (cursor < bEnd && slotEnd > bStart);
         });
-
-        if (!isBusy) {
-          slots.push(cursor.toLocaleTimeString('es-DO', { hour: '2-digit', minute: '2-digit', hour12: true }));
-        }
-        
-        cursor.setMinutes(cursor.getMinutes() + 30); // Saltos de 30 min
+        if (!isBusy) slots.push(cursor.toLocaleTimeString('es-DO', { hour: '2-digit', minute: '2-digit', hour12: true }));
+        cursor.setMinutes(cursor.getMinutes() + 30);
       }
-
       return { available: true, slots: slots.slice(0, 15) };
-    } catch (e) {
-      console.error(e);
-      return { available: false, message: "Error verificando disponibilidad." };
-    }
+    } catch (e) { return { available: false, message: "Error verificando." }; }
   }
 };
 
 // 2. BUSCAR SERVICIOS
 export const getServicesTool = {
-  description: "Busca servicios en el catálogo para obtener su ID.",
+  description: "Busca servicios y precios.",
   parameters: getServicesSchema,
   execute: async ({ tenantId, query }: z.infer<typeof getServicesSchema>) => {
     try {
       let q = supabase.from("items").select("id, name, price_cents").eq("tenant_id", tenantId).eq("is_active", true);
       if (query) q = q.ilike("name", `%${query}%`);
       const { data } = await q.limit(5);
-      
       if (!data?.length) return { found: false };
-      return { 
-        found: true, 
-        services: data.map(i => ({ id: i.id, name: i.name, price: i.price_cents/100 })) 
-      };
+      return { found: true, services: data.map(i => ({ id: i.id, name: i.name, price: i.price_cents/100 })) };
     } catch (e) { return { found: false }; }
   }
 };
 
-// 3. AGENDAR (ICS + DB)
+// 3. AGENDAR (Genera ICS)
 export const createBookingTool = {
-  description: "Registra una cita.",
+  description: "Crea una nueva cita.",
   parameters: createBookingSchema,
   execute: async ({ tenantId, customerPhone, customerName, serviceId, startTime, durationMinutes }: z.infer<typeof createBookingSchema>) => {
     const start = new Date(startTime);
@@ -142,7 +113,7 @@ export const createBookingTool = {
         tenant_id: tenantId,
         service_id: serviceId || null,
         customer_phone: customerPhone,
-        customer_name: customerName || "Cliente WhatsApp",
+        customer_name: customerName || "Cliente",
         starts_at: start.toISOString(),
         ends_at: end.toISOString(),
         status: "confirmed"
@@ -152,20 +123,59 @@ export const createBookingTool = {
 
       const ics = [
         "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//PymeBOT//ES", "METHOD:PUBLISH", "BEGIN:VEVENT",
-        `UID:${data.id}`, `DTSTAMP:${formatDateICS(new Date())}`,
-        `DTSTART:${formatDateICS(start)}`, `DTEND:${formatDateICS(end)}`,
+        `UID:${data.id}`, `DTSTAMP:${formatDateICS(new Date())}`, `DTSTART:${formatDateICS(start)}`, `DTEND:${formatDateICS(end)}`,
         "SUMMARY:Cita Confirmada", `DESCRIPTION:Reserva en ${tenantId}.`, "STATUS:CONFIRMED", "END:VEVENT", "END:VCALENDAR"
       ].join("\r\n");
 
-      return { success: true, bookingId: data.id, message: "✅ Cita confirmada.", icsData: ics };
-    } catch (e) { 
-      // CORRECCIÓN AQUÍ: Casteamos 'e' como 'any' para acceder a .message sin error
-      return { success: false, message: "Error al guardar: " + (e as any).message }; 
-    }
+      return { success: true, message: "✅ Cita confirmada.", icsData: ics };
+    } catch (e) { return { success: false, message: "Error al guardar: " + (e as any).message }; }
   }
 };
 
-// 4. MIS CITAS & CANCELAR
+// 4. REAGENDAR (LA NUEVA QUE FALTABA) - Genera ICS
+export const rescheduleBookingTool = {
+  description: "Reagenda (mueve) una cita existente a una nueva fecha.",
+  parameters: rescheduleBookingSchema,
+  execute: async ({ tenantId, customerPhone, newStartTime }: z.infer<typeof rescheduleBookingSchema>) => {
+    const start = new Date(newStartTime);
+    const end = new Date(start.getTime() + 60 * 60000); // Asumimos 1h
+    const formatDateICS = (d: Date) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+
+    try {
+      // 1. Buscar la cita activa más reciente
+      const { data: booking } = await supabase.from("bookings")
+        .select("id")
+        .eq("tenant_id", tenantId)
+        .eq("customer_phone", customerPhone)
+        .in("status", ["confirmed", "pending"])
+        .order("starts_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!booking) return { success: false, message: "No encontré cita para reagendar." };
+
+      // 2. Actualizar
+      const { error } = await supabase.from("bookings").update({
+        starts_at: start.toISOString(),
+        ends_at: end.toISOString(),
+        status: "confirmed"
+      }).eq("id", booking.id);
+
+      if (error) throw error;
+
+      // 3. Generar ICS nuevo
+      const ics = [
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//PymeBOT//ES", "METHOD:PUBLISH", "BEGIN:VEVENT",
+        `UID:${booking.id}`, `DTSTAMP:${formatDateICS(new Date())}`, `DTSTART:${formatDateICS(start)}`, `DTEND:${formatDateICS(end)}`,
+        "SUMMARY:Cita Reagendada", `DESCRIPTION:Nueva fecha de reserva.`, "STATUS:CONFIRMED", "END:VEVENT", "END:VCALENDAR"
+      ].join("\r\n");
+
+      return { success: true, message: "✅ Cita reagendada.", icsData: ics };
+    } catch (e) { return { success: false, message: "Error al reagendar: " + (e as any).message }; }
+  }
+};
+
+// 5. GESTIÓN
 export const getMyBookingsTool = {
   description: "Busca citas futuras.",
   parameters: getMyBookingsSchema,
