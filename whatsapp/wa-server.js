@@ -10,12 +10,12 @@ const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
 const fs = require("fs");
-const axios = require("axios"); // 👈 nuevo: para llamar al bot de Next
+const axios = require("axios"); // 👈 para llamar al bot de Next
 
 // Importaciones de Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
 
-// 👇 nuevo: estado de conversación en Supabase
+// 👇 estado de conversación en Supabase
 const convoState = require("./conversationState");
 
 // ---------------------------------------------------------------------
@@ -48,7 +48,21 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// 👇 OpenAI con fallback y logs claros
+const openaiApiKey =
+  process.env.OPENAI_API_KEY ||
+  process.env.OPENAI_KEY ||
+  process.env.OPENAI_SECRET ||
+  null;
+
+if (!openaiApiKey) {
+  console.warn(
+    "[wa-server] ⚠️ No hay API key de OpenAI configurada (OPENAI_API_KEY / OPENAI_KEY). " +
+      "El fallback de IA no va a funcionar."
+  );
+}
+
+const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
 
 /**
  * sessions: Map<tenantId, {
@@ -499,6 +513,14 @@ async function generateReply(
   historyMessages = [],
   userPhone = null
 ) {
+  // 👇 Guard clause si no hay OpenAI configurado
+  if (!openai) {
+    logger.error(
+      "[generateReply] OpenAI no está configurado, no puedo generar respuesta IA."
+    );
+    return null;
+  }
+
   // 1. Cargamos TODA la identidad del negocio de la DB
   const { data: profile } = await supabase
     .from("business_profiles")
@@ -1186,22 +1208,54 @@ async function getOrCreateSession(tenantId) {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // 🔥 Handler de mensajes: ahora primero intentamos /api/whatsapp-bot
+  // 🔥 Handler de mensajes con logs y fallback robusto
   sock.ev.on("messages.upsert", async (m) => {
     try {
       const msg = m.messages?.[0];
-      if (!msg?.message || msg.key.fromMe) return;
+      if (!msg) return;
+
+      logger.info(
+        { tenantId, key: msg.key },
+        "[wa-server] 📩 messages.upsert recibido"
+      );
+
+      if (!msg?.message || msg.key.fromMe) {
+        logger.info(
+          { tenantId },
+          "[wa-server] Mensaje sin contenido o enviado por mí, se ignora."
+        );
+        return;
+      }
+
       const remoteJid = msg.key.remoteJid;
-      if (!remoteJid || remoteJid.includes("@g.us")) return;
+      if (!remoteJid || remoteJid.includes("@g.us")) {
+        logger.info(
+          { tenantId, remoteJid },
+          "[wa-server] Mensaje de grupo o sin remoteJid, se ignora."
+        );
+        return;
+      }
 
       const text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
-      if (!text) return;
+
+      if (!text) {
+        logger.info(
+          { tenantId, remoteJid },
+          "[wa-server] Mensaje sin texto, se ignora."
+        );
+        return;
+      }
 
       const pushName = msg.pushName || "Cliente";
       const userPhone = remoteJid.split("@")[0];
+
+      logger.info(
+        { tenantId, remoteJid, text },
+        "[wa-server] Procesando mensaje entrante de WhatsApp"
+      );
 
       // --- Memoria por conversación (teléfono) en RAM (para OpenAI fallback) ---
       if (!info.conversations) {
@@ -1254,6 +1308,11 @@ async function getOrCreateSession(tenantId) {
         };
 
         try {
+          logger.info(
+            { tenantId, url: botApiUrl },
+            "[wa-server] Llamando a /api/whatsapp-bot"
+          );
+
           const response = await axios.post(botApiUrl, payload, {
             timeout: 15000,
           });
@@ -1261,6 +1320,10 @@ async function getOrCreateSession(tenantId) {
           if (response.data && response.data.ok) {
             replyText = response.data.reply;
             newState = response.data.newState;
+            logger.info(
+              { tenantId },
+              "[wa-server] Respuesta OK de /api/whatsapp-bot"
+            );
           } else {
             logger.error(
               "[wa-server] Respuesta no OK de /api/whatsapp-bot:",
@@ -1279,6 +1342,10 @@ async function getOrCreateSession(tenantId) {
       // 5) Fallback a OpenAI tools si algo falla
       // ---------------------------
       if (!replyText) {
+        logger.info(
+          { tenantId },
+          "[wa-server] Usando fallback de OpenAI para generar respuesta"
+        );
         const fallback = await generateReply(
           text,
           tenantId,
@@ -1315,6 +1382,10 @@ async function getOrCreateSession(tenantId) {
       // 7) Enviar respuesta por WhatsApp
       // ---------------------------
       await sock.sendMessage(remoteJid, { text: replyText });
+      logger.info(
+        { tenantId, remoteJid },
+        "[wa-server] ✅ Respuesta enviada por WhatsApp"
+      );
 
       // Guardar historial para OpenAI (solo si usamos fallback)
       history.push({ role: "user", content: text });
@@ -1651,7 +1722,7 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
     newStartsAtISO,
     newEndsAtISO,
     extraVariables,
-  } = req.body || {} ;
+  } = req.body || {};
 
   if (!tenantId || !bookingId || !newStartsAtISO || !newEndsAtISO) {
     return res.status(400).json({
