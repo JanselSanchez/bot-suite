@@ -36,31 +36,23 @@ export async function POST(req: NextRequest) {
     const { text: aiResponse, toolResults } = await generateText({
       model: openai("gpt-4o"), 
       system: `
-        ROL: Eres el asistente de reservas del negocio "${tenantId}".
-        CLIENTE: ${customerName || 'Usuario'} (Tel: ${phoneNumber}).
-        FECHA: ${now}.
+        ROL: Asistente de reservas de "${tenantId}". Cliente: ${customerName} (${phoneNumber}). FECHA: ${now}.
 
-        OBJETIVO ÚNICO: CONCRETAR LA CITA Y MANDAR EL ARCHIVO.
+        OBJETIVO: CERRAR LA CITA Y MANDAR EL ARCHIVO.
 
-        REGLAS DE COMPORTAMIENTO (MODO AGRESIVO):
-        1. **PRIORIDAD MÁXIMA: AGENDAR.**
-           - Si el cliente dice una hora ("quiero a las 3"), intenta agendar DE INMEDIATO.
-           - No des vueltas preguntando detalles innecesarios.
-
-        2. **SOBRE EL SERVICIO (ID):**
-           - Intenta buscar el servicio con 'getServices' rápido.
-           - **IMPORTANTE:** Si NO encuentras el servicio o el cliente no fue específico, **NO TE DETENGAS**.
-           - Llama a 'createBooking' enviando 'serviceId': null.
-           - Es mejor guardar una cita "sin servicio especificado" que perder al cliente.
-
-        3. **SOBRE LA DISPONIBILIDAD:**
-           - Si el cliente pregunta "¿qué horas tienes?", usa 'checkAvailability'.
-           - Si el cliente dice "Agéndame a las 4", usa 'createBooking' directamente. Si la base de datos rebota por horario ocupado, entonces ofrécele otros horarios.
+        REGLAS DE ORO (MODO VENTAS):
+        1. **CATÁLOGO:** Si preguntan precios, usa 'getServices'.
+        2. **DISPONIBILIDAD:** Si preguntan "¿qué horas tienes?", usa 'checkAvailability'.
+        3. **AGENDAR (PRIORIDAD MÁXIMA):**
+           - Si el cliente dice "Agéndame a las 3", HAZLO DE INMEDIATO.
+           - Intenta buscar el ID del servicio con 'getServices' internamente.
+           - **SI NO ENCUENTRAS EL ID:** No importa. Llama a 'createBooking' enviando 'serviceId': null.
+           - **NUNCA** digas "no tengo información del servicio". AGENDA IGUAL.
 
         4. **CONFIRMACIÓN:**
-           - Una vez ejecutes 'createBooking' y salga exitoso ("success: true"), dile al cliente: "Listo, cita confirmada. Aquí tienes tu recordatorio." y no digas nada más que pueda confundirlo.
+           - Cuando 'createBooking' responda "success", di solo: "Listo, cita confirmada. Aquí tienes tu recordatorio."
 
-        TONO: Seguro, eficiente y servicial.
+        TONO: Seguro y eficiente.
       `,
       prompt: text, 
       
@@ -76,7 +68,6 @@ export async function POST(req: NextRequest) {
       maxSteps: 8, 
     });
 
-    // Detectar si se generó el archivo de calendario
     let icsData: string | null = null;
     if (toolResults) {
       for (const tool of toolResults) {
@@ -92,7 +83,7 @@ export async function POST(req: NextRequest) {
   } catch (error: any) {
     console.error("[/api/whatsapp-bot] Error:", error);
     return NextResponse.json(
-      { ok: false, message: "Error interno: " + error.message },
+      { ok: false, message: "Error: " + error.message },
       { status: 500 }
     );
   }

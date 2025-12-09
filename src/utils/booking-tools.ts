@@ -1,17 +1,14 @@
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 
-// 1. CONFIGURACIÓN DE SUPABASE
+// CONFIGURACIÓN SUPABASE
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
-if (!supabaseUrl || !supabaseKey) {
-  throw new Error("Faltan las variables de entorno de Supabase (URL o SERVICE_ROLE_KEY)");
-}
-
+if (!supabaseUrl || !supabaseKey) throw new Error("Faltan credenciales de Supabase");
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// --- SCHEMAS (Validación de datos) ---
+// --- SCHEMAS ---
 
 const createBookingSchema = z.object({
   tenantId: z.string(),
@@ -41,9 +38,9 @@ const cancelBookingSchema = z.object({
   bookingId: z.string(),
 });
 
-// --- HERRAMIENTAS (Lógica Pura) ---
+// --- TOOLS ---
 
-// 1. DISPONIBILIDAD (Esta es la que te faltaba)
+// 1. DISPONIBILIDAD
 export const checkAvailabilityTool = {
   description: "Consulta horarios disponibles para una fecha específica.",
   parameters: checkAvailabilitySchema,
@@ -64,7 +61,7 @@ export const checkAvailabilityTool = {
         return { available: false, message: "El negocio está cerrado ese día." };
       }
 
-      // B) Buscar Citas Existentes para restar huecos
+      // B) Buscar Citas Existentes
       const startOfDay = new Date(date); startOfDay.setHours(0,0,0,0);
       const endOfDay = new Date(date); endOfDay.setHours(23,59,59,999);
 
@@ -76,9 +73,8 @@ export const checkAvailabilityTool = {
         .gte("starts_at", startOfDay.toISOString())
         .lte("ends_at", endOfDay.toISOString());
 
-      // C) Calcular Slots Libres (Simple: cada 30 min)
+      // C) Calcular Slots Libres (Cada 30 min)
       const slots = [];
-      // Parsear horas "08:00:00"
       const [openH, openM] = hours.open_time.split(':').map(Number);
       const [closeH, closeM] = hours.close_time.split(':').map(Number);
       
@@ -89,13 +85,12 @@ export const checkAvailabilityTool = {
       closeTime.setHours(closeH, closeM, 0, 0);
 
       while (cursor < closeTime) {
-        const slotEnd = new Date(cursor.getTime() + 30 * 60000); // Slots de 30 mins
+        const slotEnd = new Date(cursor.getTime() + 60 * 60000); // Duración estándar 1h
         
-        // Verificar si choca con alguna cita
+        // Verificar colisión
         const isBusy = bookings?.some((b: any) => {
           const bStart = new Date(b.starts_at);
           const bEnd = new Date(b.ends_at);
-          // Lógica de colisión
           return (cursor < bEnd && slotEnd > bStart);
         });
 
@@ -103,7 +98,7 @@ export const checkAvailabilityTool = {
           slots.push(cursor.toLocaleTimeString('es-DO', { hour: '2-digit', minute: '2-digit', hour12: true }));
         }
         
-        cursor.setMinutes(cursor.getMinutes() + 30); // Siguiente slot
+        cursor.setMinutes(cursor.getMinutes() + 30); // Saltos de 30 min
       }
 
       return { available: true, slots: slots.slice(0, 15) };
@@ -124,7 +119,7 @@ export const getServicesTool = {
       if (query) q = q.ilike("name", `%${query}%`);
       const { data } = await q.limit(5);
       
-      if (!data?.length) return { found: false, message: "No encontré servicios." };
+      if (!data?.length) return { found: false };
       return { 
         found: true, 
         services: data.map(i => ({ id: i.id, name: i.name, price: i.price_cents/100 })) 
@@ -147,7 +142,7 @@ export const createBookingTool = {
         tenant_id: tenantId,
         service_id: serviceId || null,
         customer_phone: customerPhone,
-        customer_name: customerName || "Cliente",
+        customer_name: customerName || "Cliente WhatsApp",
         starts_at: start.toISOString(),
         ends_at: end.toISOString(),
         status: "confirmed"
@@ -163,7 +158,10 @@ export const createBookingTool = {
       ].join("\r\n");
 
       return { success: true, bookingId: data.id, message: "✅ Cita confirmada.", icsData: ics };
-    } catch (e) { return { success: false, message: "Error al guardar." }; }
+    } catch (e) { 
+      // CORRECCIÓN AQUÍ: Casteamos 'e' como 'any' para acceder a .message sin error
+      return { success: false, message: "Error al guardar: " + (e as any).message }; 
+    }
   }
 };
 
