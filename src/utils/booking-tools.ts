@@ -13,11 +13,18 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- DEFINICIÓN DE PARAMETROS (Schemas Zod) ---
 
+// 1. SCHEMA PARA BUSCAR SERVICIOS (NUEVO)
+const getServicesSchema = z.object({
+  tenantId: z.string().describe("El ID del negocio"),
+  query: z.string().optional().describe("Palabra clave para buscar (ej: 'corte', 'barba')"),
+});
+
+// 2. SCHEMA AGENDAR (Modificado: serviceId es opcional)
 const createBookingSchema = z.object({
   tenantId: z.string().describe("El ID del negocio (tenant)"),
   customerPhone: z.string().describe("El número de WhatsApp del cliente"),
   customerName: z.string().optional().describe("El nombre del cliente (si se conoce)"),
-  serviceId: z.string().describe("El UUID del servicio que se va a reservar"),
+  serviceId: z.string().optional().nullable().describe("El UUID del servicio. SI NO ESTÁS SEGURO, ENVÍA NULL."),
   startTime: z.string().describe("Fecha y hora de inicio en formato ISO (ej: 2025-12-09T14:30:00Z)"),
   durationMinutes: z.number().describe("Duración del servicio en minutos (ej: 30, 60)"),
 });
@@ -33,8 +40,48 @@ const cancelBookingSchema = z.object({
 
 // --- LÓGICA PURA (Sin dependencias de IA) ---
 
+// 1. HERRAMIENTA DE BÚSQUEDA (La pieza que faltaba)
+export const getServicesTool = {
+  description: "Busca servicios en el catálogo para obtener su ID y precio. Úsala cuando el cliente pida un servicio por nombre.",
+  parameters: getServicesSchema,
+  execute: async ({ tenantId, query }: z.infer<typeof getServicesSchema>) => {
+    try {
+      let queryBuilder = supabase
+        .from("items") // Buscamos en la tabla de productos/servicios
+        .select("id, name, price_cents, description")
+        .eq("tenant_id", tenantId)
+        .eq("is_active", true);
+
+      if (query) {
+        queryBuilder = queryBuilder.ilike("name", `%${query}%`);
+      }
+
+      const { data, error } = await queryBuilder.limit(5);
+
+      if (error) throw error;
+
+      if (!data || data.length === 0) {
+        return { found: false, message: "No encontré servicios con ese nombre." };
+      }
+
+      // Formateamos para que la IA entienda fácil
+      const services = data.map(item => ({
+        id: item.id, // <--- AQUÍ ESTÁ EL ID QUE LA IA NECESITA
+        name: item.name,
+        price: (item.price_cents / 100).toFixed(2)
+      }));
+
+      return { found: true, services: services };
+    } catch (error) {
+      console.error("Error buscando servicios:", error);
+      return { found: false, message: "Error técnico buscando servicios." };
+    }
+  },
+};
+
+// 2. HERRAMIENTA AGENDAR (Más robusta)
 export const createBookingTool = {
-  description: "Registra una nueva cita. IMPORTANTE: Debes saber el ID del servicio antes de llamar a esta función.",
+  description: "Registra una nueva cita. Si tienes el serviceId úsalo, si no, envíalo como null.",
   parameters: createBookingSchema,
   execute: async ({ tenantId, customerPhone, customerName, serviceId, startTime, durationMinutes }: z.infer<typeof createBookingSchema>) => {
     // 1. Calcular tiempos
@@ -50,7 +97,7 @@ export const createBookingTool = {
         .from("bookings")
         .insert({
           tenant_id: tenantId,
-          service_id: serviceId,
+          service_id: serviceId || null, // Aceptamos nulos para no bloquear
           customer_phone: customerPhone,
           customer_name: customerName || "Cliente WhatsApp",
           starts_at: start.toISOString(),
@@ -104,9 +151,9 @@ export const getMyBookingsTool = {
         .from("bookings")
         .select(`
           id, 
-          starts_at, 
-          resources ( name )
-        `)
+          starts_at,
+          service_id
+        `) // Simplificamos el select para evitar errores de JOIN si la relación falla
         .eq("tenant_id", tenantId)
         .eq("customer_phone", customerPhone)
         .eq("status", "confirmed")
@@ -122,7 +169,7 @@ export const getMyBookingsTool = {
       const formattedBookings = bookings.map((b: any) => ({
         id: b.id,
         date: b.starts_at,
-        serviceName: b.resources?.name || "Servicio",
+        service: "Servicio Reservado" // Texto genérico para asegurar que funcione
       }));
 
       return { found: true, bookings: formattedBookings };
