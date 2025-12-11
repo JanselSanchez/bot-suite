@@ -1193,15 +1193,19 @@ async function getOrCreateSession(tenantId) {
       const shouldReconnect =
         lastDisconnect?.error?.output?.statusCode !==
         DisconnectReason.loggedOut;
+      
+      // LOGICA DE RECONEXIÓN MEJORADA
       if (shouldReconnect) {
         sessions.delete(tenantId);
-        getOrCreateSession(tenantId);
+        logger.info({ tenantId }, "🔄 Conexión perdida, intentando reconectar automáticamente...");
+        getOrCreateSession(tenantId); // RECONECTAR AUTOMÁTICAMENTE
       } else {
         sessions.delete(tenantId);
         await updateSessionDB(tenantId, {
           status: "disconnected",
           qr_data: null,
         });
+        logger.info({ tenantId }, "❌ Sesión cerrada permanentemente (Logout).");
       }
     }
   });
@@ -1287,10 +1291,12 @@ async function getOrCreateSession(tenantId) {
       // ---------------------------
       // 4) Llamar al bot de Next (/api/whatsapp-bot)
       // ---------------------------
-      const botApiUrl = process.env.BOT_API_URL;
+      // 👇 URL HARDCODED PARA EVITAR ERRORES DE ENV
+      const botApiUrl = "https://bot-suite.onrender.com/api/whatsapp-bot";
+      
       let replyText = null;
       let newState = null;
-      let icsData = null; // Variable nueva para capturar el archivo
+      let icsData = null; // Variable para capturar el archivo
 
       if (!botApiUrl) {
         logger.error("[wa-server] BOT_API_URL no está configurado.");
@@ -1300,6 +1306,7 @@ async function getOrCreateSession(tenantId) {
           customerId,
           phoneNumber: userPhone,
           text,
+          customerName: pushName,
           state: {
             current_flow: convoSession.current_flow,
             step: convoSession.step,
@@ -1311,17 +1318,18 @@ async function getOrCreateSession(tenantId) {
         try {
           logger.info(
             { tenantId, url: botApiUrl },
-            "[wa-server] Llamando a /api/whatsapp-bot"
+            "[wa-server] Llamando a /api/whatsapp-bot (Timeout 60s)"
           );
 
+          // 👇 TIMEOUT AUMENTADO A 60 SEGUNDOS
           const response = await axios.post(botApiUrl, payload, {
-            timeout: 15000,
+            timeout: 60000,
           });
 
           if (response.data && response.data.ok) {
             replyText = response.data.reply;
             newState = response.data.newState;
-            icsData = response.data.icsData; // Capturamos el ICS si viene
+            icsData = response.data.icsData; // <-- Captura archivo del cerebro nuevo
             
             logger.info(
               { tenantId },
@@ -1388,6 +1396,7 @@ async function getOrCreateSession(tenantId) {
       
       // 8) Enviar Archivo ICS si vino en la respuesta del Bot
       if (icsData) {
+          logger.info({ tenantId }, "📎 Enviando archivo ICS al usuario...");
           const icsBuffer = Buffer.from(icsData); // Ya es string, lo hacemos buffer
           await sock.sendMessage(remoteJid, {
               document: icsBuffer,
@@ -1395,7 +1404,6 @@ async function getOrCreateSession(tenantId) {
               fileName: 'cita_confirmada.ics',
               caption: '📅 Toca aquí para guardar en tu calendario'
           });
-          logger.info({ tenantId }, "📎 Archivo ICS enviado automáticamente");
       }
 
       logger.info(
