@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 
 // 1. URL del Servidor de Bots (El Proxy usará esto)
-const WA_BOT_URL = process.env.NEXT_PUBLIC_WA_SERVER_URL || "http://localhost:4001";
+// CORRECCIÓN: Ahora busca 'WA_SERVER_URL' (privada) O 'NEXT_PUBLIC_WA_SERVER_URL' (pública) O usa localhost.
+const WA_BOT_URL = process.env.WA_SERVER_URL || process.env.NEXT_PUBLIC_WA_SERVER_URL || "http://localhost:4001";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,7 +19,8 @@ export async function GET(req: Request) {
     console.log("\n========================================");
     console.log("🕵️ [PROXY GET] Solicitud recibida");
     console.log(`👤 Tenant ID: ${tenantId}`);
-    console.log(`🌍 Variable de Entorno (URL Base): '${process.env.NEXT_PUBLIC_WA_SERVER_URL}'`);
+    console.log(`🌍 Env Privada (WA_SERVER_URL): '${process.env.WA_SERVER_URL}'`);
+    console.log(`🌍 Env Pública (NEXT_PUBLIC_WA_SERVER_URL): '${process.env.NEXT_PUBLIC_WA_SERVER_URL}'`);
     console.log(`🎯 URL Final que usaremos: '${WA_BOT_URL}'`);
     // ---------------------------------------------
 
