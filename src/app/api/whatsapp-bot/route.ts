@@ -4,13 +4,13 @@ import { openai } from "@ai-sdk/openai";
 import { createClient } from "@supabase/supabase-js"; // 👈 NECESARIO PARA LEER LA DB
 
 // Importamos tus herramientas (Asegúrate de que la ruta sea correcta)
-import { 
-  createBookingTool, 
-  getMyBookingsTool, 
-  cancelBookingTool, 
-  getServicesTool, 
+import {
+  createBookingTool,
+  getMyBookingsTool,
+  cancelBookingTool,
+  getServicesTool,
   checkAvailabilityTool,
-  rescheduleBookingTool 
+  rescheduleBookingTool,
 } from "@/utils/booking-tools";
 
 // Inicializar Supabase para leer el perfil del negocio dinámicamente
@@ -21,14 +21,122 @@ const supabase = createClient(
 
 interface WhatsappBotRequestBody {
   tenantId: string;
-  phoneNumber: string; 
-  text: string;        
-  customerName?: string; 
+  phoneNumber: string;
+  text: string;
+  customerName?: string;
 }
 
 // Permitir hasta 60 segundos de ejecución (vital para la IA)
 export const maxDuration = 60;
 
+// ------------------------------
+// Helpers: toolResults parsing
+// ------------------------------
+function safeJsonParse(v: any) {
+  if (typeof v !== "string") return v;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return v;
+  }
+}
+
+type BookingMeta = {
+  action: "created" | "rescheduled";
+  bookingId: string;
+  startsAtISO?: string | null;
+  endsAtISO?: string | null;
+};
+
+function extractBookingMeta(toolResults: any): BookingMeta | null {
+  if (!Array.isArray(toolResults)) return null;
+
+  let meta: BookingMeta | null = null;
+
+  for (const tr of toolResults) {
+    const t: any = tr;
+
+    const toolName = t?.toolName || t?.name || t?.tool || null;
+    if (toolName !== "createBooking" && toolName !== "rescheduleBooking") continue;
+
+    // AI SDK a veces entrega result como objeto, a veces como string JSON
+    let result = safeJsonParse(t?.result);
+
+    // A veces el result viene envuelto: { ok:true, data: {...} } o { result: {...} }
+    // Intentamos "desenvolver" un par de capas comunes sin romper nada
+    const r0 = result?.result ?? result;
+    const r1 = r0?.data ?? r0;
+
+    const bookingId =
+      r1?.bookingId ||
+      r1?.booking_id ||
+      r1?.id ||
+      r1?.booking?.id ||
+      r0?.bookingId ||
+      r0?.booking_id ||
+      r0?.id ||
+      r0?.booking?.id ||
+      null;
+
+    const startsAtISO =
+      r1?.startsAtISO ||
+      r1?.starts_at ||
+      r1?.booking?.starts_at ||
+      r0?.startsAtISO ||
+      r0?.starts_at ||
+      r0?.booking?.starts_at ||
+      null;
+
+    const endsAtISO =
+      r1?.endsAtISO ||
+      r1?.ends_at ||
+      r1?.booking?.ends_at ||
+      r0?.endsAtISO ||
+      r0?.ends_at ||
+      r0?.booking?.ends_at ||
+      null;
+
+    if (bookingId) {
+      meta = {
+        action: toolName === "createBooking" ? "created" : "rescheduled",
+        bookingId: String(bookingId),
+        startsAtISO: startsAtISO ? String(startsAtISO) : null,
+        endsAtISO: endsAtISO ? String(endsAtISO) : null,
+      };
+    }
+  }
+
+  return meta;
+}
+
+function extractIcsData(toolResults: any): string | null {
+  if (!Array.isArray(toolResults)) return null;
+
+  for (const tr of toolResults) {
+    const t: any = tr;
+    const toolName = t?.toolName || t?.name || t?.tool || null;
+    if (toolName !== "createBooking" && toolName !== "rescheduleBooking") continue;
+
+    const result = safeJsonParse(t?.result);
+    const r0 = result?.result ?? result;
+    const r1 = r0?.data ?? r0;
+
+    // icsData puede venir en varias ubicaciones
+    const ics =
+      r1?.icsData ||
+      r0?.icsData ||
+      result?.icsData ||
+      null;
+
+    if (ics) return String(ics);
+  }
+
+  return null;
+}
+
+// ------------------------------
+// Route
+// ------------------------------
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as WhatsappBotRequestBody;
@@ -36,11 +144,13 @@ export async function POST(req: NextRequest) {
 
     // 1. Validación básica
     if (!tenantId || !phoneNumber || !text) {
-      return NextResponse.json({ ok: false, message: "Faltan datos (tenantId, phone, text)." }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, message: "Faltan datos (tenantId, phone, text)." },
+        { status: 400 }
+      );
     }
 
     // 2. 🔥 CEREBRO DINÁMICO: Buscar identidad del negocio en la DB 🔥
-    // Aquí es donde ocurre la magia Multi-Tenant.
     const { data: profile } = await supabase
       .from("business_profiles")
       .select("*")
@@ -50,16 +160,19 @@ export async function POST(req: NextRequest) {
     // Valores por defecto si no se ha configurado el perfil aún
     const botName = profile?.bot_name || "Asistente Virtual";
     const botTone = profile?.bot_tone || "Amable y profesional";
-    const customRules = profile?.custom_instructions || "Ayuda al cliente a agendar citas.";
-    
-    // Fecha y hora local de RD para que la IA sepa "cuándo es hoy"
-    const now = new Date().toLocaleString("es-DO", { timeZone: "America/Santo_Domingo", dateStyle: "full", timeStyle: "short" });
+    const customRules =
+      profile?.custom_instructions || "Ayuda al cliente a agendar citas.";
+
+    // Fecha y hora local de RD
+    const now = new Date().toLocaleString("es-DO", {
+      timeZone: "America/Santo_Domingo",
+      dateStyle: "full",
+      timeStyle: "short",
+    });
 
     // 3. Invocamos a la IA con la identidad cargada
     const { text: aiResponse, toolResults } = await generateText({
-      model: openai("gpt-4o"), // O "gpt-4o-mini" si quieres ahorrar
-      
-      // Inyectamos la identidad dinámica aquí 👇
+      model: openai("gpt-4o"), // o gpt-4o-mini
       system: `
         ROL: Eres "${botName}". Actúa con un tono ${botTone}.
         CONTEXTO: Trabajas para el negocio con ID "${tenantId}".
@@ -81,10 +194,7 @@ export async function POST(req: NextRequest) {
         - Si usas 'createBooking' o 'rescheduleBooking' con éxito, responde confirmando y di: "Te he enviado el archivo de calendario."
         - Sé conciso. No inventes información que no esté en las herramientas.
       `,
-      
-      prompt: text, 
-      
-      // Conectamos las herramientas reales que modifican la DB
+      prompt: text,
       tools: {
         getServices: getServicesTool as any,
         checkAvailability: checkAvailabilityTool as any,
@@ -93,38 +203,34 @@ export async function POST(req: NextRequest) {
         getMyBookings: getMyBookingsTool as any,
         cancelBooking: cancelBookingTool as any,
       },
-      
       // @ts-ignore
-      maxSteps: 8, // Permitimos varios pasos (ej: buscar hora -> agendar)
+      maxSteps: 8,
     });
 
-    // 4. --- MAGIA DEL ARCHIVO ICS ---
-    // Revisamos si alguna herramienta generó un archivo de calendario
-    let icsData: string | null = null;
-    
-    if (toolResults) {
-      for (const tool of toolResults) {
-        const t = tool as any;
-        // Buscamos icsData en la respuesta de crear o reagendar
-        if ((t.toolName === 'createBooking' || t.toolName === 'rescheduleBooking') && t.result?.icsData) {
-           icsData = t.result.icsData; 
-        }
-      }
-    }
+    // 4. --- ICS + BookingMeta (a prueba de fallos) ---
+    const icsData: string | null = extractIcsData(toolResults);
+    const bookingMeta: BookingMeta | null = extractBookingMeta(toolResults);
 
     // 5. Devolvemos la respuesta al Servidor de WhatsApp (wa-server)
-    return NextResponse.json({ 
-        ok: true, 
-        reply: aiResponse, 
-        icsData: icsData // Si hay archivo, se envía aquí
+    // bookingMeta permitirá que wa-server genere el ICS desde DB si icsData no vino.
+    return NextResponse.json({
+      ok: true,
+      reply: aiResponse,
+      icsData,
+      bookingMeta,
     });
-
   } catch (error: any) {
     console.error("[/api/whatsapp-bot] Error crítico:", error);
-    return NextResponse.json({ ok: false, message: "Error interno: " + error.message }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, message: "Error interno: " + error.message },
+      { status: 500 }
+    );
   }
 }
 
 export function GET() {
-  return NextResponse.json({ ok: false, message: "Method not allowed. Use POST." }, { status: 405 });
+  return NextResponse.json(
+    { ok: false, message: "Method not allowed. Use POST." },
+    { status: 405 }
+  );
 }

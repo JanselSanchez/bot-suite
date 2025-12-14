@@ -12,7 +12,7 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^2.0.80",
+    "@ai-sdk/openai": "^2.0.86",
     "@radix-ui/react-separator": "^1.1.7",
     "@radix-ui/react-slot": "^1.2.3",
     "@sentry/nextjs": "^10.20.0",
@@ -22,7 +22,7 @@
     "@supabase/supabase-js": "^2.86.2",
     "@tailwindcss/vite": "^4.1.14",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
-    "ai": "^5.0.108",
+    "ai": "^5.0.113",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "concurrently": "^9.1.0",

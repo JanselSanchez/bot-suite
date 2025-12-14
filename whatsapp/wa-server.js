@@ -23,7 +23,7 @@ const convoState = require("./conversationState");
 // ---------------------------------------------------------------------
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "20mb" })); // 👈 por si envías base64 grande
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
 // 🔥 AJUSTE DE ZONA HORARIA (CRÍTICO)
@@ -218,7 +218,70 @@ function createICSFile(
     "END:VCALENDAR",
   ].join("\r\n");
 
-  return Buffer.from(icsData);
+  return Buffer.from(icsData, "utf8");
+}
+
+/**
+ * ===========================
+ * ✅ ICS ROBUSTO (texto o base64)
+ * ===========================
+ */
+
+function looksLikeICS(str) {
+  if (!str || typeof str !== "string") return false;
+  return str.includes("BEGIN:VCALENDAR") && str.includes("END:VCALENDAR");
+}
+
+function looksLikeBase64(str) {
+  if (!str || typeof str !== "string") return false;
+  const s = str.trim();
+  if (s.length < 40) return false;
+  if (s.length % 4 !== 0) return false;
+  return /^[A-Za-z0-9+/=]+$/.test(s);
+}
+
+function icsToBuffer(icsData) {
+  if (!icsData) return null;
+
+  if (typeof icsData !== "string") {
+    try {
+      icsData = String(icsData);
+    } catch {
+      return null;
+    }
+  }
+
+  const raw = icsData.trim();
+
+  // Caso 1: viene como texto plano VCALENDAR
+  if (looksLikeICS(raw)) {
+    const normalized = raw.replace(/\r?\n/g, "\r\n");
+    return Buffer.from(normalized, "utf8");
+  }
+
+  // Caso 2: viene como base64
+  if (looksLikeBase64(raw)) {
+    const buf = Buffer.from(raw, "base64");
+    const preview = buf.toString("utf8", 0, Math.min(buf.length, 300));
+    if (!looksLikeICS(preview)) return null;
+    return buf;
+  }
+
+  return null;
+}
+
+async function sendICS(sock, remoteJid, icsData, opts = {}) {
+  const buf = icsToBuffer(icsData);
+  if (!buf) return false;
+
+  await sock.sendMessage(remoteJid, {
+    document: buf,
+    mimetype: "text/calendar; charset=utf-8",
+    fileName: opts.fileName || "cita_confirmada.ics",
+    caption: opts.caption || "📅 Toca aquí para guardar en tu calendario",
+  });
+
+  return true;
 }
 
 // ---------------------------------------------------------------------
@@ -291,11 +354,7 @@ async function getAvailableSlots(
 
   const openWindows = weeklyOpenWindows(weekStart, hours || []);
 
-  const offerableSlots = generateOfferableSlots(
-    openWindows,
-    bookings || [],
-    30
-  );
+  const offerableSlots = generateOfferableSlots(openWindows, bookings || [], 30);
 
   return offerableSlots.filter((slot) => slot.start >= startDate);
 }
@@ -502,10 +561,6 @@ const tools = [
 // 6. IA CON CEREBRO DINÁMICO (Lee la DB para saber qué ser)
 // ---------------------------------------------------------------------
 
-/**
- * historyMessages: array de mensajes previos [{role, content}] del chat con ese cliente.
- * userPhone: número de WhatsApp SIN @s.whatsapp.net
- */
 async function generateReply(
   text,
   tenantId,
@@ -513,7 +568,6 @@ async function generateReply(
   historyMessages = [],
   userPhone = null
 ) {
-  // 👇 Guard clause si no hay OpenAI configurado
   if (!openai) {
     logger.error(
       "[generateReply] OpenAI no está configurado, no puedo generar respuesta IA."
@@ -521,14 +575,13 @@ async function generateReply(
     return null;
   }
 
-  // 1. Cargamos TODA la identidad del negocio de la DB
   const { data: profile } = await supabase
     .from("business_profiles")
     .select("*")
     .eq("tenant_id", tenantId)
     .maybeSingle();
 
-  const businessType = profile?.business_type || "general"; // 'restaurante', 'clinica', 'barberia', 'tienda'
+  const businessType = profile?.business_type || "general";
   const botName = profile?.bot_name || "Asistente Virtual";
   const botTone = profile?.bot_tone || "Amable y profesional";
   const customRules =
@@ -543,10 +596,8 @@ async function generateReply(
     timeStyle: "short",
   });
 
-  // 2. Intentos detectados por intent_keywords
   const intentHints = await buildIntentHints(tenantId, text);
 
-  // 3. Construimos el Contexto según el TIPO de negocio
   let typeContext = "";
   switch (businessType) {
     case "restaurante":
@@ -582,25 +633,14 @@ async function generateReply(
       intentHints || "ninguno claro"
     }.
 
-    INTERPRETACIÓN DE INTENTOS:
-    - Si intent_keywords indica claramente algo como "reservar", "reprogramar", "cancelar" o "disponibilidad",
-      úsalo como pista fuerte para decidir qué herramienta usar primero.
-    - No contradigas el contenido literal del mensaje del cliente; úsalo como refuerzo.
-
-    INSTRUCCIONES DE COMPORTAMIENTO:
-    1. **Agendar es prioridad:** Si el cliente propone una hora y hay hueco, agenda de inmediato. No des vueltas innecesarias.
-    2. **Catálogo/Precios:** Si preguntan "qué venden", "precio" o "menú", EJECUTA la herramienta 'get_catalog'. No inventes precios.
-    3. **Datos Faltantes:** Si no tienes servicios configurados en el catálogo, NO te bloquees. Agenda la cita con 'serviceId: null' y pon en la nota lo que el cliente quiere.
-    4. **Soporte Humano:** Si el cliente pide hablar con "alguien", "humano" o "soporte", usa la herramienta 'human_handoff'.
-    5. **Listas de horarios:** Cuando uses 'check_availability' recibirás un JSON con 'slots', cada uno con:
-       - index (1,2,3,...)
-       - label (texto amigable para mostrar al cliente)
-       - isoStart (fecha/hora en ISO 8601)
-       Debes mostrar al cliente la lista usando 'label' y decirle que elija un número.
-    6. **Interpretar opciones:** Si el cliente dice "opción 3", "la 3", "la número 2", etc. DESPUÉS de haber visto una lista de horarios, SIEMPRE se refiere a esos 'slots', NO a productos del catálogo. Debes tomar el slot correspondiente por 'index' y llamar a 'create_booking' con:
-       - phone = "${userPhone || "el número del cliente en WhatsApp"}"
-       - startsAtISO = isoStart del slot elegido
-    7. **Confirmaciones vagas:** Si tú acabas de proponer un horario concreto (por ejemplo "12:00 p. m.") y el cliente responde "sí", "está bien", "perfecto", etc., interpreta eso como confirmación y llama de inmediato a 'create_booking' usando esa última hora acordada. No vuelvas a preguntar lo mismo.
+    INSTRUCCIONES:
+    1) Si el cliente propone una hora y hay hueco, agenda de inmediato.
+    2) Si preguntan precios/menú, usa get_catalog (no inventes).
+    3) Si falta serviceId, agenda con serviceId:null y mete detalle en notes.
+    4) Si piden humano/soporte, usa human_handoff.
+    5) Si check_availability te devuelve slots, lista por label y pide número.
+    6) Si el cliente elige opción N, usa el slot.isoStart para create_booking.
+    7) Si tú propusiste una hora y el cliente dice "sí", agenda ya.
   `.trim();
 
   const messages = [
@@ -619,7 +659,6 @@ async function generateReply(
 
     let message = completion.choices[0].message;
 
-    // --- MANEJO DE TOOLS ---
     if (message.tool_calls) {
       messages.push(message);
 
@@ -628,7 +667,6 @@ async function generateReply(
         const args = JSON.parse(toolCall.function.arguments || "{}");
         let response;
 
-        // A) CONSULTAR DISPONIBILIDAD
         if (fnName === "check_availability") {
           const rawSlots = await getAvailableSlots(
             tenantId,
@@ -637,13 +675,11 @@ async function generateReply(
             7
           );
 
-          // 🔥 Ordenamos cronológicamente
           const sortedSlots = (rawSlots || []).sort(
             (a, b) => a.start.getTime() - b.start.getTime()
           );
 
           if (sortedSlots.length > 0) {
-            // "Trampa" ISO: devolvemos estructura rica para que la IA pueda mapear número → ISO
             const slotObjects = sortedSlots.slice(0, 12).map((s, i) => {
               const timeStr = s.start.toLocaleString("es-DO", {
                 timeZone: tz,
@@ -674,10 +710,7 @@ async function generateReply(
               slots: [],
             });
           }
-        }
-
-        // B) CONSULTAR CATÁLOGO (Universal)
-        else if (fnName === "get_catalog") {
+        } else if (fnName === "get_catalog") {
           const { data: items } = await supabase
             .from("items")
             .select("name, price_cents, description, type")
@@ -695,13 +728,10 @@ async function generateReply(
           } else {
             response = JSON.stringify({
               message:
-                "El catálogo está vacío en el sistema. Responde basándote solo en las Reglas del Negocio (custom_instructions) o sugiere contactar al humano.",
+                "El catálogo está vacío en el sistema. Responde basándote solo en custom_instructions o sugiere contactar al humano.",
             });
           }
-        }
-
-        // C) CREAR CITA / RESERVA
-        else if (fnName === "create_booking") {
+        } else if (fnName === "create_booking") {
           const phoneArg = args.phone || userPhone;
           const startsISO = args.startsAtISO;
 
@@ -750,10 +780,7 @@ async function generateReply(
               });
             }
           }
-        }
-
-        // D) PASAR A HUMANO
-        else if (fnName === "human_handoff") {
+        } else if (fnName === "human_handoff") {
           if (humanPhone) {
             const clean = humanPhone.replace(/\D/g, "");
             response = JSON.stringify({
@@ -765,10 +792,7 @@ async function generateReply(
                 "No tengo un número de contacto directo configurado. Dile que deje su mensaje y lo contactaremos.",
             });
           }
-        }
-
-        // E) REAGENDAR (REAL)
-        else if (fnName === "reschedule_booking") {
+        } else if (fnName === "reschedule_booking") {
           const phoneFilter =
             args.customerPhone || args.phone || userPhone || null;
 
@@ -793,9 +817,7 @@ async function generateReply(
               const newStart = args.newStartsAtISO;
               const newEnd =
                 args.newEndsAtISO ||
-                new Date(
-                  new Date(newStart).getTime() + 60 * 60000
-                ).toISOString();
+                new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
 
               const { error } = await supabase
                 .from("bookings")
@@ -821,10 +843,7 @@ async function generateReply(
               });
             }
           }
-        }
-
-        // F) CANCELAR (REAL)
-        else if (fnName === "cancel_booking") {
+        } else if (fnName === "cancel_booking") {
           const phoneFilter =
             args.customerPhone || args.phone || userPhone || null;
 
@@ -879,7 +898,6 @@ async function generateReply(
         });
       }
 
-      // Segunda llamada a OpenAI con los resultados de las herramientas
       const finalReply = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages,
@@ -902,7 +920,6 @@ async function updateSessionDB(tenantId, updateData) {
   if (!tenantId) return;
 
   try {
-    // 1) Ver si ya existe una fila para este tenant
     const { data: existing, error: selectError } = await supabase
       .from("whatsapp_sessions")
       .select("id")
@@ -917,7 +934,6 @@ async function updateSessionDB(tenantId, updateData) {
       return;
     }
 
-    // 2) Si existe, hacemos UPDATE; si no, INSERT
     if (existing) {
       const { error: updateError } = await supabase
         .from("whatsapp_sessions")
@@ -948,7 +964,6 @@ async function updateSessionDB(tenantId, updateData) {
       }
     }
 
-    // 3) Sincronizamos también la columna wa_connected en tenants (si viene status)
     if (updateData.status) {
       const isConnected = updateData.status === "connected";
       const { error: tenantError } = await supabase
@@ -979,9 +994,8 @@ async function getOrCreateCustomer(tenantId, phoneNumber) {
     );
   }
 
-  // Buscar
   const { data, error } = await supabase
-    .from("customers") // 👈 asegúrate de que la tabla se llame así
+    .from("customers")
     .select("id")
     .eq("tenant_id", tenantId)
     .eq("phone_number", phoneNumber)
@@ -994,7 +1008,6 @@ async function getOrCreateCustomer(tenantId, phoneNumber) {
 
   if (data) return data.id;
 
-  // Crear
   const { data: created, error: insertError } = await supabase
     .from("customers")
     .insert({
@@ -1017,12 +1030,10 @@ function buildBookingEventFromMessage(text, session) {
   const currentFlow = session.current_flow;
   const step = session.step;
 
-  // Si usuario dice cancelar flujo
   if (lower === "cancelar" || lower === "olvídalo" || lower === "olvidalo") {
     return { type: "CANCEL_FLOW" };
   }
 
-  // 1) Si no hay flujo activo → iniciar booking
   if (!currentFlow) {
     if (
       lower.includes("cita") ||
@@ -1034,23 +1045,19 @@ function buildBookingEventFromMessage(text, session) {
       return { type: "START_BOOKING" };
     }
 
-    // Fallback: arrancar booking igual
     return { type: "START_BOOKING" };
   }
 
-  // 2) Flujos activos de BOOKING
   if (currentFlow === "BOOKING") {
     if (step === "SELECT_SERVICE") {
-      // 🔴 Aquí conecta con tus services reales
-      // De momento: IDs simbólicos a reemplazar por UUID reales
       let serviceId = null;
 
       if (lower.includes("corte") && lower.includes("barba")) {
-        serviceId = "service_corte_barba"; // TODO: reemplazar
+        serviceId = "service_corte_barba";
       } else if (lower.includes("corte")) {
-        serviceId = "service_corte"; // TODO: reemplazar
+        serviceId = "service_corte";
       } else if (lower.includes("barba")) {
-        serviceId = "service_barba"; // TODO: reemplazar
+        serviceId = "service_barba";
       }
 
       return {
@@ -1066,8 +1073,7 @@ function buildBookingEventFromMessage(text, session) {
       const dd = String(today.getDate()).padStart(2, "0");
       let targetDate = `${yyyy}-${mm}-${dd}`;
 
-      const isTomorrow =
-        lower.includes("mañana") || lower.includes("manana");
+      const isTomorrow = lower.includes("mañana") || lower.includes("manana");
 
       if (isTomorrow) {
         const t2 = new Date(today.getTime() + 24 * 60 * 60 * 1000);
@@ -1098,7 +1104,6 @@ function buildBookingEventFromMessage(text, session) {
     }
   }
 
-  // Fallback
   return { type: "START_BOOKING" };
 }
 
@@ -1106,10 +1111,6 @@ function buildBookingEventFromMessage(text, session) {
 // 9. AUTH STATE MONOLÍTICO
 // ---------------------------------------------------------------------
 
-/**
- * Wrapper sobre useMultiFileAuthState de Baileys.
- * Crea una carpeta por tenant dentro de .wa-sessions (o la que definas).
- */
 async function useSupabaseAuthState(tenantId) {
   if (!tenantId) throw new Error("useSupabaseAuthState requiere tenantId");
 
@@ -1117,7 +1118,6 @@ async function useSupabaseAuthState(tenantId) {
 
   const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
 
-  // Nos aseguramos de que la carpeta exista
   if (!fs.existsSync(sessionFolder)) {
     fs.mkdirSync(sessionFolder, { recursive: true });
   }
@@ -1156,7 +1156,7 @@ async function getOrCreateSession(tenantId) {
     socket: sock,
     status: "connecting",
     qr: null,
-    conversations: new Map(), // phone -> { history: [...] }
+    conversations: new Map(),
   };
   sessions.set(tenantId, info);
 
@@ -1191,52 +1191,46 @@ async function getOrCreateSession(tenantId) {
 
     if (connection === "close") {
       const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !==
-        DisconnectReason.loggedOut;
-      
-      // LOGICA DE RECONEXIÓN MEJORADA
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+
       if (shouldReconnect) {
         sessions.delete(tenantId);
-        logger.info({ tenantId }, "🔄 Conexión perdida, intentando reconectar automáticamente...");
-        getOrCreateSession(tenantId); // RECONECTAR AUTOMÁTICAMENTE
+        logger.info(
+          { tenantId },
+          "🔄 Conexión perdida, intentando reconectar automáticamente..."
+        );
+        getOrCreateSession(tenantId);
       } else {
         sessions.delete(tenantId);
         await updateSessionDB(tenantId, {
           status: "disconnected",
           qr_data: null,
         });
-        logger.info({ tenantId }, "❌ Sesión cerrada permanentemente (Logout).");
+        logger.info(
+          { tenantId },
+          "❌ Sesión cerrada permanentemente (Logout)."
+        );
       }
     }
   });
 
   sock.ev.on("creds.update", saveCreds);
 
-  // 🔥 Handler de mensajes con logs y fallback robusto
   sock.ev.on("messages.upsert", async (m) => {
     try {
       const msg = m.messages?.[0];
       if (!msg) return;
 
-      logger.info(
-        { tenantId, key: msg.key },
-        "[wa-server] 📩 messages.upsert recibido"
-      );
+      logger.info({ tenantId, key: msg.key }, "[wa-server] 📩 messages.upsert recibido");
 
       if (!msg?.message || msg.key.fromMe) {
-        logger.info(
-          { tenantId },
-          "[wa-server] Mensaje sin contenido o enviado por mí, se ignora."
-        );
+        logger.info({ tenantId }, "[wa-server] Mensaje sin contenido o enviado por mí, se ignora.");
         return;
       }
 
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid || remoteJid.includes("@g.us")) {
-        logger.info(
-          { tenantId, remoteJid },
-          "[wa-server] Mensaje de grupo o sin remoteJid, se ignora."
-        );
+        logger.info({ tenantId, remoteJid }, "[wa-server] Mensaje de grupo o sin remoteJid, se ignora.");
         return;
       }
 
@@ -1246,25 +1240,17 @@ async function getOrCreateSession(tenantId) {
         msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
 
       if (!text) {
-        logger.info(
-          { tenantId, remoteJid },
-          "[wa-server] Mensaje sin texto, se ignora."
-        );
+        logger.info({ tenantId, remoteJid }, "[wa-server] Mensaje sin texto, se ignora.");
         return;
       }
 
       const pushName = msg.pushName || "Cliente";
       const userPhone = remoteJid.split("@")[0];
 
-      logger.info(
-        { tenantId, remoteJid, text },
-        "[wa-server] Procesando mensaje entrante de WhatsApp"
-      );
+      logger.info({ tenantId, remoteJid, text }, "[wa-server] Procesando mensaje entrante de WhatsApp");
 
-      // --- Memoria por conversación (teléfono) en RAM (para OpenAI fallback) ---
-      if (!info.conversations) {
-        info.conversations = new Map();
-      }
+      if (!info.conversations) info.conversations = new Map();
+
       let convo = info.conversations.get(userPhone);
       if (!convo) {
         convo = { history: [] };
@@ -1272,31 +1258,15 @@ async function getOrCreateSession(tenantId) {
       }
       const history = convo.history || [];
 
-      // ---------------------------
-      // 1) Estado de conversación en DB (conversation_sessions)
-      // ---------------------------
-      const convoSession =
-        await convoState.getOrCreateSession(tenantId, userPhone);
-
-      // ---------------------------
-      // 2) Customer en DB
-      // ---------------------------
+      const convoSession = await convoState.getOrCreateSession(tenantId, userPhone);
       const customerId = await getOrCreateCustomer(tenantId, userPhone);
-
-      // ---------------------------
-      // 3) Evento de booking
-      // ---------------------------
       const event = buildBookingEventFromMessage(text, convoSession);
 
-      // ---------------------------
-      // 4) Llamar al bot de Next (/api/whatsapp-bot)
-      // ---------------------------
-      // 👇 URL HARDCODED PARA EVITAR ERRORES DE ENV
       const botApiUrl = "https://bot-suite.onrender.com/api/whatsapp-bot";
-      
+
       let replyText = null;
       let newState = null;
-      let icsData = null; // Variable para capturar el archivo
+      let icsData = null;
 
       if (!botApiUrl) {
         logger.error("[wa-server] BOT_API_URL no está configurado.");
@@ -1316,30 +1286,17 @@ async function getOrCreateSession(tenantId) {
         };
 
         try {
-          logger.info(
-            { tenantId, url: botApiUrl },
-            "[wa-server] Llamando a /api/whatsapp-bot (Timeout 60s)"
-          );
-
-          // 👇 TIMEOUT AUMENTADO A 60 SEGUNDOS
-          const response = await axios.post(botApiUrl, payload, {
-            timeout: 60000,
-          });
+          logger.info({ tenantId, url: botApiUrl }, "[wa-server] Llamando a /api/whatsapp-bot (Timeout 60s)");
+          const response = await axios.post(botApiUrl, payload, { timeout: 60000 });
 
           if (response.data && response.data.ok) {
             replyText = response.data.reply;
             newState = response.data.newState;
-            icsData = response.data.icsData; // <-- Captura archivo del cerebro nuevo
-            
-            logger.info(
-              { tenantId },
-              "[wa-server] Respuesta OK de /api/whatsapp-bot"
-            );
+            icsData = response.data.icsData;
+
+            logger.info({ tenantId }, "[wa-server] Respuesta OK de /api/whatsapp-bot");
           } else {
-            logger.error(
-              "[wa-server] Respuesta no OK de /api/whatsapp-bot:",
-              response.data
-            );
+            logger.error("[wa-server] Respuesta no OK de /api/whatsapp-bot:", response.data);
           }
         } catch (err) {
           logger.error(
@@ -1349,21 +1306,9 @@ async function getOrCreateSession(tenantId) {
         }
       }
 
-      // ---------------------------
-      // 5) Fallback a OpenAI tools si algo falla
-      // ---------------------------
       if (!replyText) {
-        logger.info(
-          { tenantId },
-          "[wa-server] Usando fallback de OpenAI para generar respuesta"
-        );
-        const fallback = await generateReply(
-          text,
-          tenantId,
-          pushName,
-          history,
-          userPhone
-        );
+        logger.info({ tenantId }, "[wa-server] Usando fallback de OpenAI para generar respuesta");
+        const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
         replyText =
           fallback ||
           "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
@@ -1374,9 +1319,6 @@ async function getOrCreateSession(tenantId) {
         };
       }
 
-      // ---------------------------
-      // 6) Actualizar estado de conversation_sessions en DB
-      // ---------------------------
       if (newState) {
         try {
           await convoState.updateSession(convoSession.id, {
@@ -1389,29 +1331,30 @@ async function getOrCreateSession(tenantId) {
         }
       }
 
-      // ---------------------------
-      // 7) Enviar respuesta por WhatsApp
-      // ---------------------------
+      // 7) Enviar texto
       await sock.sendMessage(remoteJid, { text: replyText });
-      
-      // 8) Enviar Archivo ICS si vino en la respuesta del Bot
+
+      // 8) ✅ Enviar ICS (robusto)
       if (icsData) {
-          logger.info({ tenantId }, "📎 Enviando archivo ICS al usuario...");
-          const icsBuffer = Buffer.from(icsData); // Ya es string, lo hacemos buffer
-          await sock.sendMessage(remoteJid, {
-              document: icsBuffer,
-              mimetype: 'text/calendar',
-              fileName: 'cita_confirmada.ics',
-              caption: '📅 Toca aquí para guardar en tu calendario'
-          });
+        logger.info({ tenantId }, "📎 Intentando enviar archivo ICS al usuario...");
+
+        const ok = await sendICS(sock, remoteJid, icsData, {
+          fileName: "cita_confirmada.ics",
+          caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
+        });
+
+        if (!ok) {
+          logger.warn(
+            { tenantId },
+            "⚠️ Llegó icsData pero no parece un ICS válido (ni texto ni base64). No se envió."
+          );
+        } else {
+          logger.info({ tenantId }, "✅ ICS enviado correctamente.");
+        }
       }
 
-      logger.info(
-        { tenantId, remoteJid },
-        "[wa-server] ✅ Respuesta enviada por WhatsApp"
-      );
+      logger.info({ tenantId, remoteJid }, "[wa-server] ✅ Respuesta enviada por WhatsApp");
 
-      // Guardar historial para OpenAI (solo si usamos fallback)
       history.push({ role: "user", content: text });
       history.push({ role: "assistant", content: replyText });
 
@@ -1546,7 +1489,7 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
 
         await session.socket.sendMessage(jid, {
           document: icsBuffer,
-          mimetype: "text/calendar",
+          mimetype: "text/calendar; charset=utf-8",
           fileName: "agendar_cita.ics",
           caption:
             "📅 Toca este archivo para agregar el recordatorio a tu calendario.",
@@ -1578,14 +1521,13 @@ app.post("/sessions/:tenantId/send-media", async (req, res) => {
     return res.status(400).json({ error: "Faltan datos (phone, base64, type)" });
   }
 
-  // Verificar sesión
   let session = sessions.get(tenantId);
   if (!session || session.status !== "connected") {
-    // Intento rápido de reconexión si está en memoria pero desconectado
-    try { session = await getOrCreateSession(tenantId); } catch (e) {}
+    try {
+      session = await getOrCreateSession(tenantId);
+    } catch (e) {}
   }
 
-  // Doble chequeo por si falló la reconexión
   session = sessions.get(tenantId);
   if (!session || session.status !== "connected") {
     return res.status(400).json({ error: "Bot no conectado." });
@@ -1594,37 +1536,35 @@ app.post("/sessions/:tenantId/send-media", async (req, res) => {
   const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
 
   try {
-    // 1. Convertir Base64 a Buffer
-    const mediaBuffer = Buffer.from(base64, 'base64');
+    const mediaBuffer = Buffer.from(base64, "base64");
 
-    // 2. Construir payload según tipo
     let messagePayload = {};
 
-    if (type === 'document') {
+    if (type === "document") {
       messagePayload = {
         document: mediaBuffer,
-        mimetype: mimetype || 'application/octet-stream',
-        fileName: fileName || 'archivo.bin',
-        caption: caption || ''
+        mimetype: mimetype || "application/octet-stream",
+        fileName: fileName || "archivo.bin",
+        caption: caption || "",
       };
-    } else if (type === 'image') {
+    } else if (type === "image") {
       messagePayload = {
         image: mediaBuffer,
-        caption: caption || ''
+        caption: caption || "",
       };
-    } else if (type === 'audio') {
+    } else if (type === "audio") {
       messagePayload = {
         audio: mediaBuffer,
-        mimetype: mimetype || 'audio/mp4'
+        mimetype: mimetype || "audio/mp4",
       };
+    } else {
+      return res.status(400).json({ error: "type inválido. Usa document|image|audio" });
     }
 
-    // 3. Enviar con Baileys
     await session.socket.sendMessage(jid, messagePayload);
 
     logger.info({ tenantId, phone, type }, "📎 Archivo enviado por API externa");
     res.json({ ok: true });
-
   } catch (e) {
     logger.error(e, "Error enviando media");
     res.status(500).json({ error: "Error enviando archivo: " + e.message });
@@ -1654,20 +1594,16 @@ app.get("/api/v1/availability", async (req, res) => {
     7
   );
 
-  // Ordenamos también aquí, por si acaso
-  const sorted = (slots || []).sort(
-    (a, b) => a.start.getTime() - b.start.getTime()
-  );
+  const sorted = (slots || []).sort((a, b) => a.start.getTime() - b.start.getTime());
 
-  const formattedSlots = sorted.map(
-    (s) =>
-      `${s.start.toLocaleString("es-DO", {
-        weekday: "short",
-        month: "numeric",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      })}`
+  const formattedSlots = sorted.map((s) =>
+    `${s.start.toLocaleString("es-DO", {
+      weekday: "short",
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    })}`
   );
 
   res.json({
@@ -1768,21 +1704,15 @@ app.post("/api/v1/create-booking", async (req, res) => {
 
       await session.socket.sendMessage(jid, {
         document: icsBuffer,
-        mimetype: "text/calendar",
+        mimetype: "text/calendar; charset=utf-8",
         fileName: "cita_confirmada.ics",
         caption:
           "📅 Tu cita fue agendada. Toca este archivo para agregar el recordatorio a tu calendario.",
       });
 
-      logger.info(
-        { tenantId, bookingId: booking.id },
-        "✅ Booking creado y mensaje enviado"
-      );
+      logger.info({ tenantId, bookingId: booking.id }, "✅ Booking creado y mensaje enviado");
     } else {
-      logger.warn(
-        { tenantId, bookingId: booking.id },
-        "Booking creado pero bot no conectado"
-      );
+      logger.warn({ tenantId, bookingId: booking.id }, "Booking creado pero bot no conectado");
     }
   } catch (e) {
     logger.error(e, "Error enviando confirmación de creación de cita");
@@ -1804,13 +1734,8 @@ app.post("/api/v1/create-booking", async (req, res) => {
 // ---------------------------------------------------------------------
 
 app.post("/api/v1/reschedule-booking", async (req, res) => {
-  const {
-    tenantId,
-    bookingId,
-    newStartsAtISO,
-    newEndsAtISO,
-    extraVariables,
-  } = req.body || {};
+  const { tenantId, bookingId, newStartsAtISO, newEndsAtISO, extraVariables } =
+    req.body || {};
 
   if (!tenantId || !bookingId || !newStartsAtISO || !newEndsAtISO) {
     return res.status(400).json({
@@ -1839,9 +1764,10 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
   }
 
   if (!updatedBooking) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "booking_not_found_or_not_owned" });
+    return res.status(404).json({
+      ok: false,
+      error: "booking_not_found_or_not_owned",
+    });
   }
 
   try {
@@ -1862,10 +1788,7 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
         const dateStr = startsDate.toISOString().slice(0, 10);
         const timeStr = startsDate.toTimeString().slice(0, 5);
 
-        const templateBody = await getTemplate(
-          tenantId,
-          "booking_rescheduled"
-        );
+        const templateBody = await getTemplate(tenantId, "booking_rescheduled");
 
         const vars = {
           date: dateStr,
@@ -1890,27 +1813,18 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
 
         await session.socket.sendMessage(jid, {
           document: icsBuffer,
-          mimetype: "text/calendar",
+          mimetype: "text/calendar; charset=utf-8",
           fileName: "cita_reagendada.ics",
           caption:
             "📅 Tu cita fue reagendada. Toca este archivo para actualizar el recordatorio en tu calendario.",
         });
 
-        logger.info(
-          { tenantId, bookingId },
-          "✅ Booking reagendado y mensaje enviado"
-        );
+        logger.info({ tenantId, bookingId }, "✅ Booking reagendado y mensaje enviado");
       } else {
-        logger.warn(
-          { tenantId, bookingId },
-          "Booking reagendado pero sin teléfono para notificar"
-        );
+        logger.warn({ tenantId, bookingId }, "Booking reagendado pero sin teléfono para notificar");
       }
     } else {
-      logger.warn(
-        { tenantId, bookingId },
-        "Booking reagendado pero bot no conectado"
-      );
+      logger.warn({ tenantId, bookingId }, "Booking reagendado pero bot no conectado");
     }
   } catch (e) {
     logger.error(e, "Error enviando confirmación de reagendamiento");
@@ -1944,9 +1858,7 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 
   const { data: cancelledBooking, error } = await supabase
     .from("bookings")
-    .update({
-      status: "cancelled",
-    })
+    .update({ status: "cancelled" })
     .eq("id", bookingId)
     .eq("tenant_id", tenantId)
     .select("*")
@@ -1958,9 +1870,10 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
   }
 
   if (!cancelledBooking) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "booking_not_found_or_not_owned" });
+    return res.status(404).json({
+      ok: false,
+      error: "booking_not_found_or_not_owned",
+    });
   }
 
   try {
@@ -2001,21 +1914,12 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 
         await session.socket.sendMessage(jid, { text: msg });
 
-        logger.info(
-          { tenantId, bookingId },
-          "✅ Booking cancelado y mensaje enviado"
-        );
+        logger.info({ tenantId, bookingId }, "✅ Booking cancelado y mensaje enviado");
       } else {
-        logger.warn(
-          { tenantId, bookingId },
-          "Booking cancelado pero sin teléfono para notificar"
-        );
+        logger.warn({ tenantId, bookingId }, "Booking cancelado pero sin teléfono para notificar");
       }
     } else {
-      logger.warn(
-        { tenantId, bookingId },
-        "Booking cancelado pero bot no conectado"
-      );
+      logger.warn({ tenantId, bookingId }, "Booking cancelado pero bot no conectado");
     }
   } catch (e) {
     logger.error(e, "Error enviando confirmación de cancelación");
@@ -2062,10 +1966,7 @@ async function restoreSessions() {
           last_seen_at: new Date().toISOString(),
         });
       } catch (err) {
-        logger.error(
-          { tenantId, err },
-          "Error restaurando sesión de WhatsApp"
-        );
+        logger.error({ tenantId, err }, "Error restaurando sesión de WhatsApp");
       }
     }
   } catch (e) {
