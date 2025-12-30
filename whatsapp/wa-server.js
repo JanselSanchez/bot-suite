@@ -1262,7 +1262,7 @@ async function getOrCreateSession(tenantId) {
       const customerId = await getOrCreateCustomer(tenantId, userPhone);
       const event = buildBookingEventFromMessage(text, convoSession);
 
-      const botApiUrl = "https://bot-suite.onrender.com/api/whatsapp-bot";
+      const botApiUrl = process.env.N8N_WEBHOOK_URL; // 👈 Ahora sí leerá tu enlace de n8n
 
       let replyText = null;
       let newState = null;
@@ -1289,15 +1289,21 @@ async function getOrCreateSession(tenantId) {
           logger.info({ tenantId, url: botApiUrl }, "[wa-server] Llamando a /api/whatsapp-bot (Timeout 60s)");
           const response = await axios.post(botApiUrl, payload, { timeout: 60000 });
 
-          if (response.data && response.data.ok) {
-            replyText = response.data.reply;
-            newState = response.data.newState;
-            icsData = response.data.icsData;
-
-            logger.info({ tenantId }, "[wa-server] Respuesta OK de /api/whatsapp-bot");
-          } else {
-            logger.error("[wa-server] Respuesta no OK de /api/whatsapp-bot:", response.data);
-          }
+         // --- INICIO DEL CAMBIO ---
+if (response.data) {
+  // CASO 1: Respuesta de n8n (Simple)
+  if (response.data.data) {
+      replyText = response.data.data;
+      logger.info({ tenantId }, "[wa-server] Respuesta recibida de n8n");
+  } 
+  // CASO 2: Respuesta de bot-suite antigua (Compleja)
+  else if (response.data.reply) {
+      replyText = response.data.reply;
+      newState = response.data.newState;
+      icsData = response.data.icsData;
+  }
+}
+// --- FIN DEL CAMBIO ---
         } catch (err) {
           logger.error(
             "[wa-server] Error al llamar a /api/whatsapp-bot:",
