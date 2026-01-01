@@ -1,3 +1,14 @@
+/**
+ * wa-server.js — versión corregida (producción)
+ *
+ * FIXES CLAVE:
+ * 1) ✅ /sessions/:tenantId/send-message definido ANTES de app.listen (si estaba después, Express no lo registraba bien en algunos deploys / hot reload)
+ * 2) ✅ Normaliza N8N_WEBHOOK_URL: soporta response { data }, { reply }, { replyText }, { message } para evitar “no replyText”
+ * 3) ✅ Logging más claro (y sin reventar por objetos grandes)
+ * 4) ✅ Manejo robusto de sesión al enviar mensajes: intenta getOrCreateSession si no está connected
+ * 5) ✅ Hardening básico: timeouts, validaciones, y errores consistentes
+ */
+
 require("dotenv").config({ path: ".env.local" });
 require("dotenv").config();
 
@@ -10,7 +21,7 @@ const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
 const fs = require("fs");
-const axios = require("axios"); // 👈 para llamar al bot de Next
+const axios = require("axios");
 
 // Importaciones de Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -23,7 +34,7 @@ const convoState = require("./conversationState");
 // ---------------------------------------------------------------------
 
 const app = express();
-app.use(express.json({ limit: "20mb" })); // 👈 por si envías base64 grande
+app.use(express.json({ limit: "20mb" }));
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
 // 🔥 AJUSTE DE ZONA HORARIA (CRÍTICO)
@@ -57,11 +68,9 @@ const openaiApiKey =
 
 if (!openaiApiKey) {
   console.warn(
-    "[wa-server] ⚠️ No hay API key de OpenAI configurada (OPENAI_API_KEY / OPENAI_KEY). " +
-      "El fallback de IA no va a funcionar."
+    "[wa-server] ⚠️ No hay API key de OpenAI configurada (OPENAI_API_KEY / OPENAI_KEY). El fallback de IA no va a funcionar."
   );
 }
-
 const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
 
 /**
@@ -105,20 +114,16 @@ function weeklyOpenWindows(weekStart, businessHours) {
   const windows = [];
   let currentDayCursor = new Date(weekStart);
 
-  // Iteramos 7 días
   for (let i = 0; i < 7; i++) {
     const currentDow = currentDayCursor.getDay(); // 0=Dom, 1=Lun...
 
-    // Buscamos configuración para este día que NO esté cerrado
     const dayConfig = businessHours.find(
       (bh) => bh.dow === currentDow && bh.is_closed === false
     );
 
     if (dayConfig && dayConfig.open_time && dayConfig.close_time) {
       const { h: openH, m: openM } = hmsToParts(toHHMM(dayConfig.open_time));
-      const { h: closeH, m: closeM } = hmsToParts(
-        toHHMM(dayConfig.close_time)
-      );
+      const { h: closeH, m: closeM } = hmsToParts(toHHMM(dayConfig.close_time));
 
       // 🔥 CORRECCIÓN UTC: Sumamos el offset a la hora de apertura/cierre
       const start = new Date(currentDayCursor);
@@ -127,12 +132,9 @@ function weeklyOpenWindows(weekStart, businessHours) {
       const end = new Date(currentDayCursor);
       end.setHours(closeH + SERVER_OFFSET_HOURS, closeM, 0, 0);
 
-      // Si la ventana es válida (cierra después de abrir), la guardamos
-      if (end > start) {
-        windows.push({ start, end });
-      }
+      if (end > start) windows.push({ start, end });
     }
-    // Avanzamos al siguiente día
+
     currentDayCursor.setDate(currentDayCursor.getDate() + 1);
   }
   return windows;
@@ -151,25 +153,19 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
       const slotEnd = new Date(cursor);
       slotEnd.setMinutes(slotEnd.getMinutes() + stepMin);
 
-      // Si el slot se sale del cierre, paramos
       if (slotEnd.getTime() > windowEnd.getTime()) break;
 
-      // Detectar colisiones con citas existentes
-      const isBusy = bookings.some((booking) => {
+      const isBusy = (bookings || []).some((booking) => {
         const busyStart = new Date(booking.starts_at);
         const busyEnd = new Date(booking.ends_at);
-        // Lógica de solapamiento
         return (
           cursor.getTime() < busyEnd.getTime() &&
           slotEnd.getTime() > busyStart.getTime()
         );
       });
 
-      if (!isBusy) {
-        slots.push({ start: new Date(cursor), end: slotEnd });
-      }
+      if (!isBusy) slots.push({ start: new Date(cursor), end: slotEnd });
 
-      // Avanzamos al siguiente bloque
       cursor.setMinutes(cursor.getMinutes() + stepMin);
     }
   }
@@ -222,11 +218,8 @@ function createICSFile(
 }
 
 /**
- * ===========================
  * ✅ ICS ROBUSTO (texto o base64)
- * ===========================
  */
-
 function looksLikeICS(str) {
   if (!str || typeof str !== "string") return false;
   return str.includes("BEGIN:VCALENDAR") && str.includes("END:VCALENDAR");
@@ -253,13 +246,11 @@ function icsToBuffer(icsData) {
 
   const raw = icsData.trim();
 
-  // Caso 1: viene como texto plano VCALENDAR
   if (looksLikeICS(raw)) {
     const normalized = raw.replace(/\r?\n/g, "\r\n");
     return Buffer.from(normalized, "utf8");
   }
 
-  // Caso 2: viene como base64
   if (looksLikeBase64(raw)) {
     const buf = Buffer.from(raw, "base64");
     const preview = buf.toString("utf8", 0, Math.min(buf.length, 300));
@@ -296,8 +287,7 @@ async function getTenantContext(tenantId) {
       .eq("id", tenantId)
       .maybeSingle();
 
-    if (!data)
-      return { name: "el negocio", vertical: "general", description: "" };
+    if (!data) return { name: "el negocio", vertical: "general", description: "" };
     return data;
   } catch (e) {
     return { name: "el negocio", vertical: "general", description: "" };
@@ -321,12 +311,7 @@ function renderTemplate(body, variables = {}) {
   return body.replace(/\{\{(\w+)\}\}/g, (_, key) => variables[key] || "");
 }
 
-async function getAvailableSlots(
-  tenantId,
-  resourceId,
-  startDate,
-  daysToLookAhead = 7
-) {
+async function getAvailableSlots(tenantId, resourceId, startDate, daysToLookAhead = 7) {
   if (!tenantId) return [];
 
   const weekStart = startOfWeek(startDate, { weekStartsOn: 1 });
@@ -347,13 +332,11 @@ async function getAvailableSlots(
     .lt("ends_at", addDays(weekEnd, 1).toISOString())
     .in("status", ["confirmed", "pending"]);
 
-  if (resourceId) {
-    bookingsQuery = bookingsQuery.eq("resource_id", resourceId);
-  }
+  if (resourceId) bookingsQuery = bookingsQuery.eq("resource_id", resourceId);
+
   const { data: bookings } = await bookingsQuery;
 
   const openWindows = weeklyOpenWindows(weekStart, hours || []);
-
   const offerableSlots = generateOfferableSlots(openWindows, bookings || [], 30);
 
   return offerableSlots.filter((slot) => slot.start >= startDate);
@@ -367,7 +350,7 @@ function normalizeForIntent(str = "") {
   return str
     .toString()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // quitar acentos
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .trim();
 }
@@ -384,23 +367,18 @@ async function buildIntentHints(tenantId, userText) {
       .select("intent, frase, peso, es_error, locale, term, tenant_id")
       .or(`tenant_id.eq.${tenantId},tenant_id.is.null`);
 
-    if (error || !data || data.length === 0) {
-      return "";
-    }
+    if (error || !data || data.length === 0) return "";
 
     const scores = {}; // intent -> { score, terms: Set<string> }
 
     for (const row of data) {
-      // Filtrar por locale si viene
       if (
         row.locale &&
         normalizeForIntent(row.locale) !== normalizeForIntent("es-DO") &&
         normalizeForIntent(row.locale) !== normalizeForIntent("es")
-      ) {
-        continue;
-      }
+      ) continue;
 
-      if (row.es_error) continue; // ignoramos ejemplos marcados como error
+      if (row.es_error) continue;
 
       const term = row.term || row.frase;
       if (!term) continue;
@@ -411,11 +389,7 @@ async function buildIntentHints(tenantId, userText) {
       if (normalizedUser.includes(normTerm)) {
         const intent = row.intent || "desconocido";
         if (!scores[intent]) {
-          scores[intent] = {
-            intent,
-            score: 0,
-            terms: new Set(),
-          };
+          scores[intent] = { intent, score: 0, terms: new Set() };
         }
         const peso = typeof row.peso === "number" ? row.peso : 1;
         scores[intent].score += peso;
@@ -426,7 +400,6 @@ async function buildIntentHints(tenantId, userText) {
     const intentsArr = Object.values(scores);
     if (intentsArr.length === 0) return "";
 
-    // Ordenar por score desc y limitar a top 3
     intentsArr.sort((a, b) => b.score - a.score);
     const topIntents = intentsArr.slice(0, 3).map((i) => ({
       intent: i.intent,
@@ -434,10 +407,7 @@ async function buildIntentHints(tenantId, userText) {
       terms: Array.from(i.terms),
     }));
 
-    return JSON.stringify({
-      engine: "intent_keywords",
-      intents: topIntents,
-    });
+    return JSON.stringify({ engine: "intent_keywords", intents: topIntents });
   } catch (e) {
     console.error("[buildIntentHints] error:", e);
     return "";
@@ -457,9 +427,7 @@ const tools = [
         "Consulta disponibilidad. Úsalo para ver huecos libres para citas o reservas.",
       parameters: {
         type: "object",
-        properties: {
-          requestedDate: { type: "string", description: "Fecha ISO base." },
-        },
+        properties: { requestedDate: { type: "string", description: "Fecha ISO base." } },
         required: ["requestedDate"],
       },
     },
@@ -519,19 +487,9 @@ const tools = [
       parameters: {
         type: "object",
         properties: {
-          customerPhone: {
-            type: "string",
-            description: "Teléfono del cliente (WhatsApp).",
-          },
-          newStartsAtISO: {
-            type: "string",
-            description: "Nueva fecha/hora inicio en formato ISO 8601.",
-          },
-          newEndsAtISO: {
-            type: "string",
-            description:
-              "Nueva fecha/hora fin en formato ISO 8601. Opcional; si no se envía se asume 1 hora.",
-          },
+          customerPhone: { type: "string", description: "Teléfono del cliente (WhatsApp)." },
+          newStartsAtISO: { type: "string", description: "Nueva fecha/hora inicio ISO 8601." },
+          newEndsAtISO: { type: "string", description: "Nueva fecha/hora fin ISO. Opcional." },
         },
         required: ["customerPhone", "newStartsAtISO"],
       },
@@ -546,10 +504,7 @@ const tools = [
       parameters: {
         type: "object",
         properties: {
-          customerPhone: {
-            type: "string",
-            description: "Teléfono del cliente (WhatsApp).",
-          },
+          customerPhone: { type: "string", description: "Teléfono del cliente (WhatsApp)." },
         },
         required: ["customerPhone"],
       },
@@ -561,17 +516,9 @@ const tools = [
 // 6. IA CON CEREBRO DINÁMICO (Lee la DB para saber qué ser)
 // ---------------------------------------------------------------------
 
-async function generateReply(
-  text,
-  tenantId,
-  pushName,
-  historyMessages = [],
-  userPhone = null
-) {
+async function generateReply(text, tenantId, pushName, historyMessages = [], userPhone = null) {
   if (!openai) {
-    logger.error(
-      "[generateReply] OpenAI no está configurado, no puedo generar respuesta IA."
-    );
+    logger.error("[generateReply] OpenAI no está configurado, no puedo generar respuesta IA.");
     return null;
   }
 
@@ -584,8 +531,7 @@ async function generateReply(
   const businessType = profile?.business_type || "general";
   const botName = profile?.bot_name || "Asistente Virtual";
   const botTone = profile?.bot_tone || "Amable y profesional";
-  const customRules =
-    profile?.custom_instructions || "Ayuda al cliente a agendar o comprar.";
+  const customRules = profile?.custom_instructions || "Ayuda al cliente a agendar o comprar.";
   const humanPhone = profile?.human_handoff_phone || null;
 
   const now = new Date();
@@ -618,29 +564,27 @@ async function generateReply(
   }
 
   const systemPrompt = `
-    IDENTIDAD: Te llamas "${botName}".
-    TONO: ${botTone}.
-    ROL: ${typeContext}
-    
-    INFORMACIÓN DEL NEGOCIO (Reglas de Oro):
-    "${customRules}"
-    
-    DATOS ACTUALES:
-    - Fecha y Hora Local: ${currentDateStr}.
-    - Cliente: "${pushName}".
-    - Teléfono WhatsApp del cliente (úsalo SIEMPRE como "phone" / "customerPhone" en las herramientas): ${userPhone || "desconocido"}.
-    - INTENTOS DETECTADOS POR PALABRAS CLAVE (intent_keywords): ${
-      intentHints || "ninguno claro"
-    }.
+IDENTIDAD: Te llamas "${botName}".
+TONO: ${botTone}.
+ROL: ${typeContext}
 
-    INSTRUCCIONES:
-    1) Si el cliente propone una hora y hay hueco, agenda de inmediato.
-    2) Si preguntan precios/menú, usa get_catalog (no inventes).
-    3) Si falta serviceId, agenda con serviceId:null y mete detalle en notes.
-    4) Si piden humano/soporte, usa human_handoff.
-    5) Si check_availability te devuelve slots, lista por label y pide número.
-    6) Si el cliente elige opción N, usa el slot.isoStart para create_booking.
-    7) Si tú propusiste una hora y el cliente dice "sí", agenda ya.
+INFORMACIÓN DEL NEGOCIO (Reglas de Oro):
+"${customRules}"
+
+DATOS ACTUALES:
+- Fecha y Hora Local: ${currentDateStr}.
+- Cliente: "${pushName}".
+- Teléfono WhatsApp del cliente (úsalo SIEMPRE como "phone" / "customerPhone" en las herramientas): ${userPhone || "desconocido"}.
+- INTENTOS DETECTADOS POR PALABRAS CLAVE (intent_keywords): ${intentHints || "ninguno claro"}.
+
+INSTRUCCIONES:
+1) Si el cliente propone una hora y hay hueco, agenda de inmediato.
+2) Si preguntan precios/menú, usa get_catalog (no inventes).
+3) Si falta serviceId, agenda con serviceId:null y mete detalle en notes.
+4) Si piden humano/soporte, usa human_handoff.
+5) Si check_availability devuelve slots, lista por label y pide número.
+6) Si el cliente elige opción N, usa slot.isoStart para create_booking.
+7) Si tú propusiste una hora y el cliente dice "sí", agenda ya.
   `.trim();
 
   const messages = [
@@ -793,8 +737,7 @@ async function generateReply(
             });
           }
         } else if (fnName === "reschedule_booking") {
-          const phoneFilter =
-            args.customerPhone || args.phone || userPhone || null;
+          const phoneFilter = args.customerPhone || args.phone || userPhone || null;
 
           if (!phoneFilter) {
             response = JSON.stringify({
@@ -844,8 +787,7 @@ async function generateReply(
             }
           }
         } else if (fnName === "cancel_booking") {
-          const phoneFilter =
-            args.customerPhone || args.phone || userPhone || null;
+          const phoneFilter = args.customerPhone || args.phone || userPhone || null;
 
           if (!phoneFilter) {
             response = JSON.stringify({
@@ -927,10 +869,7 @@ async function updateSessionDB(tenantId, updateData) {
       .maybeSingle();
 
     if (selectError) {
-      console.error(
-        "[updateSessionDB] Error select whatsapp_sessions:",
-        selectError
-      );
+      console.error("[updateSessionDB] Error select whatsapp_sessions:", selectError);
       return;
     }
 
@@ -941,26 +880,16 @@ async function updateSessionDB(tenantId, updateData) {
         .eq("tenant_id", tenantId);
 
       if (updateError) {
-        console.error(
-          "[updateSessionDB] Error update whatsapp_sessions:",
-          updateError
-        );
+        console.error("[updateSessionDB] Error update whatsapp_sessions:", updateError);
       }
     } else {
-      const row = {
-        tenant_id: tenantId,
-        ...updateData,
-      };
-
+      const row = { tenant_id: tenantId, ...updateData };
       const { error: insertError } = await supabase
         .from("whatsapp_sessions")
         .insert([row]);
 
       if (insertError) {
-        console.error(
-          "[updateSessionDB] Error insert whatsapp_sessions:",
-          insertError
-        );
+        console.error("[updateSessionDB] Error insert whatsapp_sessions:", insertError);
       }
     }
 
@@ -972,10 +901,7 @@ async function updateSessionDB(tenantId, updateData) {
         .eq("id", tenantId);
 
       if (tenantError) {
-        console.error(
-          "[updateSessionDB] Error update tenants.wa_connected:",
-          tenantError
-        );
+        console.error("[updateSessionDB] Error update tenants.wa_connected:", tenantError);
       }
     }
   } catch (e) {
@@ -989,9 +915,7 @@ async function updateSessionDB(tenantId, updateData) {
 
 async function getOrCreateCustomer(tenantId, phoneNumber) {
   if (!tenantId || !phoneNumber) {
-    throw new Error(
-      "[wa-server] tenantId y phoneNumber requeridos para customer."
-    );
+    throw new Error("[wa-server] tenantId y phoneNumber requeridos para customer.");
   }
 
   const { data, error } = await supabase
@@ -1010,10 +934,7 @@ async function getOrCreateCustomer(tenantId, phoneNumber) {
 
   const { data: created, error: insertError } = await supabase
     .from("customers")
-    .insert({
-      tenant_id: tenantId,
-      phone_number: phoneNumber,
-    })
+    .insert({ tenant_id: tenantId, phone_number: phoneNumber })
     .select("id")
     .single();
 
@@ -1035,16 +956,7 @@ function buildBookingEventFromMessage(text, session) {
   }
 
   if (!currentFlow) {
-    if (
-      lower.includes("cita") ||
-      lower.includes("agendar") ||
-      lower.includes("agenda") ||
-      lower.includes("corte") ||
-      lower.includes("barba")
-    ) {
-      return { type: "START_BOOKING" };
-    }
-
+    // Por ahora: todo cae a booking (tu lógica)
     return { type: "START_BOOKING" };
   }
 
@@ -1060,10 +972,7 @@ function buildBookingEventFromMessage(text, session) {
         serviceId = "service_barba";
       }
 
-      return {
-        type: "SERVICE_PROVIDED",
-        serviceId,
-      };
+      return { type: "SERVICE_PROVIDED", serviceId };
     }
 
     if (step === "SELECT_DATE") {
@@ -1074,7 +983,6 @@ function buildBookingEventFromMessage(text, session) {
       let targetDate = `${yyyy}-${mm}-${dd}`;
 
       const isTomorrow = lower.includes("mañana") || lower.includes("manana");
-
       if (isTomorrow) {
         const t2 = new Date(today.getTime() + 24 * 60 * 60 * 1000);
         const yyyy2 = t2.getFullYear();
@@ -1083,24 +991,13 @@ function buildBookingEventFromMessage(text, session) {
         targetDate = `${yyyy2}-${mm2}-${dd2}`;
       }
 
-      return {
-        type: "DATE_PROVIDED",
-        date: targetDate,
-      };
+      return { type: "DATE_PROVIDED", date: targetDate };
     }
 
     if (step === "SELECT_HOUR") {
       const num = parseInt(lower, 10);
-      if (!isNaN(num)) {
-        return {
-          type: "HOUR_PROVIDED",
-          slotIndex: num,
-        };
-      }
-
-      return {
-        type: "HOUR_PROVIDED",
-      };
+      if (!isNaN(num)) return { type: "HOUR_PROVIDED", slotIndex: num };
+      return { type: "HOUR_PROVIDED" };
     }
   }
 
@@ -1115,19 +1012,16 @@ async function useSupabaseAuthState(tenantId) {
   if (!tenantId) throw new Error("useSupabaseAuthState requiere tenantId");
 
   const { useMultiFileAuthState } = await import("@whiskeysockets/baileys");
-
   const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
 
-  if (!fs.existsSync(sessionFolder)) {
-    fs.mkdirSync(sessionFolder, { recursive: true });
-  }
+  if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
   return { state, saveCreds };
 }
 
 // ---------------------------------------------------------------------
-// 10. CORE WHATSAPP (Baileys + integración bot Next)
+// 10. CORE WHATSAPP (Baileys + integración n8n)
 // ---------------------------------------------------------------------
 
 async function getOrCreateSession(tenantId) {
@@ -1136,10 +1030,7 @@ async function getOrCreateSession(tenantId) {
 
   logger.info({ tenantId }, "🔌 Iniciando Socket...");
 
-  const { default: makeWASocket, DisconnectReason } = await import(
-    "@whiskeysockets/baileys"
-  );
-
+  const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
   const { state, saveCreds } = await useSupabaseAuthState(tenantId);
 
   const sock = makeWASocket({
@@ -1167,19 +1058,23 @@ async function getOrCreateSession(tenantId) {
       info.status = "qrcode";
       info.qr = qr;
       logger.info({ tenantId }, "✨ QR Generado");
+
       await updateSessionDB(tenantId, {
         qr_data: qr,
         status: "qrcode",
         last_seen_at: new Date().toISOString(),
       });
+
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === "open") {
       info.status = "connected";
       info.qr = null;
+
       logger.info({ tenantId }, "✅ Conectado");
       let phone = sock?.user?.id ? sock.user.id.split(":")[0] : null;
+
       await updateSessionDB(tenantId, {
         status: "connected",
         qr_data: null,
@@ -1195,21 +1090,12 @@ async function getOrCreateSession(tenantId) {
 
       if (shouldReconnect) {
         sessions.delete(tenantId);
-        logger.info(
-          { tenantId },
-          "🔄 Conexión perdida, intentando reconectar automáticamente..."
-        );
+        logger.info({ tenantId }, "🔄 Conexión perdida, intentando reconectar automáticamente...");
         getOrCreateSession(tenantId);
       } else {
         sessions.delete(tenantId);
-        await updateSessionDB(tenantId, {
-          status: "disconnected",
-          qr_data: null,
-        });
-        logger.info(
-          { tenantId },
-          "❌ Sesión cerrada permanentemente (Logout)."
-        );
+        await updateSessionDB(tenantId, { status: "disconnected", qr_data: null });
+        logger.info({ tenantId }, "❌ Sesión cerrada permanentemente (Logout).");
       }
     }
   });
@@ -1221,33 +1107,22 @@ async function getOrCreateSession(tenantId) {
       const msg = m.messages?.[0];
       if (!msg) return;
 
-      logger.info({ tenantId, key: msg.key }, "[wa-server] 📩 messages.upsert recibido");
+      logger.info({ tenantId }, "[wa-server] 📩 messages.upsert recibido");
 
-      if (!msg?.message || msg.key.fromMe) {
-        logger.info({ tenantId }, "[wa-server] Mensaje sin contenido o enviado por mí, se ignora.");
-        return;
-      }
+      if (!msg?.message || msg.key.fromMe) return;
 
       const remoteJid = msg.key.remoteJid;
-      if (!remoteJid || remoteJid.includes("@g.us")) {
-        logger.info({ tenantId, remoteJid }, "[wa-server] Mensaje de grupo o sin remoteJid, se ignora.");
-        return;
-      }
+      if (!remoteJid || remoteJid.includes("@g.us")) return;
 
       const text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
 
-      if (!text) {
-        logger.info({ tenantId, remoteJid }, "[wa-server] Mensaje sin texto, se ignora.");
-        return;
-      }
+      if (!text) return;
 
       const pushName = msg.pushName || "Cliente";
       const userPhone = remoteJid.split("@")[0];
-
-      logger.info({ tenantId, remoteJid, text }, "[wa-server] Procesando mensaje entrante de WhatsApp");
 
       if (!info.conversations) info.conversations = new Map();
 
@@ -1262,14 +1137,14 @@ async function getOrCreateSession(tenantId) {
       const customerId = await getOrCreateCustomer(tenantId, userPhone);
       const event = buildBookingEventFromMessage(text, convoSession);
 
-      const botApiUrl = process.env.N8N_WEBHOOK_URL; // 👈 Ahora sí leerá tu enlace de n8n
+      const botApiUrl = process.env.N8N_WEBHOOK_URL;
 
       let replyText = null;
       let newState = null;
       let icsData = null;
 
       if (!botApiUrl) {
-        logger.error("[wa-server] BOT_API_URL no está configurado.");
+        logger.error("[wa-server] N8N_WEBHOOK_URL no está configurado.");
       } else {
         const payload = {
           tenantId,
@@ -1286,38 +1161,43 @@ async function getOrCreateSession(tenantId) {
         };
 
         try {
-          logger.info({ tenantId, url: botApiUrl }, "[wa-server] Llamando a /api/whatsapp-bot (Timeout 60s)");
+          logger.info({ tenantId }, "[wa-server] Llamando a n8n (timeout 60s)");
           const response = await axios.post(botApiUrl, payload, { timeout: 60000 });
 
-         // --- INICIO DEL CAMBIO ---
-if (response.data) {
-  // CASO 1: Respuesta de n8n (Simple)
-  if (response.data.data) {
-      replyText = response.data.data;
-      logger.info({ tenantId }, "[wa-server] Respuesta recibida de n8n");
-  } 
-  // CASO 2: Respuesta de bot-suite antigua (Compleja)
-  else if (response.data.reply) {
-      replyText = response.data.reply;
-      newState = response.data.newState;
-      icsData = response.data.icsData;
-  }
-}
-// --- FIN DEL CAMBIO ---
+          // ✅ Normalización de respuesta (n8n / legacy)
+          const d = response?.data || null;
+
+          if (d) {
+            // n8n simple
+            if (typeof d.data === "string") replyText = d.data;
+
+            // variantes comunes
+            if (!replyText && typeof d.replyText === "string") replyText = d.replyText;
+            if (!replyText && typeof d.message === "string") replyText = d.message;
+
+            // legacy bot-suite
+            if (!replyText && typeof d.reply === "string") replyText = d.reply;
+            if (d.newState) newState = d.newState;
+            if (d.icsData) icsData = d.icsData;
+          }
+
+          if (replyText) logger.info({ tenantId }, "[wa-server] ✅ Respuesta recibida desde n8n");
+          else logger.warn({ tenantId, d }, "[wa-server] ⚠️ n8n respondió pero sin texto usable");
         } catch (err) {
           logger.error(
-            "[wa-server] Error al llamar a /api/whatsapp-bot:",
+            "[wa-server] Error al llamar a n8n:",
             err?.response?.data || err.message
           );
         }
       }
 
       if (!replyText) {
-        logger.info({ tenantId }, "[wa-server] Usando fallback de OpenAI para generar respuesta");
+        logger.info({ tenantId }, "[wa-server] Usando fallback de OpenAI");
         const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
         replyText =
           fallback ||
           "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
+
         newState = {
           current_flow: convoSession.current_flow,
           step: convoSession.step,
@@ -1337,37 +1217,26 @@ if (response.data) {
         }
       }
 
-      // 7) Enviar texto
       await sock.sendMessage(remoteJid, { text: replyText });
 
-      // 8) ✅ Enviar ICS (robusto)
       if (icsData) {
-        logger.info({ tenantId }, "📎 Intentando enviar archivo ICS al usuario...");
-
         const ok = await sendICS(sock, remoteJid, icsData, {
           fileName: "cita_confirmada.ics",
           caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
         });
 
         if (!ok) {
-          logger.warn(
-            { tenantId },
-            "⚠️ Llegó icsData pero no parece un ICS válido (ni texto ni base64). No se envió."
-          );
+          logger.warn({ tenantId }, "⚠️ icsData llegó pero no era válido (texto/base64).");
         } else {
           logger.info({ tenantId }, "✅ ICS enviado correctamente.");
         }
       }
 
-      logger.info({ tenantId, remoteJid }, "[wa-server] ✅ Respuesta enviada por WhatsApp");
-
       history.push({ role: "user", content: text });
       history.push({ role: "assistant", content: replyText });
 
       const MAX_MESSAGES = 20;
-      if (history.length > MAX_MESSAGES) {
-        history.splice(0, history.length - MAX_MESSAGES);
-      }
+      if (history.length > MAX_MESSAGES) history.splice(0, history.length - MAX_MESSAGES);
 
       convo.history = history;
       info.conversations.set(userPhone, convo);
@@ -1395,11 +1264,7 @@ app.get("/sessions/:tenantId", async (req, res) => {
   if (!info) {
     return res.json({
       ok: true,
-      session: {
-        id: tenantId,
-        status: "disconnected",
-        qr_data: null,
-      },
+      session: { id: tenantId, status: "disconnected", qr_data: null },
     });
   }
 
@@ -1420,11 +1285,7 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
 
   try {
     const info = await getOrCreateSession(tenantId);
-
-    return res.json({
-      ok: true,
-      status: info.status || "connecting",
-    });
+    return res.json({ ok: true, status: info.status || "connecting" });
   } catch (e) {
     console.error("[/sessions/:tenantId/connect] Error:", e);
     return res.status(500).json({
@@ -1438,11 +1299,49 @@ app.post("/sessions/:tenantId/disconnect", async (req, res) => {
   const s = sessions.get(req.params.tenantId);
   if (s?.socket) await s.socket.logout().catch(() => {});
   sessions.delete(req.params.tenantId);
-  await updateSessionDB(req.params.tenantId, {
-    status: "disconnected",
-    qr_data: null,
-  });
+  await updateSessionDB(req.params.tenantId, { status: "disconnected", qr_data: null });
   res.json({ ok: true });
+});
+
+/**
+ * ✅ ENDPOINT: Enviar mensaje simple (para n8n HTTP Request)
+ * - FIX: estaba abajo de app.listen en tu archivo → lo moví aquí
+ * - Extra: intenta restaurar sesión si no está cargada
+ */
+app.post("/sessions/:tenantId/send-message", async (req, res) => {
+  const { tenantId } = req.params;
+  const { phone, message } = req.body || {};
+
+  if (!phone || !message) {
+    return res.status(400).json({ ok: false, error: "missing_fields", detail: "Requiere phone y message" });
+  }
+
+  let session = sessions.get(tenantId);
+
+  // Si no existe o no está conectada, intenta levantarla
+  if (!session || session.status !== "connected") {
+    try {
+      session = await getOrCreateSession(tenantId);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  session = sessions.get(tenantId);
+  if (!session || session.status !== "connected") {
+    return res.status(400).json({ ok: false, error: "wa_not_connected" });
+  }
+
+  const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
+
+  try {
+    await session.socket.sendMessage(jid, { text: String(message) });
+    logger.info({ tenantId, phone }, "✅ send-message enviado");
+    return res.json({ ok: true });
+  } catch (e) {
+    logger.error(e, "Error en send-message");
+    return res.status(500).json({ ok: false, error: "send_failed", detail: e.message });
+  }
 });
 
 /**
@@ -1452,8 +1351,7 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
   const { tenantId } = req.params;
   const { event, phone, variables } = req.body;
 
-  if (!event || !phone)
-    return res.status(400).json({ error: "Faltan datos" });
+  if (!event || !phone) return res.status(400).json({ error: "Faltan datos" });
 
   let session = sessions.get(tenantId);
   if (!session || session.status !== "connected") {
@@ -1462,16 +1360,13 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
     } catch (e) {}
   }
 
+  session = sessions.get(tenantId);
   if (!session || session.status !== "connected") {
     return res.status(400).json({ error: "Bot no conectado." });
   }
 
   const templateBody = await getTemplate(tenantId, event);
-  if (!templateBody) {
-    return res
-      .status(404)
-      .json({ error: `Plantilla no encontrada: ${event}` });
-  }
+  if (!templateBody) return res.status(404).json({ error: `Plantilla no encontrada: ${event}` });
 
   const message = renderTemplate(templateBody, variables || {});
   const jid = phone.replace(/\D/g, "") + "@s.whatsapp.net";
@@ -1497,14 +1392,10 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
           document: icsBuffer,
           mimetype: "text/calendar; charset=utf-8",
           fileName: "agendar_cita.ics",
-          caption:
-            "📅 Toca este archivo para agregar el recordatorio a tu calendario.",
+          caption: "📅 Toca este archivo para agregar el recordatorio a tu calendario.",
         });
 
-        logger.info(
-          { tenantId, event, phone },
-          "✅ Plantilla + ICS enviados correctamente"
-        );
+        logger.info({ tenantId, event, phone }, "✅ Plantilla + ICS enviados correctamente");
       }
     }
 
@@ -1584,9 +1475,7 @@ app.post("/sessions/:tenantId/send-media", async (req, res) => {
 app.get("/api/v1/availability", async (req, res) => {
   const { tenantId, resourceId, date } = req.query;
 
-  if (!tenantId || !date) {
-    return res.status(400).json({ error: "Faltan tenantId y date" });
-  }
+  if (!tenantId || !date) return res.status(400).json({ error: "Faltan tenantId y date" });
 
   const requestedDate = new Date(String(date));
   if (isNaN(requestedDate.getTime())) {
@@ -1640,8 +1529,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
     return res.status(400).json({
       ok: false,
       error: "missing_fields",
-      detail:
-        "Requiere tenantId, phone, startsAtISO y endsAtISO. CustomerName es opcional.",
+      detail: "Requiere tenantId, phone, startsAtISO y endsAtISO. CustomerName es opcional.",
     });
   }
 
@@ -1670,9 +1558,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
     return res.status(500).json({ ok: false, error: "db_error" });
   }
 
-  if (!booking) {
-    return res.status(500).json({ ok: false, error: "no_booking_created" });
-  }
+  if (!booking) return res.status(500).json({ ok: false, error: "no_booking_created" });
 
   try {
     const session = await getOrCreateSession(tenantId);
@@ -1712,8 +1598,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
         document: icsBuffer,
         mimetype: "text/calendar; charset=utf-8",
         fileName: "cita_confirmada.ics",
-        caption:
-          "📅 Tu cita fue agendada. Toca este archivo para agregar el recordatorio a tu calendario.",
+        caption: "📅 Tu cita fue agendada. Toca este archivo para agregar el recordatorio a tu calendario.",
       });
 
       logger.info({ tenantId, bookingId: booking.id }, "✅ Booking creado y mensaje enviado");
@@ -1747,8 +1632,7 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
     return res.status(400).json({
       ok: false,
       error: "missing_fields",
-      detail:
-        "Requiere tenantId, bookingId, newStartsAtISO y newEndsAtISO en el body.",
+      detail: "Requiere tenantId, bookingId, newStartsAtISO y newEndsAtISO en el body.",
     });
   }
 
@@ -1770,10 +1654,7 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
   }
 
   if (!updatedBooking) {
-    return res.status(404).json({
-      ok: false,
-      error: "booking_not_found_or_not_owned",
-    });
+    return res.status(404).json({ ok: false, error: "booking_not_found_or_not_owned" });
   }
 
   try {
@@ -1821,16 +1702,11 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
           document: icsBuffer,
           mimetype: "text/calendar; charset=utf-8",
           fileName: "cita_reagendada.ics",
-          caption:
-            "📅 Tu cita fue reagendada. Toca este archivo para actualizar el recordatorio en tu calendario.",
+          caption: "📅 Tu cita fue reagendada. Toca este archivo para actualizar el recordatorio en tu calendario.",
         });
 
         logger.info({ tenantId, bookingId }, "✅ Booking reagendado y mensaje enviado");
-      } else {
-        logger.warn({ tenantId, bookingId }, "Booking reagendado pero sin teléfono para notificar");
       }
-    } else {
-      logger.warn({ tenantId, bookingId }, "Booking reagendado pero bot no conectado");
     }
   } catch (e) {
     logger.error(e, "Error enviando confirmación de reagendamiento");
@@ -1876,10 +1752,7 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
   }
 
   if (!cancelledBooking) {
-    return res.status(404).json({
-      ok: false,
-      error: "booking_not_found_or_not_owned",
-    });
+    return res.status(404).json({ ok: false, error: "booking_not_found_or_not_owned" });
   }
 
   try {
@@ -1911,21 +1784,14 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
           ...(extraVariables || {}),
         };
 
-        let msg = "";
-        if (templateBody) {
-          msg = renderTemplate(templateBody, vars);
-        } else {
-          msg = `Tu cita en ${context.name} para el ${dateStr} a las ${timeStr} ha sido cancelada exitosamente.`;
-        }
+        const msg = templateBody
+          ? renderTemplate(templateBody, vars)
+          : `Tu cita en ${context.name} para el ${dateStr} a las ${timeStr} ha sido cancelada exitosamente.`;
 
         await session.socket.sendMessage(jid, { text: msg });
 
         logger.info({ tenantId, bookingId }, "✅ Booking cancelado y mensaje enviado");
-      } else {
-        logger.warn({ tenantId, bookingId }, "Booking cancelado pero sin teléfono para notificar");
       }
-    } else {
-      logger.warn({ tenantId, bookingId }, "Booking cancelado pero bot no conectado");
     }
   } catch (e) {
     logger.error(e, "Error enviando confirmación de cancelación");
@@ -1933,10 +1799,7 @@ app.post("/api/v1/cancel-booking", async (req, res) => {
 
   return res.json({
     ok: true,
-    booking: {
-      id: cancelledBooking.id,
-      status: cancelledBooking.status,
-    },
+    booking: { id: cancelledBooking.id, status: cancelledBooking.status },
   });
 });
 
@@ -1968,9 +1831,7 @@ async function restoreSessions() {
       try {
         logger.info({ tenantId }, "🔄 Restaurando sesión previa...");
         await getOrCreateSession(tenantId);
-        await updateSessionDB(tenantId, {
-          last_seen_at: new Date().toISOString(),
-        });
+        await updateSessionDB(tenantId, { last_seen_at: new Date().toISOString() });
       } catch (err) {
         logger.error({ tenantId, err }, "Error restaurando sesión de WhatsApp");
       }
@@ -1989,30 +1850,4 @@ app.listen(PORT, () => {
   restoreSessions().catch((e) =>
     logger.error(e, "Error al intentar restaurar sesiones al inicio")
   );
-});
-
-// AGREGAR ESTO EN TU INDEX.JS PARA QUE EL NODO HTTP REQUEST FUNCIONE
-app.post("/sessions/:tenantId/send-message", async (req, res) => {
-  const { tenantId } = req.params;
-  const { phone, message } = req.body;
-
-  if (!phone || !message) return res.status(400).json({ error: "Falta phone o message" });
-
-  // Busca la sesión
-  const session = sessions.get(tenantId);
-  if (!session || session.status !== "connected") {
-    return res.status(400).json({ error: "WhatsApp no conectado" });
-  }
-
-  // Formatea el número
-  const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
-
-  try {
-    // Envía el mensaje
-    await session.socket.sendMessage(jid, { text: message });
-    console.log(`Mensaje enviado a ${phone} del tenant ${tenantId}`);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
 });
