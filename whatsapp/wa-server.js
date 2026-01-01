@@ -1990,3 +1990,29 @@ app.listen(PORT, () => {
     logger.error(e, "Error al intentar restaurar sesiones al inicio")
   );
 });
+
+// AGREGAR ESTO EN TU INDEX.JS PARA QUE EL NODO HTTP REQUEST FUNCIONE
+app.post("/sessions/:tenantId/send-message", async (req, res) => {
+  const { tenantId } = req.params;
+  const { phone, message } = req.body;
+
+  if (!phone || !message) return res.status(400).json({ error: "Falta phone o message" });
+
+  // Busca la sesión
+  const session = sessions.get(tenantId);
+  if (!session || session.status !== "connected") {
+    return res.status(400).json({ error: "WhatsApp no conectado" });
+  }
+
+  // Formatea el número
+  const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
+
+  try {
+    // Envía el mensaje
+    await session.socket.sendMessage(jid, { text: message });
+    console.log(`Mensaje enviado a ${phone} del tenant ${tenantId}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
