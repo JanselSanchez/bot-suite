@@ -1,16 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
-import { createClient } from "@supabase/supabase-js"; // 👈 NECESARIO PARA LEER LA DB
+import { createClient } from "@supabase/supabase-js";
 
-// Importamos tus herramientas (Asegúrate de que la ruta sea correcta)
+// ✅ Usar factorías (make...) para inyectar tenantId/phone y evitar errores
 import {
-  createBookingTool,
-  getMyBookingsTool,
-  cancelBookingTool,
-  getServicesTool,
-  checkAvailabilityTool,
-  rescheduleBookingTool,
+  makeCheckAvailabilityTool,
+  makeGetServicesTool,
+  makeCreateBookingTool,
+  makeRescheduleBookingTool,
+  makeGetMyBookingsTool,
+  makeCancelBookingTool,
 } from "@/utils/booking-tools";
 
 // Inicializar Supabase para leer el perfil del negocio dinámicamente
@@ -60,10 +60,9 @@ function extractBookingMeta(toolResults: any): BookingMeta | null {
     if (toolName !== "createBooking" && toolName !== "rescheduleBooking") continue;
 
     // AI SDK a veces entrega result como objeto, a veces como string JSON
-    let result = safeJsonParse(t?.result);
+    const result = safeJsonParse(t?.result);
 
     // A veces el result viene envuelto: { ok:true, data: {...} } o { result: {...} }
-    // Intentamos "desenvolver" un par de capas comunes sin romper nada
     const r0 = result?.result ?? result;
     const r1 = r0?.data ?? r0;
 
@@ -122,11 +121,7 @@ function extractIcsData(toolResults: any): string | null {
     const r1 = r0?.data ?? r0;
 
     // icsData puede venir en varias ubicaciones
-    const ics =
-      r1?.icsData ||
-      r0?.icsData ||
-      result?.icsData ||
-      null;
+    const ics = r1?.icsData || r0?.icsData || result?.icsData || null;
 
     if (ics) return String(ics);
   }
@@ -145,7 +140,7 @@ export async function POST(req: NextRequest) {
     // 1. Validación básica
     if (!tenantId || !phoneNumber || !text) {
       return NextResponse.json(
-        { ok: false, message: "Faltan datos (tenantId, phone, text)." },
+        { ok: false, message: "Faltan datos (tenantId, phoneNumber, text)." },
         { status: 400 }
       );
     }
@@ -170,49 +165,52 @@ export async function POST(req: NextRequest) {
       timeStyle: "short",
     });
 
-    // 3. Invocamos a la IA con la identidad cargada
+    // ✅ 3) Crear tools ya “inyectadas” con tenantId/phone para que la IA no invente esos campos
+    const tools = {
+      getServices: makeGetServicesTool(tenantId) as any,
+      checkAvailability: makeCheckAvailabilityTool(tenantId) as any,
+      createBooking: makeCreateBookingTool(tenantId, phoneNumber, customerName) as any,
+      rescheduleBooking: makeRescheduleBookingTool(tenantId, phoneNumber) as any,
+      getMyBookings: makeGetMyBookingsTool(tenantId, phoneNumber) as any,
+      cancelBooking: makeCancelBookingTool(tenantId, phoneNumber) as any,
+    };
+
+    // 4. Invocamos a la IA con la identidad cargada
     const { text: aiResponse, toolResults } = await generateText({
       model: openai("gpt-4o"), // o gpt-4o-mini
       system: `
-        ROL: Eres "${botName}". Actúa con un tono ${botTone}.
-        CONTEXTO: Trabajas para el negocio con ID "${tenantId}".
-        FECHA Y HORA ACTUAL: ${now}.
-        CLIENTE: ${customerName || "Usuario"} (${phoneNumber}).
+ROL: Eres "${botName}". Actúa con un tono ${botTone}.
+CONTEXTO: Trabajas para el negocio con ID "${tenantId}".
+FECHA Y HORA ACTUAL: ${now}.
+CLIENTE: ${customerName || "Usuario"} (${phoneNumber}).
 
-        REGLAS DEL NEGOCIO (SÍGUELAS AL PIE DE LA LETRA):
-        "${customRules}"
+REGLAS DEL NEGOCIO (SÍGUELAS AL PIE DE LA LETRA):
+"${customRules}"
 
-        HERRAMIENTAS DISPONIBLES:
-        1. **PRECIOS/SERVICIOS:** Usa 'getServices'.
-        2. **DISPONIBILIDAD:** Usa 'checkAvailability'.
-        3. **AGENDAR:** Usa 'createBooking'. (Si no sabes serviceId, envía null).
-        4. **REAGENDAR:** Usa 'rescheduleBooking'.
-        5. **CANCELAR:** Usa 'cancelBooking'.
-        6. **MIS CITAS:** Usa 'getMyBookings'.
+HERRAMIENTAS DISPONIBLES:
+1. **PRECIOS/SERVICIOS:** Usa 'getServices'.
+2. **DISPONIBILIDAD:** Usa 'checkAvailability'.
+3. **AGENDAR:** Usa 'createBooking'. (Si no sabes serviceId, envía null).
+4. **REAGENDAR:** Usa 'rescheduleBooking'.
+5. **CANCELAR:** Usa 'cancelBooking'.
+6. **MIS CITAS:** Usa 'getMyBookings'.
 
-        INSTRUCCIONES IMPORTANTES:
-        - Si usas 'createBooking' o 'rescheduleBooking' con éxito, responde confirmando y di: "Te he enviado el archivo de calendario."
-        - Sé conciso. No inventes información que no esté en las herramientas.
-      `,
+INSTRUCCIONES IMPORTANTES:
+- Cuando el usuario quiera agendar/reagendar, SIEMPRE llama la herramienta correspondiente.
+- Si usas 'createBooking' o 'rescheduleBooking' con éxito, responde confirmando y di: "Te he enviado el archivo de calendario."
+- Sé conciso. No inventes información que no esté en las herramientas.
+      `.trim(),
       prompt: text,
-      tools: {
-        getServices: getServicesTool as any,
-        checkAvailability: checkAvailabilityTool as any,
-        createBooking: createBookingTool as any,
-        rescheduleBooking: rescheduleBookingTool as any,
-        getMyBookings: getMyBookingsTool as any,
-        cancelBooking: cancelBookingTool as any,
-      },
+      tools,
       // @ts-ignore
       maxSteps: 8,
     });
 
-    // 4. --- ICS + BookingMeta (a prueba de fallos) ---
+    // 5. --- ICS + BookingMeta (a prueba de fallos) ---
     const icsData: string | null = extractIcsData(toolResults);
     const bookingMeta: BookingMeta | null = extractBookingMeta(toolResults);
 
-    // 5. Devolvemos la respuesta al Servidor de WhatsApp (wa-server)
-    // bookingMeta permitirá que wa-server genere el ICS desde DB si icsData no vino.
+    // 6. Respuesta a n8n / wa-server
     return NextResponse.json({
       ok: true,
       reply: aiResponse,
@@ -222,7 +220,7 @@ export async function POST(req: NextRequest) {
   } catch (error: any) {
     console.error("[/api/whatsapp-bot] Error crítico:", error);
     return NextResponse.json(
-      { ok: false, message: "Error interno: " + error.message },
+      { ok: false, message: "Error interno: " + (error?.message || String(error)) },
       { status: 500 }
     );
   }
