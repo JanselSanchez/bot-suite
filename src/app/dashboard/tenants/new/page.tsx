@@ -3,7 +3,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Building2, ShieldCheck, Phone, Store, FileText } from "lucide-react";
+import { Building2, ShieldCheck, Phone, Store, FileText, Mail } from "lucide-react"; // 👈 Agregamos Mail
 import { Button } from "@/componentes/ui/button";
 import { VERTICALS } from "@/app/lib/constants";
 
@@ -25,9 +25,10 @@ export default function NewTenantPage() {
   
   // Estados del formulario
   const [name, setName] = useState("");
-  const [vertical, setVertical] = useState("general"); // 👈 Nuevo estado
-  const [description, setDescription] = useState("");  // 👈 Nuevo estado
+  const [vertical, setVertical] = useState("general");
+  const [description, setDescription] = useState("");
   const [phone, setPhone] = useState("");
+  const [email, setEmail] = useState(""); // 👈 Nuevo estado para el Email
   const [timezone, setTimezone] = useState(DEFAULT_TZ);
   const [loading, setLoading] = useState(false);
 
@@ -40,8 +41,9 @@ export default function NewTenantPage() {
     try {
       const payload: any = {
         name: name.trim(),
-        vertical,        // 👈 Enviamos el tipo
-        description: description.trim() || null, // 👈 Enviamos la descripción
+        vertical,
+        description: description.trim() || null,
+        notification_email: email.trim() || null, // 👈 Enviamos el email al backend
         timezone: timezone || DEFAULT_TZ,
       };
       
@@ -111,7 +113,7 @@ export default function NewTenantPage() {
               />
             </div>
 
-            {/* 2. Tipo de Negocio (Vertical) - NUEVO */}
+            {/* 2. Tipo de Negocio (Vertical) */}
             <div>
               <label className="block text-sm font-medium text-gray-700">Tipo de Negocio</label>
               <p className="text-xs text-gray-400 mb-2">Esto ayuda a la IA a saber cómo hablar (ej. citas vs reservas).</p>
@@ -133,7 +135,7 @@ export default function NewTenantPage() {
               </div>
             </div>
 
-            {/* 3. Descripción (Contexto IA) - NUEVO */}
+            {/* 3. Descripción (Contexto IA) */}
             <div>
               <label className="block text-sm font-medium text-gray-700">Descripción breve</label>
               <p className="text-xs text-gray-400 mb-2">Dale contexto al bot: ¿Qué servicios principales ofreces?</p>
@@ -168,7 +170,27 @@ export default function NewTenantPage() {
               </div>
             </div>
 
-            {/* 5. Zona Horaria */}
+            {/* 5. Email para Notificaciones (NUEVO) */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700">
+                Email para Notificaciones
+              </label>
+              <p className="text-xs text-gray-400 mb-2">Aquí te avisaremos cuando tengas una nueva cita.</p>
+              <div className="flex items-center gap-2">
+                <div className="grid h-11 w-11 place-items-center rounded-2xl border border-gray-200 bg-white shadow-sm shrink-0">
+                  <Mail className="h-5 w-5 text-gray-500" />
+                </div>
+                <input
+                  type="email"
+                  className="flex-1 rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] shadow-sm outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
+                  placeholder="Ej. contacto@negocio.com"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {/* 6. Zona Horaria */}
             <div>
               <label className="block text-sm font-medium text-gray-700">Zona horaria</label>
               <select
