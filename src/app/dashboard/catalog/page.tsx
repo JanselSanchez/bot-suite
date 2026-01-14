@@ -1,31 +1,45 @@
 // src/app/dashboard/catalog/page.tsx
 "use client";
 
-import { useState, useEffect } from "react";
-import { createItem, getItems, deleteItem } from "@/app/actions/catalog-actions"; // Importa tus acciones
-import { Plus, Trash2, Clock, Package, Tag } from "lucide-react"; // Iconos
+import { useState, useEffect, useMemo } from "react";
+import { createItem, getItems, deleteItem } from "@/app/actions/catalog-actions";
+import { Plus, Trash2, Clock, Package } from "lucide-react";
 
-export default function CatalogPage({ searchParams }: { searchParams: { tenantId?: string } }) {
-  // NOTA: Asegúrate de obtener el tenantId real de tu sesión o URL
-  const tenantId = "3870826e-9376-457b-9b53-7533c89e8cda"; // ID FIJO PARA TU PRUEBA (cámbialo dinámico luego)
+export default function CatalogPage({
+  searchParams,
+}: {
+  searchParams: { tenantId?: string };
+}) {
+  // ✅ Tenant dinámico desde la URL (dropdown)
+  // Fallback solo para dev si aún no estás pasando tenantId en la URL
+  const tenantId = useMemo(() => {
+    return (
+      searchParams?.tenantId ||
+      "3870826e-9376-457b-9b53-7533c89e8cda" // fallback DEV (puedes quitarlo cuando ya esté todo conectado)
+    );
+  }, [searchParams?.tenantId]);
 
   const [items, setItems] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
 
   // Estado del Formulario
-  const [type, setType] = useState<"service" | "product">("service"); // Switch Service/Product
+  const [type, setType] = useState<"service" | "product">("service");
 
   useEffect(() => {
+    // ✅ Si cambia tenantId (por dropdown), recarga catálogo
     loadItems();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenantId]);
 
   async function loadItems() {
+    setLoading(true);
     try {
       const data = await getItems(tenantId);
-      setItems(data);
+      setItems(Array.isArray(data) ? data : []);
     } catch (e) {
       console.error(e);
+      setItems([]);
     } finally {
       setLoading(false);
     }
@@ -34,20 +48,35 @@ export default function CatalogPage({ searchParams }: { searchParams: { tenantId
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
+
+    // ✅ IMPORTANTÍSIMO: el item se crea en el tenant seleccionado
     formData.append("tenantId", tenantId);
-    formData.append("type", type); // Aseguramos enviar el tipo seleccionado
+    formData.append("type", type);
 
     await createItem(formData);
     setIsModalOpen(false);
-    loadItems(); // Recargar lista
-    (e.target as HTMLFormElement).reset(); // Limpiar form
+    await loadItems();
+    (e.target as HTMLFormElement).reset();
   }
 
   async function handleDelete(id: string) {
     if (confirm("¿Estás seguro de borrar este ítem?")) {
       await deleteItem(id);
-      loadItems();
+      await loadItems();
     }
+  }
+
+  // ✅ Guardrail real: si no hay tenantId, no intentes cargar
+  // (Si quieres obligar selección real, quita el fallback DEV de arriba)
+  if (!tenantId) {
+    return (
+      <div className="p-6 max-w-5xl mx-auto">
+        <h1 className="text-2xl font-bold text-gray-900">Catálogo Universal</h1>
+        <p className="text-gray-500 mt-2">
+          Selecciona un negocio arriba para ver su catálogo.
+        </p>
+      </div>
+    );
   }
 
   return (
@@ -57,6 +86,9 @@ export default function CatalogPage({ searchParams }: { searchParams: { tenantId
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Catálogo Universal</h1>
           <p className="text-gray-500">Administra tus servicios y productos para el Bot.</p>
+          <p className="text-xs text-gray-400 mt-1">
+            Tenant activo: <span className="font-mono">{tenantId}</span>
+          </p>
         </div>
         <button
           onClick={() => setIsModalOpen(true)}
@@ -76,7 +108,10 @@ export default function CatalogPage({ searchParams }: { searchParams: { tenantId
           </p>
         ) : (
           items.map((item) => (
-            <div key={item.id} className="border border-gray-200 rounded-xl p-5 bg-white shadow-sm hover:shadow-md transition">
+            <div
+              key={item.id}
+              className="border border-gray-200 rounded-xl p-5 bg-white shadow-sm hover:shadow-md transition"
+            >
               <div className="flex justify-between items-start mb-2">
                 <span
                   className={`text-xs font-bold px-2 py-1 rounded-full uppercase tracking-wide ${
@@ -87,7 +122,10 @@ export default function CatalogPage({ searchParams }: { searchParams: { tenantId
                 >
                   {item.type === "service" ? "Servicio" : "Producto"}
                 </span>
-                <button onClick={() => handleDelete(item.id)} className="text-gray-400 hover:text-red-500">
+                <button
+                  onClick={() => handleDelete(item.id)}
+                  className="text-gray-400 hover:text-red-500"
+                >
                   <Trash2 size={18} />
                 </button>
               </div>
@@ -101,12 +139,14 @@ export default function CatalogPage({ searchParams }: { searchParams: { tenantId
                 <span className="text-xl font-bold text-gray-900">
                   RD${(item.price_cents / 100).toFixed(2)}
                 </span>
+
                 {item.type === "service" && (
                   <div className="flex items-center text-gray-500 text-sm gap-1">
                     <Clock size={16} />
                     <span>{item.duration_minutes} min</span>
                   </div>
                 )}
+
                 {item.type === "product" && (
                   <div className="flex items-center text-gray-500 text-sm gap-1">
                     <Package size={16} />
@@ -124,9 +164,9 @@ export default function CatalogPage({ searchParams }: { searchParams: { tenantId
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-2xl">
             <h2 className="text-2xl font-bold mb-4">Nuevo Ítem</h2>
-            
+
             <form onSubmit={handleSubmit} className="space-y-4">
-              {/* Selector de TIPO (La clave del sistema universal) */}
+              {/* Selector de TIPO */}
               <div className="flex bg-gray-100 p-1 rounded-lg mb-4">
                 <button
                   type="button"
@@ -150,33 +190,60 @@ export default function CatalogPage({ searchParams }: { searchParams: { tenantId
 
               <div>
                 <label className="block text-sm font-medium text-gray-700">Nombre</label>
-                <input required name="name" className="w-full border rounded-lg p-2 mt-1" placeholder="Ej: Corte Degradado / Pizza" />
+                <input
+                  required
+                  name="name"
+                  className="w-full border rounded-lg p-2 mt-1"
+                  placeholder="Ej: Corte Degradado / Pizza"
+                />
               </div>
 
               <div>
                 <label className="block text-sm font-medium text-gray-700">Descripción</label>
-                <textarea name="description" className="w-full border rounded-lg p-2 mt-1" placeholder="Detalles para que la IA venda..." rows={2} />
+                <textarea
+                  name="description"
+                  className="w-full border rounded-lg p-2 mt-1"
+                  placeholder="Detalles para que la IA venda..."
+                  rows={2}
+                />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700">Precio (RD$)</label>
-                  <input required type="number" name="price" className="w-full border rounded-lg p-2 mt-1" placeholder="0.00" />
+                  <input
+                    required
+                    type="number"
+                    name="price"
+                    className="w-full border rounded-lg p-2 mt-1"
+                    placeholder="0.00"
+                  />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700">Categoría</label>
-                  <input name="category" className="w-full border rounded-lg p-2 mt-1" placeholder="Ej: Caballeros" />
+                  <input
+                    name="category"
+                    className="w-full border rounded-lg p-2 mt-1"
+                    placeholder="Ej: Caballeros"
+                  />
                 </div>
               </div>
 
-              {/* CAMPO CONDICIONAL: Solo si es Servicio muestra duración */}
               {type === "service" && (
                 <div className="bg-blue-50 p-3 rounded-lg border border-blue-100">
                   <label className="block text-sm font-medium text-blue-800 flex items-center gap-2">
                     <Clock size={16} /> Duración (Minutos)
                   </label>
-                  <input required type="number" name="duration" defaultValue={30} className="w-full border rounded-lg p-2 mt-1" />
-                  <p className="text-xs text-blue-600 mt-1">Tiempo que se bloqueará en la agenda.</p>
+                  <input
+                    required
+                    type="number"
+                    name="duration"
+                    defaultValue={30}
+                    className="w-full border rounded-lg p-2 mt-1"
+                  />
+                  <p className="text-xs text-blue-600 mt-1">
+                    Tiempo que se bloqueará en la agenda.
+                  </p>
                 </div>
               )}
 
