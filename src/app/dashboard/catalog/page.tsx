@@ -1,16 +1,27 @@
 // src/app/dashboard/catalog/page.tsx
 "use client";
 
-import { useState, useEffect, Suspense } from "react"; // 👈 Agregamos Suspense
-import { useSearchParams } from "next/navigation"; // 👈 IMPORTANTE: Hook oficial para leer URL
+import { useState, useEffect, Suspense } from "react";
+import { useSearchParams, useRouter, usePathname } from "next/navigation"; // 👈 Agregamos router y pathname
 import { createItem, getItems, deleteItem } from "@/app/actions/catalog-actions";
 import { Plus, Trash2, Clock, Package } from "lucide-react";
+// 👇 INTEGRACIÓN: Conectamos con la memoria del menú para que no salga vacío
+import { useActiveTenant } from "@/app/providers/active-tenant";
 
-// 1️⃣ COMPONENTE INTERNO: Aquí va TODA tu lógica original
+// 1️⃣ COMPONENTE INTERNO
 function CatalogContent() {
-  // ✅ FORMA ROBUSTA: Usamos el hook para escuchar cambios en la URL en vivo
   const searchParams = useSearchParams();
-  const tenantId = searchParams.get("tenantId"); 
+  const router = useRouter();
+  const pathname = usePathname();
+  
+  // A. Intentamos leer de la URL (Prioridad 1)
+  const urlTenantId = searchParams.get("tenantId");
+  
+  // B. Intentamos leer de la Memoria Global del Menú (Prioridad 2)
+  const { tenantId: globalTenantId } = useActiveTenant();
+
+  // C. Decidimos cuál usar: Si hay URL, usa URL. Si no, usa el Global.
+  const tenantId = urlTenantId || globalTenantId;
 
   const [items, setItems] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -19,24 +30,32 @@ function CatalogContent() {
   // Estado del Formulario
   const [type, setType] = useState<"service" | "product">("service");
 
+  // ✅ EFECTO 1: Sincronizar URL
+  // Si seleccionaste algo en el menú (global) pero la URL está limpia,
+  // escribimos el ID en la URL para que todo sea consistente.
   useEffect(() => {
-    // Si hay tenantId, cargamos. Si no, limpiamos.
+    if (globalTenantId && !urlTenantId) {
+      router.replace(`${pathname}?tenantId=${globalTenantId}`);
+    }
+  }, [globalTenantId, urlTenantId, pathname, router]);
+
+  // ✅ EFECTO 2: Cargar datos cuando cambia el tenantId final
+  useEffect(() => {
     if (tenantId) {
-      loadItems();
+      loadItems(tenantId);
     } else {
       setItems([]);
       setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenantId]); // 👈 Ahora sí reaccionará al cambio del menú
+  }, [tenantId]);
 
-  async function loadItems() {
-    if (!tenantId) return;
+  async function loadItems(idToUse: string) {
+    if (!idToUse) return;
 
     setLoading(true);
     try {
-      // Pasamos el tenantId (asegurando que es string)
-      const data = await getItems(tenantId);
+      const data = await getItems(idToUse);
       setItems(Array.isArray(data) ? data : []);
     } catch (e) {
       console.error(e);
@@ -56,18 +75,19 @@ function CatalogContent() {
 
     await createItem(formData);
     setIsModalOpen(false);
-    await loadItems();
+    await loadItems(tenantId);
     (e.target as HTMLFormElement).reset();
   }
 
   async function handleDelete(id: string) {
+    if (!tenantId) return;
     if (confirm("¿Estás seguro de borrar este ítem?")) {
       await deleteItem(id);
-      await loadItems();
+      await loadItems(tenantId);
     }
   }
 
-  // 🛑 Estado Vacío: Si no seleccionó negocio
+  // 🛑 Estado Vacío: Si no seleccionó negocio (ni en URL ni en Global)
   if (!tenantId) {
     return (
       <div className="p-10 max-w-5xl mx-auto text-center border-2 border-dashed border-gray-200 rounded-2xl mt-10">
