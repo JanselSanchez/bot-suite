@@ -1,12 +1,13 @@
 // src/app/dashboard/catalog/page.tsx
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, Suspense } from "react"; // 👈 Agregamos Suspense
 import { useSearchParams } from "next/navigation"; // 👈 IMPORTANTE: Hook oficial para leer URL
 import { createItem, getItems, deleteItem } from "@/app/actions/catalog-actions";
 import { Plus, Trash2, Clock, Package } from "lucide-react";
 
-export default function CatalogPage() {
+// 1️⃣ COMPONENTE INTERNO: Aquí va TODA tu lógica original
+function CatalogContent() {
   // ✅ FORMA ROBUSTA: Usamos el hook para escuchar cambios en la URL en vivo
   const searchParams = useSearchParams();
   const tenantId = searchParams.get("tenantId"); 
@@ -222,5 +223,14 @@ export default function CatalogPage() {
         </div>
       )}
     </div>
+  );
+}
+
+// 2️⃣ COMPONENTE PRINCIPAL: El envoltorio con Suspense para arreglar el error del Build
+export default function CatalogPage() {
+  return (
+    <Suspense fallback={<div className="p-10 text-center text-gray-500">Cargando catálogo...</div>}>
+      <CatalogContent />
+    </Suspense>
   );
 }
