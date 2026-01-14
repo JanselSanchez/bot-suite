@@ -2,32 +2,30 @@
 "use client";
 
 import { useState, useEffect, useMemo } from "react";
+import { useSearchParams } from "next/navigation";
 import { createItem, getItems, deleteItem } from "@/app/actions/catalog-actions";
 import { Plus, Trash2, Clock, Package } from "lucide-react";
 
-export default function CatalogPage({
-  searchParams,
-}: {
-  searchParams: { tenantId?: string };
-}) {
-  // ✅ Tenant dinámico desde la URL (dropdown)
-  // Fallback solo para dev si aún no estás pasando tenantId en la URL
+export default function CatalogPage() {
+  const searchParams = useSearchParams();
+
+  // ✅ AHORA SÍ: tenantId real desde la URL
   const tenantId = useMemo(() => {
-    return (
-      searchParams?.tenantId ||
-      "3870826e-9376-457b-9b53-7533c89e8cda" // fallback DEV (puedes quitarlo cuando ya esté todo conectado)
-    );
-  }, [searchParams?.tenantId]);
+    return searchParams.get("tenantId") || "";
+  }, [searchParams]);
 
   const [items, setItems] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
 
-  // Estado del Formulario
   const [type, setType] = useState<"service" | "product">("service");
 
   useEffect(() => {
-    // ✅ Si cambia tenantId (por dropdown), recarga catálogo
+    if (!tenantId) {
+      setItems([]);
+      setLoading(false);
+      return;
+    }
     loadItems();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId]);
@@ -47,9 +45,9 @@ export default function CatalogPage({
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    const formData = new FormData(e.currentTarget);
+    if (!tenantId) return alert("Selecciona un negocio arriba.");
 
-    // ✅ IMPORTANTÍSIMO: el item se crea en el tenant seleccionado
+    const formData = new FormData(e.currentTarget);
     formData.append("tenantId", tenantId);
     formData.append("type", type);
 
@@ -66,12 +64,11 @@ export default function CatalogPage({
     }
   }
 
-  // ✅ Guardrail real: si no hay tenantId, no intentes cargar
-  // (Si quieres obligar selección real, quita el fallback DEV de arriba)
+  // ✅ Si no hay tenantId en URL, no muestres data de otro tenant
   if (!tenantId) {
     return (
       <div className="p-6 max-w-5xl mx-auto">
-        <h1 className="text-2xl font-bold text-gray-900">Catálogo Universal</h1>
+        <h1 className="text-3xl font-bold text-gray-900">Catálogo Universal</h1>
         <p className="text-gray-500 mt-2">
           Selecciona un negocio arriba para ver su catálogo.
         </p>
@@ -81,15 +78,17 @@ export default function CatalogPage({
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
-      {/* Encabezado */}
       <div className="flex justify-between items-center mb-8">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Catálogo Universal</h1>
           <p className="text-gray-500">Administra tus servicios y productos para el Bot.</p>
+
+          {/* DEBUG visible: así confirmas si está cambiando */}
           <p className="text-xs text-gray-400 mt-1">
             Tenant activo: <span className="font-mono">{tenantId}</span>
           </p>
         </div>
+
         <button
           onClick={() => setIsModalOpen(true)}
           className="bg-black text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-gray-800 transition"
@@ -98,7 +97,6 @@ export default function CatalogPage({
         </button>
       </div>
 
-      {/* Lista de Ítems */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {loading ? (
           <p>Cargando catálogo...</p>
@@ -159,14 +157,12 @@ export default function CatalogPage({
         )}
       </div>
 
-      {/* MODAL DE CREACIÓN */}
       {isModalOpen && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-2xl">
             <h2 className="text-2xl font-bold mb-4">Nuevo Ítem</h2>
 
             <form onSubmit={handleSubmit} className="space-y-4">
-              {/* Selector de TIPO */}
               <div className="flex bg-gray-100 p-1 rounded-lg mb-4">
                 <button
                   type="button"
@@ -190,42 +186,22 @@ export default function CatalogPage({
 
               <div>
                 <label className="block text-sm font-medium text-gray-700">Nombre</label>
-                <input
-                  required
-                  name="name"
-                  className="w-full border rounded-lg p-2 mt-1"
-                  placeholder="Ej: Corte Degradado / Pizza"
-                />
+                <input required name="name" className="w-full border rounded-lg p-2 mt-1" />
               </div>
 
               <div>
                 <label className="block text-sm font-medium text-gray-700">Descripción</label>
-                <textarea
-                  name="description"
-                  className="w-full border rounded-lg p-2 mt-1"
-                  placeholder="Detalles para que la IA venda..."
-                  rows={2}
-                />
+                <textarea name="description" className="w-full border rounded-lg p-2 mt-1" rows={2} />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700">Precio (RD$)</label>
-                  <input
-                    required
-                    type="number"
-                    name="price"
-                    className="w-full border rounded-lg p-2 mt-1"
-                    placeholder="0.00"
-                  />
+                  <input required type="number" name="price" className="w-full border rounded-lg p-2 mt-1" />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700">Categoría</label>
-                  <input
-                    name="category"
-                    className="w-full border rounded-lg p-2 mt-1"
-                    placeholder="Ej: Caballeros"
-                  />
+                  <input name="category" className="w-full border rounded-lg p-2 mt-1" />
                 </div>
               </div>
 
@@ -234,35 +210,20 @@ export default function CatalogPage({
                   <label className="block text-sm font-medium text-blue-800 flex items-center gap-2">
                     <Clock size={16} /> Duración (Minutos)
                   </label>
-                  <input
-                    required
-                    type="number"
-                    name="duration"
-                    defaultValue={30}
-                    className="w-full border rounded-lg p-2 mt-1"
-                  />
-                  <p className="text-xs text-blue-600 mt-1">
-                    Tiempo que se bloqueará en la agenda.
-                  </p>
+                  <input required type="number" name="duration" defaultValue={30} className="w-full border rounded-lg p-2 mt-1" />
                 </div>
               )}
 
               <div className="flex gap-3 mt-6">
-                <button
-                  type="button"
-                  onClick={() => setIsModalOpen(false)}
-                  className="flex-1 py-2 border rounded-lg hover:bg-gray-50"
-                >
+                <button type="button" onClick={() => setIsModalOpen(false)} className="flex-1 py-2 border rounded-lg">
                   Cancelar
                 </button>
-                <button
-                  type="submit"
-                  className="flex-1 py-2 bg-black text-white rounded-lg hover:bg-gray-800"
-                >
+                <button type="submit" className="flex-1 py-2 bg-black text-white rounded-lg">
                   Guardar
                 </button>
               </div>
             </form>
+
           </div>
         </div>
       )}
