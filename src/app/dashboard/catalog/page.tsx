@@ -10,14 +10,9 @@ export default function CatalogPage({
 }: {
   searchParams: { tenantId?: string };
 }) {
-  // ✅ Tenant dinámico desde la URL (dropdown)
-  // Fallback solo para dev si aún no estás pasando tenantId en la URL
-  const tenantId = useMemo(() => {
-    return (
-      searchParams?.tenantId ||
-      "3870826e-9376-457b-9b53-7533c89e8cda" // fallback DEV (puedes quitarlo cuando ya esté todo conectado)
-    );
-  }, [searchParams?.tenantId]);
+  // ✅ CORREGIDO: Eliminamos el ID fijo. Ahora obedece estrictamente a la URL.
+  // Si searchParams.tenantId no existe, la variable será undefined.
+  const tenantId = searchParams?.tenantId;
 
   const [items, setItems] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -28,11 +23,19 @@ export default function CatalogPage({
 
   useEffect(() => {
     // ✅ Si cambia tenantId (por dropdown), recarga catálogo
-    loadItems();
+    if (tenantId) {
+      loadItems();
+    } else {
+      setItems([]); // Limpia la lista si no hay tenant
+      setLoading(false);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId]);
 
   async function loadItems() {
+    // Doble seguridad: No cargar si no hay ID
+    if (!tenantId) return;
+
     setLoading(true);
     try {
       const data = await getItems(tenantId);
@@ -47,6 +50,8 @@ export default function CatalogPage({
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (!tenantId) return; // Seguridad extra
+
     const formData = new FormData(e.currentTarget);
 
     // ✅ IMPORTANTÍSIMO: el item se crea en el tenant seleccionado
@@ -67,7 +72,6 @@ export default function CatalogPage({
   }
 
   // ✅ Guardrail real: si no hay tenantId, no intentes cargar
-  // (Si quieres obligar selección real, quita el fallback DEV de arriba)
   if (!tenantId) {
     return (
       <div className="p-6 max-w-5xl mx-auto">
