@@ -2,10 +2,11 @@
 "use client";
 
 import { useState, useEffect, Suspense } from "react";
-import { useSearchParams, useRouter, usePathname } from "next/navigation"; // 👈 Agregamos router y pathname
-import { createItem, getItems, deleteItem } from "@/app/actions/catalog-actions";
-import { Plus, Trash2, Clock, Package } from "lucide-react";
-// 👇 INTEGRACIÓN: Conectamos con la memoria del menú para que no salga vacío
+import { useSearchParams, useRouter, usePathname } from "next/navigation";
+// 👇 AÑADIDO: updateItem a los imports
+import { createItem, getItems, deleteItem, updateItem } from "@/app/actions/catalog-actions";
+// 👇 AÑADIDO: Pencil a los iconos
+import { Plus, Trash2, Clock, Package, Pencil } from "lucide-react";
 import { useActiveTenant } from "@/app/providers/active-tenant";
 
 // 1️⃣ COMPONENTE INTERNO
@@ -30,9 +31,10 @@ function CatalogContent() {
   // Estado del Formulario
   const [type, setType] = useState<"service" | "product">("service");
 
+  // 👇 AÑADIDO: Estado para saber qué ítem estamos editando (null = creando nuevo)
+  const [editingItem, setEditingItem] = useState<any>(null);
+
   // ✅ EFECTO 1: Sincronizar URL
-  // Si seleccionaste algo en el menú (global) pero la URL está limpia,
-  // escribimos el ID en la URL para que todo sea consistente.
   useEffect(() => {
     if (globalTenantId && !urlTenantId) {
       router.replace(`${pathname}?tenantId=${globalTenantId}`);
@@ -65,6 +67,20 @@ function CatalogContent() {
     }
   }
 
+  // 👇 AÑADIDO: Función auxiliar para abrir el modal en modo EDICIÓN
+  function handleEdit(item: any) {
+    setEditingItem(item);
+    setType(item.type); // Ajustar el switch servicio/producto
+    setIsModalOpen(true);
+  }
+
+  // 👇 AÑADIDO: Función auxiliar para abrir el modal en modo CREACIÓN
+  function handleCreateNew() {
+    setEditingItem(null);
+    setType("service"); // Resetear al default
+    setIsModalOpen(true);
+  }
+
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!tenantId) return;
@@ -73,10 +89,20 @@ function CatalogContent() {
     formData.append("tenantId", tenantId);
     formData.append("type", type);
 
-    await createItem(formData);
+    // 👇 LÓGICA DE ACTUALIZACIÓN VS CREACIÓN
+    if (editingItem) {
+        // Estamos editando
+        formData.append("id", editingItem.id);
+        await updateItem(formData); // Asegúrate de tener esta acción en tu backend
+    } else {
+        // Estamos creando
+        await createItem(formData);
+    }
+
     setIsModalOpen(false);
+    setEditingItem(null); // Limpiar estado
     await loadItems(tenantId);
-    (e.target as HTMLFormElement).reset();
+    // No reseteamos el form aquí porque el modal se desmonta con el isModalOpen &&
   }
 
   async function handleDelete(id: string) {
@@ -111,7 +137,7 @@ function CatalogContent() {
           </p>
         </div>
         <button
-          onClick={() => setIsModalOpen(true)}
+          onClick={handleCreateNew} // 👈 Actualizado para limpiar estado
           className="bg-black text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-gray-800 transition shadow-lg"
         >
           <Plus size={20} /> Nuevo Ítem
@@ -146,12 +172,24 @@ function CatalogContent() {
                 >
                   {item.type === "service" ? "Servicio" : "Producto"}
                 </span>
-                <button
-                  onClick={() => handleDelete(item.id)}
-                  className="text-gray-300 hover:text-red-500 transition p-1"
-                >
-                  <Trash2 size={18} />
-                </button>
+                
+                {/* 👇 GRUPO DE BOTONES EDITAR / BORRAR */}
+                <div className="flex gap-1">
+                    <button
+                        onClick={() => handleEdit(item)}
+                        className="text-gray-300 hover:text-blue-500 transition p-1"
+                        title="Editar"
+                    >
+                        <Pencil size={18} />
+                    </button>
+                    <button
+                        onClick={() => handleDelete(item.id)}
+                        className="text-gray-300 hover:text-red-500 transition p-1"
+                        title="Borrar"
+                    >
+                        <Trash2 size={18} />
+                    </button>
+                </div>
               </div>
 
               <h3 className="font-bold text-lg text-gray-800 leading-tight">{item.name}</h3>
@@ -176,11 +214,15 @@ function CatalogContent() {
         )}
       </div>
 
-      {/* MODAL (Sin cambios funcionales, solo visuales) */}
+      {/* MODAL */}
       {isModalOpen && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-white rounded-2xl w-full max-w-md p-6 shadow-2xl animate-in fade-in zoom-in duration-200">
-            <h2 className="text-2xl font-bold mb-4">Nuevo Ítem</h2>
+            {/* 👇 TÍTULO DINÁMICO */}
+            <h2 className="text-2xl font-bold mb-4">
+                {editingItem ? "Editar Ítem" : "Nuevo Ítem"}
+            </h2>
+            
             <form onSubmit={handleSubmit} className="space-y-4">
               {/* Selector de TIPO */}
               <div className="flex bg-gray-100 p-1 rounded-lg mb-4">
@@ -204,24 +246,50 @@ function CatalogContent() {
                 </button>
               </div>
 
+              {/* 👇 INPUTS CON DEFAULTVALUE PARA EDICIÓN */}
               <div>
                 <label className="block text-xs font-bold text-gray-500 uppercase mb-1">Nombre</label>
-                <input required name="name" className="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-black focus:outline-none" placeholder="Ej: Corte Premium" />
+                <input 
+                    required 
+                    name="name" 
+                    defaultValue={editingItem?.name} 
+                    className="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-black focus:outline-none" 
+                    placeholder="Ej: Corte Premium" 
+                />
               </div>
 
               <div>
                 <label className="block text-xs font-bold text-gray-500 uppercase mb-1">Descripción (Para la IA)</label>
-                <textarea name="description" className="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-black focus:outline-none" placeholder="Describe los beneficios..." rows={2} />
+                <textarea 
+                    name="description" 
+                    defaultValue={editingItem?.description} 
+                    className="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-black focus:outline-none" 
+                    placeholder="Describe los beneficios..." 
+                    rows={2} 
+                />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-bold text-gray-500 uppercase mb-1">Precio (RD$)</label>
-                  <input required type="number" name="price" className="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-black focus:outline-none" placeholder="0.00" />
+                  <input 
+                    required 
+                    type="number" 
+                    name="price"
+                    // Convertimos centavos a decimal para mostrar en el input
+                    defaultValue={editingItem ? (editingItem.price_cents / 100) : ""} 
+                    className="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-black focus:outline-none" 
+                    placeholder="0.00" 
+                  />
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-gray-500 uppercase mb-1">Categoría</label>
-                  <input name="category" className="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-black focus:outline-none" placeholder="Opcional" />
+                  <input 
+                    name="category" 
+                    defaultValue={editingItem?.category} 
+                    className="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-black focus:outline-none" 
+                    placeholder="Opcional" 
+                  />
                 </div>
               </div>
 
@@ -230,13 +298,21 @@ function CatalogContent() {
                   <label className="block text-xs font-bold text-blue-700 uppercase mb-1 flex items-center gap-1">
                     <Clock size={12} /> Duración (Minutos)
                   </label>
-                  <input required type="number" name="duration" defaultValue={30} className="w-full border border-blue-200 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none" />
+                  <input 
+                    required 
+                    type="number" 
+                    name="duration" 
+                    defaultValue={editingItem?.duration_minutes || 30} 
+                    className="w-full border border-blue-200 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none" 
+                  />
                 </div>
               )}
 
               <div className="flex gap-3 mt-6 pt-2">
                 <button type="button" onClick={() => setIsModalOpen(false)} className="flex-1 py-2.5 border border-gray-300 rounded-lg hover:bg-gray-50 font-medium">Cancelar</button>
-                <button type="submit" className="flex-1 py-2.5 bg-black text-white rounded-lg hover:bg-gray-800 font-medium">Guardar Ítem</button>
+                <button type="submit" className="flex-1 py-2.5 bg-black text-white rounded-lg hover:bg-gray-800 font-medium">
+                    {editingItem ? "Actualizar" : "Guardar Ítem"}
+                </button>
               </div>
             </form>
           </div>
