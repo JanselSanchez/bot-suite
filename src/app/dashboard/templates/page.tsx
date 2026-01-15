@@ -17,19 +17,27 @@ const DEFAULT_CHANNEL = "whatsapp" as const;
 // Tipos derivados de tus constantes
 type VerticalValue = (typeof VERTICALS)[number]["value"];
 
+// ✨ ACTUALIZADO: Añadido 'system_prompt' a los tipos permitidos
 type EventKey =
   | "booking_confirmed"
   | "booking_rescheduled"
   | "booking_cancelled"
   | "reminder"
   | "payment_pending"
-  | "pricing_pitch";
+  | "pricing_pitch"
+  | "system_prompt"; // 👈 NUEVO: El Cerebro
 
+// ✨ ACTUALIZADO: Añadida la opción en el menú desplegable
 const EVENT_OPTS: ReadonlyArray<{
   value: EventKey;
   label: string;
   hint: string;
 }> = [
+  {
+    value: "system_prompt", // 👈 LA NUEVA OPCIÓN
+    label: "🧠 Cerebro / Personalidad IA",
+    hint: "Define quién es el bot, qué vende y cómo se comporta. (Instrucción Maestra)",
+  },
   {
     value: "booking_confirmed",
     label: "Cita CONFIRMADA",
@@ -58,14 +66,32 @@ const EVENT_OPTS: ReadonlyArray<{
 ];
 
 // 🧠 CEREBRO DE SUGERENCIAS: Textos adaptados a cada negocio
+// ✨ ACTUALIZADO: Agregué 'system_prompt' a cada nicho con la lógica que diseñamos.
 const PRESETS: Record<string, Partial<Record<EventKey, string>>> = {
   general: {
+    system_prompt: `Eres el Asistente Virtual de {{business_name}}.
+Tu misión: Atender clientes, resolver dudas y filtrar interesados.
+
+Reglas de Comportamiento:
+1. Sé amable, profesional y directo.
+2. Si preguntan precios, usa la información del catálogo.
+3. Si el cliente está listo para comprar o tiene dudas complejas, usa la herramienta "human_handoff" o manda el contacto del dueño.
+
+Tu objetivo NO es trabarte en conversaciones largas, es llevar al cliente al siguiente paso (Agendar o Hablar con Humano).`,
     booking_confirmed:
       "Hola {{customer_name}}, tu cita del {{date}} a las {{time}} con {{resource_name}} fue confirmada. Si deseas pagar antes: {{payment_link}}.",
     pricing_pitch:
       "Nuestros servicios van desde $500 hasta $5,000 dependiendo de lo que necesites. ¿Te gustaría agendar una evaluación?",
   },
   barbershop: {
+    system_prompt: `Eres el Asistente con Flow de {{business_name}}.
+Tu misión: Llenar la agenda de cortes y mantener el estilo.
+
+Tono: Urbano, respetuoso ("mi líder", "caballero"), cercano.
+Reglas:
+1. Tu prioridad #1 es AGENDAR CITAS usando la herramienta.
+2. Si preguntan precios, dalos directo y cierra con "¿Te anoto para hoy?".
+3. No des vueltas. Corte, Barba, Cejas. Rápido y efectivo.`,
     booking_confirmed:
       "¡Todo listo, líder! 💈 {{customer_name}}, tu corte quedó para el {{date}} a las {{time}} con {{resource_name}}. Llega 5 min antes.",
     reminder:
@@ -74,12 +100,28 @@ const PRESETS: Record<string, Partial<Record<EventKey, string>>> = {
       "El corte regular cuesta $500, barba $300 y el servicio completo $800. ¿Te agendo uno para hoy?",
   },
   salon: {
+    system_prompt: `Eres la Asistente de Belleza de {{business_name}}.
+Tu misión: Hacer sentir especiales a las clientes y organizar las citas.
+
+Tono: Amable, cálido, usa emojis ✨💅.
+Reglas:
+1. Agenda citas para secado, uñas, tintes.
+2. Recuerda que los precios de tintes son "desde" y requieren evaluación.
+3. Trata a cada cliente como una reina.`,
     booking_confirmed:
       "Hola bella ✨ {{customer_name}}, tu cita de belleza es el {{date}} a las {{time}} con {{resource_name}}. ¡Te esperamos!",
     pricing_pitch:
       "El lavado y secado empieza en $800. Tintes desde $2,500. Para un precio exacto necesitamos evaluarte el cabello. ¿Pasas hoy?",
   },
   clinic: {
+    system_prompt: `Eres el Asistente Médico de {{business_name}}.
+Tu misión: Gestionar la agenda de pacientes con profesionalismo y empatía.
+
+Tono: Formal, respetuoso ("Estimado paciente"), serio.
+Reglas:
+1. Agenda citas médicas verificando disponibilidad.
+2. Si es una emergencia, indica que llamen al 911 o vayan a urgencias.
+3. Solicita confirmar si tienen seguro médico.`,
     booking_confirmed:
       "Estimado(a) {{customer_name}}, su consulta médica está confirmada para el {{date}} a las {{time}} con el Dr(a). {{resource_name}}.",
     reminder:
@@ -88,18 +130,39 @@ const PRESETS: Record<string, Partial<Record<EventKey, string>>> = {
       "La consulta general tiene un costo de $2,000 (o diferencia de seguro). Especialidades varían. ¿Desea ver disponibilidad?",
   },
   restaurant: {
+    system_prompt: `Eres el Camarero Virtual de {{business_name}}.
+Tu misión: Antojar a los clientes, mostrar el menú y tomar reservas.
+
+Reglas CRÍTICAS:
+1. NO USES la herramienta de agendar citas (booking) a menos que sea una RESERVA DE MESA.
+2. Para delivery: Muestra el menú, toma el pedido y pide la dirección.
+3. Sé descriptivo con la comida 🍕🍔. ¡Que les de hambre al leerte!`,
     booking_confirmed:
       "¡Mesa reservada! 🍽️ {{customer_name}}, los esperamos el {{date}} a las {{time}}. Ver menú: {{payment_link}}",
     pricing_pitch:
       "Nuestro plato del día cuesta $450. El menú a la carta varía entre $600 y $1,500 por persona. ¡Tenemos Happy Hour de 5 a 8!",
   },
   real_estate: {
+    system_prompt: `Eres el Asesor Inmobiliario IA de {{business_name}}.
+Tu misión: Calificar prospectos y agendar visitas a propiedades.
+
+Reglas:
+1. No des la ubicación exacta por chat, agenda la visita.
+2. Filtra presupuesto: Pregunta rango de precio y zona de interés.
+3. Tu objetivo es conseguir la cita presencial.`,
     booking_confirmed:
       "Visita confirmada 🏠. {{customer_name}}, nos vemos el {{date}} a las {{time}} para ver la propiedad.",
     pricing_pitch:
       "Manejamos propiedades desde US$80,000 en planos hasta listas para entrega. ¿Buscas para vivir o inversión?",
   },
   store: {
+    system_prompt: `Eres el Vendedor Digital de {{business_name}}.
+Tu misión: Ayudar a encontrar productos y cerrar ventas.
+
+Reglas:
+1. Muestra el catálogo con precios.
+2. Si piden algo específico, confirma si hay stock (o di que lo verificas).
+3. Gestiona pedidos para pickup o envío.`,
     booking_confirmed:
       "¡Pedido recibido! 🛍️ {{customer_name}}, puedes pasar a recogerlo el {{date}} a las {{time}}.",
     pricing_pitch:
@@ -135,7 +198,9 @@ export default function TemplatesPage() {
   // Estado del vertical seleccionado (para sugerencias)
   const [vertical, setVertical] = useState<string>("general");
   
+  // Valor por defecto del dropdown
   const [event, setEvent] = useState<EventKey>("booking_confirmed");
+  
   const [idEditing, setIdEditing] = useState<string | null>(null);
   const [name, setName] = useState<string>("");
   const [body, setBody] = useState<string>("");
@@ -262,7 +327,6 @@ export default function TemplatesPage() {
       name: name || null,
       body,
       active,
-      // Guardamos el vertical actual como metadato (opcional, pero útil)
       vertical: vertical 
     };
 
@@ -304,9 +368,13 @@ export default function TemplatesPage() {
     setName(row.name ?? "");
     setBody(row.body);
     setActive(row.active);
-    // Intentar encontrar el evento en la lista, si no existe (legacy), mantenerlo
+    
+    // Intentar encontrar el evento en la lista
     const evFound = EVENT_OPTS.find((e) => e.value === row.event)?.value;
+    
+    // Si es system_prompt o cualquier otro válido, lo seteamos
     if (evFound) setEvent(evFound as EventKey);
+    // Si no está en la lista (legacy), lo dejamos como está o forzamos general (opcional)
     
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -320,7 +388,7 @@ export default function TemplatesPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Plantillas</h1>
           <p className="text-sm text-gray-500">
-            Define los mensajes que el Bot usará para responder.
+            Define los mensajes y la personalidad que el Bot usará.
           </p>
         </div>
         <button
@@ -397,7 +465,7 @@ export default function TemplatesPage() {
       {/* Editor Principal */}
       <div className="rounded-2xl border bg-white/80 backdrop-blur p-5 shadow-sm space-y-4">
         <div className="flex justify-between items-center">
-            <h2 className="font-semibold">Editor de Mensaje</h2>
+            <h2 className="font-semibold">Editor de Mensaje / Prompt</h2>
             {idEditing && (
                 <span className="text-xs bg-amber-100 text-amber-700 px-2 py-1 rounded-full">
                     Editando plantilla existente
@@ -407,7 +475,7 @@ export default function TemplatesPage() {
 
         <input
           className="border rounded-xl px-3 py-2 w-full text-sm"
-          placeholder="Nombre interno (opcional, ej: Confirmación Barbería)"
+          placeholder="Nombre interno (opcional, ej: Cerebro Ventas)"
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
@@ -430,8 +498,8 @@ export default function TemplatesPage() {
 
         <textarea
           ref={bodyRef}
-          className="border rounded-2xl w-full min-h-[120px] p-4 text-sm leading-relaxed focus:ring-2 focus:ring-violet-500/20 outline-none transition"
-          placeholder="Escribe el mensaje aquí..."
+          className="border rounded-2xl w-full min-h-[180px] p-4 text-sm leading-relaxed focus:ring-2 focus:ring-violet-500/20 outline-none transition font-mono"
+          placeholder="Escribe el mensaje o las instrucciones del sistema aquí..."
           value={body}
           onChange={(e) => setBody(e.target.value)}
         />
@@ -469,10 +537,10 @@ export default function TemplatesPage() {
       {/* Preview Box */}
       {preview && (
         <div className="rounded-2xl border bg-white/70 backdrop-blur p-5 shadow-sm animate-in fade-in slide-in-from-top-2">
-            <h3 className="font-semibold mb-3 text-sm">Vista Previa (WhatsApp)</h3>
-            <div className="bg-[#DCF8C6] rounded-lg p-3 text-sm shadow-sm max-w-[80%] text-gray-800 relative">
-                 <div className="whitespace-pre-wrap leading-snug">{preview}</div>
-                 <div className="text-[10px] text-gray-500 text-right mt-1">10:30 AM</div>
+            <h3 className="font-semibold mb-3 text-sm">Vista Previa</h3>
+            <div className="bg-[#DCF8C6] rounded-lg p-3 text-sm shadow-sm max-w-[80%] text-gray-800 relative whitespace-pre-wrap leading-snug font-sans">
+                  {preview}
+                  <div className="text-[10px] text-gray-500 text-right mt-1">10:30 AM</div>
             </div>
         </div>
       )}
