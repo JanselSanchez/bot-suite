@@ -75,3 +75,41 @@ export async function deleteItem(itemId: string) {
   revalidatePath("/dashboard/catalog");
   return { success: true };
 }
+
+// 👇 ESTA ES LA FUNCIÓN NUEVA QUE FALTABA PARA CORREGIR EL ERROR
+export async function updateItem(formData: FormData) {
+  const supabase = getSupabase();
+  
+  const id = formData.get("id") as string;
+  const name = formData.get("name") as string;
+  const description = formData.get("description") as string;
+  const price = Number(formData.get("price")); 
+  // Leemos el tipo para saber si guardar duración o ponerla en 0
+  const type = formData.get("type") as "service" | "product";
+  const duration = Number(formData.get("duration") || 0);
+  const category = formData.get("category") as string;
+
+  if (!id || !name) {
+    return { error: "Faltan datos obligatorios (ID o Nombre)" };
+  }
+
+  // Guardamos precio en centavos
+  const priceCents = Math.round(price * 100);
+
+  const { error } = await supabase
+    .from("items")
+    .update({
+      name,
+      description,
+      price_cents: priceCents,
+      category,
+      // Si es servicio usa la duración, si es producto fuerza 0
+      duration_minutes: type === "service" ? duration : 0,
+    })
+    .eq("id", id);
+
+  if (error) return { error: error.message };
+
+  revalidatePath("/dashboard/catalog"); 
+  return { success: true };
+}
