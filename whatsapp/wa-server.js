@@ -10,8 +10,9 @@
  *
  * 🛠️ CORRECCIONES APLICADAS:
  * 1. restoreSessions: Solo revive 'connected' para evitar spam de QRs en logs.
- * 2. /connect: Fuerza limpieza de sesión previa para garantizar QR fresco.
+ * 2. /connect: NUCLEAR FIX -> Mata memoria, Borra disco y Resetea DB sin preguntar.
  * 3. JID FIX: Prioridad a remoteJidAlt o cualquiera que tenga @s.whatsapp.net.
+ * 4. BROWSER FIX: Usamos "Ubuntu" para mayor estabilidad.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -49,10 +50,8 @@ app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
-// 🔥 AJUSTE DE ZONA HORARIA (tu lógica actual)
+// 🔥 AJUSTE DE ZONA HORARIA
 const SERVER_OFFSET_HOURS = 4;
-
-// Timezone configurable (fallback RD)
 const TIMEZONE_LOCALE = process.env.TIMEZONE_LOCALE || "America/Santo_Domingo";
 
 const logger = P({
@@ -107,7 +106,7 @@ try {
 
 function requireAuth(req, res, next) {
   const expected = String(process.env.WA_API_TOKEN || "").trim();
-  if (!expected) return next(); // si no hay token, no bloquea
+  if (!expected) return next();
 
   const auth = String(req.headers.authorization || "");
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
@@ -119,7 +118,7 @@ function requireAuth(req, res, next) {
 }
 
 // ---------------------------------------------------------------------
-// HELPERS: Normalización teléfono → WhatsApp JID
+// HELPERS
 // ---------------------------------------------------------------------
 
 function normalizePhoneDigits(input) {
@@ -925,13 +924,16 @@ async function getOrCreateSession(tenantId) {
   const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
   const { state, saveCreds } = await useFileAuthState(tenantId);
 
+  // 🔥 FIX 3 & 4: Browser Ubuntu y Timeouts aumentados
   const sock = makeWASocket({
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ["PymeBot", "Chrome", "1.0.0"],
+    browser: ["Ubuntu", "Chrome", "20.0.04"], // <-- Se hace pasar por Ubuntu
     syncFullHistory: false,
-    connectTimeoutMs: 60000,
+    connectTimeoutMs: 60000, 
+    keepAliveIntervalMs: 10000, 
+    retryRequestDelayMs: 5000,
   });
 
   const info = {
@@ -1131,18 +1133,38 @@ app.get("/sessions/:tenantId", async (req, res) => {
   });
 });
 
-// 🔥 CORRECCIÓN 2: Fuerza limpieza para evitar QR viejo
+// 🔥 CORRECCIÓN 2 MEJORADA: Borrado TOTAL (Memoria + Disco + DB)
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
   try {
-    // 1. Matar sesión vieja si existe y está trabada
+    
+    // 1. Limpieza de DB (Para que nadie crea que estamos conectados)
+    await updateSessionDB(tenantId, { status: "disconnected", qr_data: null });
+
+    // 2. Matar sesión vieja en Memoria
     const existing = sessions.get(tenantId);
-    if (existing && existing.status !== "connected") {
-      try { await existing.socket.logout(); } catch(e) {}
-      sessions.delete(tenantId);
+    if (existing) {
+      try { 
+        // Intentamos cerrar socket suavemente
+        existing.socket.end(undefined); 
+        sessions.delete(tenantId);
+      } catch(e) {
+        console.error("Error cerrando socket viejo:", e);
+      }
     }
 
-    // 2. Crear nueva fresca
+    // 3. 🔥 ELIMINAR CARPETA DE SESIÓN (Físico)
+    const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
+    if (fs.existsSync(sessionFolder)) {
+      try {
+        fs.rmSync(sessionFolder, { recursive: true, force: true });
+        logger.info({ tenantId }, "🗑️ Carpeta de sesión eliminada para forzar conexión limpia.");
+      } catch (err) {
+        logger.error({ tenantId, err }, "No se pudo borrar la carpeta de sesión.");
+      }
+    }
+
+    // 4. Crear nueva fresca
     const info = await getOrCreateSession(tenantId);
     
     // espera un poco por si conecta rápido
