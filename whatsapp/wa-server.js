@@ -6,12 +6,15 @@
  * ✅ COMPATIBILIDAD: Browser "Creativa Web" en Windows (Universal).
  * ✅ AUTO-ICS: Envío automático de archivo de calendario al crear reserva.
  * ✅ FUSIÓN: Maneja tráfico de Next.js (Dashboard) y del Bot en el mismo puerto.
+ * ✅ ESTABILIDAD: Modo producción forzado y Body Parser segregado.
  */
 
 require("dotenv").config({ path: ".env.local" });
 require("dotenv").config();
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+// 🔥 FIX 1: Forzamos producción para ahorrar RAM y evitar caídas en Render
+process.env.NODE_ENV = "production";
 
 const express = require("express");
 const qrcode = require("qrcode-terminal");
@@ -33,12 +36,23 @@ const convoState = require("./conversationState");
 // CONFIGURACIÓN GLOBAL & NEXT.JS
 // ---------------------------------------------------------------------
 
-const dev = process.env.NODE_ENV !== "production";
+// 🔥 FIX 2: 'dev: false' obliga a usar la versión compilada (Rápida y Ligera)
+const dev = false; 
 const nextApp = next({ dev });
 const handle = nextApp.getRequestHandler();
 
 const app = express();
-app.use(express.json({ limit: "20mb" }));
+
+// 🔥 FIX 3: SEGREGACIÓN DE JSON
+// NO usamos app.use(express.json()) globalmente porque "roba" el cuerpo a Next.js.
+// Creamos un parser específico para usarlo solo en las rutas del bot.
+const jsonParser = express.json({ limit: "20mb" });
+
+// Aplicamos el parser SOLO a las rutas del API del Bot
+app.use("/sessions", jsonParser);
+app.use("/api", jsonParser);
+app.use("/health", jsonParser);
+
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
 // 🔥 AJUSTE DE ZONA HORARIA (CRÍTICO)
@@ -1325,12 +1339,12 @@ async function getOrCreateSession(tenantId) {
 // 11. API ROUTES BÁSICAS
 // ---------------------------------------------------------------------
 
-app.get("/health", (req, res) =>
+app.get("/health", jsonParser, (req, res) =>
   res.json({ ok: true, active_sessions: sessions.size })
 );
 
 // Ruta para que el dashboard lea estado y QR
-app.get("/sessions/:tenantId", async (req, res) => {
+app.get("/sessions/:tenantId", jsonParser, async (req, res) => {
   const tenantId = req.params.tenantId;
   const info = sessions.get(tenantId);
 
@@ -1353,7 +1367,7 @@ app.get("/sessions/:tenantId", async (req, res) => {
 });
 
 // 🔥 CONNECT NUCLEAR MEJORADO (CON WAIT)
-app.post("/sessions/:tenantId/connect", async (req, res) => {
+app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
   const tenantId = req.params.tenantId;
 
   try {
@@ -1400,7 +1414,7 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
   }
 });
 
-app.post("/sessions/:tenantId/disconnect", async (req, res) => {
+app.post("/sessions/:tenantId/disconnect", jsonParser, async (req, res) => {
   const s = sessions.get(req.params.tenantId);
   if (s?.socket) await s.socket.logout().catch(() => {});
   sessions.delete(req.params.tenantId);
@@ -1413,7 +1427,7 @@ app.post("/sessions/:tenantId/disconnect", async (req, res) => {
  * - FIX: estaba abajo de app.listen en tu archivo → lo moví aquí
  * - Extra: intenta restaurar sesión si no está cargada
  */
-app.post("/sessions/:tenantId/send-message", async (req, res) => {
+app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   const { tenantId } = req.params;
   const { phone, message } = req.body || {};
 
@@ -1452,7 +1466,7 @@ app.post("/sessions/:tenantId/send-message", async (req, res) => {
 /**
  * ENDPOINT: Envía plantilla + archivo ICS
  */
-app.post("/sessions/:tenantId/send-template", async (req, res) => {
+app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   const { tenantId } = req.params;
   const { event, phone, variables } = req.body;
 
@@ -1515,7 +1529,7 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
 // ---------------------------------------------------------------------
 // ENDPOINT NUEVO: Enviar Archivos/Media (ICS, PDF, IMG) desde Next.js
 // ---------------------------------------------------------------------
-app.post("/sessions/:tenantId/send-media", async (req, res) => {
+app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
   const { tenantId } = req.params;
   const { phone, type, base64, fileName, mimetype, caption } = req.body;
 
@@ -1577,7 +1591,7 @@ app.post("/sessions/:tenantId/send-media", async (req, res) => {
 // 12. API DE CONSULTA DE DISPONIBILIDAD
 // ---------------------------------------------------------------------
 
-app.get("/api/v1/availability", async (req, res) => {
+app.get("/api/v1/availability", jsonParser, async (req, res) => {
   const { tenantId, resourceId, date } = req.query;
 
   if (!tenantId || !date) return res.status(400).json({ error: "Faltan tenantId y date" });
@@ -1617,7 +1631,7 @@ app.get("/api/v1/availability", async (req, res) => {
 // 13. API DE CREACIÓN DE CITA
 // ---------------------------------------------------------------------
 
-app.post("/api/v1/create-booking", async (req, res) => {
+app.post("/api/v1/create-booking", jsonParser, async (req, res) => {
   const {
     tenantId,
     serviceId,
@@ -1729,7 +1743,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
 // 14. API DE REAGENDAMIENTO
 // ---------------------------------------------------------------------
 
-app.post("/api/v1/reschedule-booking", async (req, res) => {
+app.post("/api/v1/reschedule-booking", jsonParser, async (req, res) => {
   const { tenantId, bookingId, newStartsAtISO, newEndsAtISO, extraVariables } =
     req.body || {};
 
@@ -1832,7 +1846,7 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
 // 15. API DE CANCELACIÓN
 // ---------------------------------------------------------------------
 
-app.post("/api/v1/cancel-booking", async (req, res) => {
+app.post("/api/v1/cancel-booking", jsonParser, async (req, res) => {
   const { tenantId, bookingId, extraVariables } = req.body || {};
 
   if (!tenantId || !bookingId) {
@@ -1950,7 +1964,7 @@ async function restoreSessions() {
 // 17. START SERVER (MODIFICADO PARA NEXT.JS)
 // ---------------------------------------------------------------------
 
-// 🛑 FUSIÓN: Ruta comodín para Next.js
+// 🛑 FUSIÓN: Ruta comodín para Next.js con el fix de (.*)
 app.all("(.*)", (req, res) => {
   return handle(req, res);
 });
