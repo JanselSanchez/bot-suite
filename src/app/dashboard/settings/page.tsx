@@ -54,7 +54,7 @@ export default function SettingsPage() {
 
   const [saving, setSaving] = useState(false);
 
-  // --- NUEVOS ESTADOS PARA GESTIÓN DE NOTIFICACIONES ---
+  // --- NUEVOS ESTADOS PARA GESTIÓN DE NOTIFICACIONES (Modificado para tenant_settings) ---
   const [notifPhones, setNotifPhones] = useState<NotificationPhone[]>([]);
   const [showAddPhone, setShowAddPhone] = useState(false);
   const [newPhoneName, setNewPhoneName] = useState("");
@@ -63,11 +63,23 @@ export default function SettingsPage() {
   // ---------- CARGA DE DATOS ----------
 
   async function loadNotificationPhones(tid: string) {
-    const { data } = await sb
-      .from("notification_phones")
-      .select("id, name, phone, created_at")
-      .eq("tenant_id", tid);
-    if (data) setNotifPhones(data as NotificationPhone[]);
+    // Ajustado para leer de la tabla tenant_settings según tu query SQL
+    const { data, error } = await sb
+      .from("tenant_settings")
+      .select("tenant_id, notification_name, notification_phone")
+      .eq("tenant_id", tid)
+      .maybeSingle();
+
+    if (data && data.notification_phone) {
+      setNotifPhones([{
+        id: data.tenant_id,
+        name: data.notification_name || "Asignado",
+        phone: data.notification_phone,
+        created_at: "" // No requerido para la UI actual
+      }]);
+    } else {
+      setNotifPhones([]);
+    }
   }
 
   // Carga Tenant + Perfil de Negocio (JOIN lógico)
@@ -132,17 +144,19 @@ export default function SettingsPage() {
     try { localStorage.setItem(KEY_SELECTED_TENANT, tenantId); } catch {}
   }, [tenantId]);
 
-  // Funciones de notificación (Se mantienen igual)
+  // Funciones de notificación (Modificadas para usar tenant_settings)
   async function handleAddPhone() {
     if (!newPhoneName || !newPhoneNum) return;
     const cleanPhone = normalizePhone(newPhoneNum);
     if (!cleanPhone) { alert("Número inválido"); return; }
 
-    const { error } = await sb.from("notification_phones").insert({
-      tenant_id: tenantId,
-      name: newPhoneName.trim(),
-      phone: cleanPhone
-    });
+    const { error } = await sb
+      .from("tenant_settings")
+      .upsert({
+        tenant_id: tenantId,
+        notification_name: newPhoneName.trim(),
+        notification_phone: cleanPhone
+      }, { onConflict: 'tenant_id' });
 
     if (error) alert("Error agregando teléfono: " + error.message);
     else {
@@ -155,8 +169,17 @@ export default function SettingsPage() {
 
   async function handleDeletePhone(id: string) {
     if (!confirm("¿Borrar este número de la lista de notificaciones?")) return;
-    await sb.from("notification_phones").delete().eq("id", id);
-    loadNotificationPhones(tenantId);
+    
+    const { error } = await sb
+      .from("tenant_settings")
+      .update({
+        notification_name: null,
+        notification_phone: null
+      })
+      .eq("tenant_id", tenantId);
+      
+    if (error) alert("Error eliminando: " + error.message);
+    else loadNotificationPhones(tenantId);
   }
 
   // ====== GUARDAR CAMBIOS GENERALES Y DE PERFIL ======
@@ -317,7 +340,7 @@ export default function SettingsPage() {
         </div>
       </section>
       
-      {/* --- SECCIÓN 2: DESTINATARIOS DE NOTIFICACIONES (Igual que antes) --- */}
+      {/* --- SECCIÓN 2: DESTINATARIOS DE NOTIFICACIONES (Integrado con tenant_settings) --- */}
       <section className="relative z-10 rounded-3xl border border-white/60 bg-white/80 shadow-xl backdrop-blur-xl p-6 md:p-8">
         <div className="mb-6 flex items-start gap-3">
           <div className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-500 text-white shadow"><Bell className="w-5 h-5"/></div>
@@ -332,7 +355,7 @@ export default function SettingsPage() {
             {notifPhones.map(p => (
               <div key={p.id} className="flex items-center justify-between p-3 bg-white border rounded-xl shadow-sm hover:shadow-md transition">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-full bg-emerald-50 flex items-center justify-center text-emerald-600 font-bold">{p.name[0]}</div>
+                  <div className="w-10 h-10 rounded-full bg-emerald-50 flex items-center justify-center text-emerald-600 font-bold">{(p.name || "A")[0]}</div>
                   <div>
                     <p className="font-medium text-sm text-gray-900">{p.name}</p>
                     <p className="text-xs text-gray-500 font-mono">{p.phone.replace("whatsapp:", "")}</p>
@@ -350,15 +373,26 @@ export default function SettingsPage() {
               </div>
           )}
           
-          {!showAddPhone && (
+          {!showAddPhone && (notifPhones.length === 0) && (
             <button onClick={() => setShowAddPhone(true)} className="mt-2 w-full py-3 rounded-xl border-2 border-dashed border-gray-200 text-gray-500 font-medium hover:border-violet-300 hover:text-violet-600 hover:bg-violet-50 transition flex justify-center items-center gap-2">
               <Plus size={18} /> Agregar Teléfono
             </button>
           )}
 
+          {/* Botón de editar si ya existe uno (ya que tenant_settings guarda uno por tenant) */}
+          {!showAddPhone && notifPhones.length > 0 && (
+            <button onClick={() => {
+              setNewPhoneName(notifPhones[0].name);
+              setNewPhoneNum(notifPhones[0].phone.replace("whatsapp:", ""));
+              setShowAddPhone(true);
+            }} className="text-sm text-violet-600 font-medium hover:underline">
+              Editar contacto de notificación
+            </button>
+          )}
+
           {showAddPhone && (
             <div className="bg-gray-50 p-5 rounded-2xl border border-gray-200 animate-in fade-in zoom-in-95">
-              <h4 className="text-sm font-bold text-gray-800 mb-4">Nuevo Destinatario</h4>
+              <h4 className="text-sm font-bold text-gray-800 mb-4">Configurar Destinatario</h4>
               <div className="flex flex-col md:flex-row gap-3">
                 <input className="flex-1 border rounded-xl px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-violet-500" placeholder="Nombre (Ej: Recepción)" value={newPhoneName} onChange={e => setNewPhoneName(e.target.value)} />
                 <input className="flex-1 border rounded-xl px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-violet-500" placeholder="WhatsApp (Ej: 1829...)" value={newPhoneNum} onChange={e => setNewPhoneNum(e.target.value)} />
