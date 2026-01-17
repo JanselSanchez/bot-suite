@@ -51,9 +51,22 @@ const app = express();
 // Creamos un parser específico para usarlo solo en las rutas del bot.
 const jsonParser = express.json({ limit: "20mb" });
 
+// ---------------------------------------------------------------------
+// MIDDLEWARES DE RUTAS (CORREGIDO PARA LOGIN)
+// ---------------------------------------------------------------------
+
 // Aplicamos el parser SOLO a las rutas del Bot
 app.use("/sessions", jsonParser);
-app.use("/api", jsonParser);
+
+// ✅ FIX AUTH: Excluimos explícitamente las rutas de Auth de Next.js del parser de Express
+// para evitar que las peticiones se queden en (pending).
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/auth")) {
+    return next(); 
+  }
+  jsonParser(req, res, next);
+});
+
 app.use("/health", jsonParser);
 
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
@@ -1646,9 +1659,17 @@ async function restoreSessions() {
 // 17. FINAL FUSION HANDLER (FIX PARA TODO)
 // ---------------------------------------------------------------------
 
-// 🛑 AQUÍ ESTÁ EL FIX FINAL: 
-// 1. Sin ruta para evitar error PathError (*)
-// 2. Next.js ahora sabe dónde encontrar la web gracias a 'dir: projectRoot'
+// 🛑 AQUÍ ESTÁ EL FIX FINAL PARA EL LOGIN: 
+// Aseguramos que el parser de JSON no interfiere con las rutas de auth de Next.js
+app.use("/api", (req, res, next) => {
+  if (req.path.startsWith("/auth")) {
+    return next(); 
+  }
+  jsonParser(req, res, next);
+});
+
+// Sin ruta para evitar error PathError (*)
+// Next.js ahora sabe dónde encontrar la web gracias a 'dir: projectRoot'
 app.use(async (req, res) => {
   await handle(req, res);
 });
