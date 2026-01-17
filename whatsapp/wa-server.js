@@ -1,17 +1,21 @@
 /**
- * wa-server.js — VERSIÓN FINAL CORREGIDA (N8N + NUCLEAR FIX + AUTO-ICS) — TEXT IDs
+ * wa-server.js — VERSIÓN FINAL CORREGIDA (N8N + NUCLEAR FIX + AUTO-ICS + TEXT IDs)
  *
  * ✅ IDs: TODO TEXT (tenantId, customerId, etc.).
  * ✅ CEREBRO: n8n (Prioridad) + OpenAI (Fallback).
  * ✅ CONEXIÓN: Nuclear (Borrado físico de sesión + wait QR/connected).
  * ✅ COMPATIBILIDAD: Browser "Creativa Web" en Windows (Universal).
  * ✅ AUTO-ICS: Envío automático de archivo de calendario al crear/reagendar.
+ * ✅ FUSIÓN: Integrado con Next.js (Dashboard) + Modo Producción forzado.
  */
 
 require("dotenv").config({ path: ".env.local" });
 require("dotenv").config();
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+// 🔥 FIX MEMORIA: Forzamos producción explícitamente para evitar caídas
+process.env.NODE_ENV = "production";
 
 const express = require("express");
 const qrcode = require("qrcode-terminal");
@@ -21,6 +25,7 @@ const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
+const next = require("next"); // 👈 FUSIÓN: Importamos Next.js
 
 // Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -29,21 +34,37 @@ const { startOfWeek, addDays, startOfDay } = require("date-fns");
 const convoState = require("./conversationState");
 
 // ---------------------------------------------------------------------
-// CONFIGURACIÓN GLOBAL
+// CONFIGURACIÓN GLOBAL & NEXT.JS (FIX DIRECTORIO)
 // ---------------------------------------------------------------------
 
+// 🔥 FIX CRÍTICO: Le decimos a Next.js que la web está UNA CARPETA ATRÁS (..)
+const projectRoot = path.join(__dirname, "..");
+
+// 'dev: false' obliga a usar la versión compilada (Rápida y Ligera)
+const dev = false; 
+const nextApp = next({ dev, dir: projectRoot });
+const handle = nextApp.getRequestHandler();
+
 const app = express();
-app.use(express.json({ limit: "20mb" }));
+
+// 🔥 FIX DATOS: NO usamos express.json() global para no romper Next.js
+// Creamos un parser específico para usarlo solo en las rutas del bot.
+const jsonParser = express.json({ limit: "20mb" });
+
+// Aplicamos el parser SOLO a las rutas del Bot
+app.use("/sessions", jsonParser);
+app.use("/api", jsonParser);
+app.use("/health", jsonParser);
+
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
 // Timezone configurable (fallback RD)
 const TIMEZONE_LOCALE = process.env.TIMEZONE_LOCALE || "America/Santo_Domingo";
 
 // ✅ Offset fijo (RD es -04:00 normalmente). Úsalo para parsing ICS robusto.
-// Si tu negocio está en otro país, cambia TZ_OFFSET en env (ej: -05:00)
 const TZ_OFFSET = process.env.TZ_OFFSET || "-04:00";
 
-// Si sigues usando el viejo offset horario para business_hours, deja esto (pero mejor usa TZ_OFFSET)
+// Si sigues usando el viejo offset horario para business_hours
 const SERVER_OFFSET_HOURS = Number(process.env.SERVER_OFFSET_HOURS || 4);
 
 const logger = P({
@@ -138,8 +159,6 @@ function toHHMM(t) {
 
 /**
  * Calcula ventanas abiertas basadas en business_hours.
- * NOTA: aquí sigues usando SERVER_OFFSET_HOURS (legacy).
- * Ideal: en el futuro mover todo a timezone real (date-fns-tz).
  */
 function weeklyOpenWindows(weekStart, businessHours) {
   const windows = [];
@@ -1312,14 +1331,14 @@ async function getOrCreateSession(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 11. API ROUTES
+// 11. API ROUTES (JSON Parser Protected)
 // ---------------------------------------------------------------------
 
-app.get("/health", (req, res) =>
+app.get("/health", jsonParser, (req, res) =>
   res.json({ ok: true, active_sessions: sessions.size })
 );
 
-app.get("/sessions/:tenantId", async (req, res) => {
+app.get("/sessions/:tenantId", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const info = sessions.get(tenantId);
 
@@ -1342,7 +1361,7 @@ app.get("/sessions/:tenantId", async (req, res) => {
 });
 
 // ✅ CONNECT NUCLEAR (corrige wait)
-app.post("/sessions/:tenantId/connect", async (req, res) => {
+app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
 
   try {
@@ -1371,7 +1390,7 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
 
     await getOrCreateSession(tenantId);
 
-    // ✅ Espera por QR o connected (no te devuelve “connecting” por gusto)
+    // ✅ Espera por QR o connected
     const ready = await waitForReady(tenantId, 12000);
 
     return res.json({
@@ -1387,7 +1406,7 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
   }
 });
 
-app.post("/sessions/:tenantId/disconnect", async (req, res) => {
+app.post("/sessions/:tenantId/disconnect", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const s = sessions.get(tenantId);
   if (s?.socket) await s.socket.logout().catch(() => {});
@@ -1396,7 +1415,7 @@ app.post("/sessions/:tenantId/disconnect", async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/sessions/:tenantId/send-message", async (req, res) => {
+app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const { phone, message } = req.body || {};
 
@@ -1427,7 +1446,7 @@ app.post("/sessions/:tenantId/send-message", async (req, res) => {
   }
 });
 
-app.post("/sessions/:tenantId/send-template", async (req, res) => {
+app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const { event, phone, variables } = req.body || {};
 
@@ -1485,7 +1504,7 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
   }
 });
 
-app.post("/sessions/:tenantId/send-media", async (req, res) => {
+app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const { phone, type, base64, fileName, mimetype, caption } = req.body || {};
 
@@ -1545,7 +1564,7 @@ app.post("/sessions/:tenantId/send-media", async (req, res) => {
 // 12. AVAILABILITY
 // ---------------------------------------------------------------------
 
-app.get("/api/v1/availability", async (req, res) => {
+app.get("/api/v1/availability", jsonParser, async (req, res) => {
   const tenantId = String(req.query.tenantId || "");
   const resourceId = req.query.resourceId ? String(req.query.resourceId) : null;
   const date = String(req.query.date || "");
@@ -1582,11 +1601,6 @@ app.get("/api/v1/availability", async (req, res) => {
     available_slots: formattedSlots.slice(0, 40),
   });
 });
-
-// ---------------------------------------------------------------------
-// 13-15 create/reschedule/cancel (tu lógica original ya estaba bien con TEXT)
-// (Dejé tus endpoints igual de estilo; si quieres los migro con parse robusto también.)
-// ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
 // 16. RESTORE SESSIONS
@@ -1629,12 +1643,26 @@ async function restoreSessions() {
 }
 
 // ---------------------------------------------------------------------
-// 17. START SERVER
+// 17. FINAL FUSION HANDLER (FIX PARA TODO)
 // ---------------------------------------------------------------------
 
-app.listen(PORT, () => {
-  logger.info(`🚀 WA server escuchando en puerto ${PORT}`);
-  restoreSessions().catch((e) =>
-    logger.error(e, "Error al intentar restaurar sesiones al inicio")
-  );
+// 🛑 AQUÍ ESTÁ EL FIX FINAL: 
+// 1. Sin ruta para evitar error PathError (*)
+// 2. Next.js ahora sabe dónde encontrar la web gracias a 'dir: projectRoot'
+app.use(async (req, res) => {
+  await handle(req, res);
+});
+
+// 🔥 ENCENDIDO DEL MOTOR HÍBRIDO
+nextApp.prepare().then(() => {
+  app.listen(PORT, (err) => {
+    if (err) throw err;
+    logger.info(`🚀 Servidor FUSIONADO (Bot + Web) escuchando en puerto ${PORT}`);
+    restoreSessions().catch((e) =>
+      logger.error(e, "Error al intentar restaurar sesiones al inicio")
+    );
+  });
+}).catch((ex) => {
+  console.error(ex.stack);
+  process.exit(1);
 });
