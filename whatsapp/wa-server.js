@@ -1,9 +1,10 @@
 /**
- * wa-server.js — VERSIÓN FINAL CORREGIDA (N8N + NUCLEAR FIX)
+ * wa-server.js — VERSIÓN FINAL CORREGIDA (N8N + NUCLEAR FIX + AUTO-ICS)
  *
  * ✅ CEREBRO: n8n (Prioridad) + OpenAI (Fallback).
  * ✅ CONEXIÓN: Nuclear (Borrado físico de sesión + Tiempos de espera).
  * ✅ COMPATIBILIDAD: Browser "Creativa Web" en Windows (Universal).
+ * ✅ AUTO-ICS: Envío automático de archivo de calendario al crear reserva.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -261,7 +262,7 @@ function icsToBuffer(icsData) {
   if (typeof icsData !== "string") {
     try {
       icsData = String(icsData);
-    } catch {
+        } catch {
       return null;
     }
   }
@@ -698,6 +699,7 @@ INSTRUCCIONES:
             });
           }
         } else if (fnName === "create_booking") {
+          // --- AQUÍ ESTÁ EL FIX ---
           const phoneArg = args.phone || userPhone;
           const startsISO = args.startsAtISO;
 
@@ -713,6 +715,7 @@ INSTRUCCIONES:
               args.endsAtISO ||
               new Date(start.getTime() + 60 * 60000).toISOString();
 
+            // 1. Guardar en Base de Datos
             const { data: booking, error } = await supabase
               .from("bookings")
               .insert([
@@ -732,10 +735,47 @@ INSTRUCCIONES:
               .single();
 
             if (!error) {
+              // ✅ MAGIA NUEVA: Enviar ICS Automáticamente sin n8n
+              try {
+                const session = sessions.get(tenantId);
+                if (session && session.status === "connected") {
+                  const context = await getTenantContext(tenantId);
+                  const dateStr = start.toLocaleString("es-DO", {
+                    timeZone: TIMEZONE_LOCALE,
+                  });
+
+                  const icsBuffer = createICSFile(
+                    `Cita en ${context.name}`,
+                    `Cita confirmada para ${dateStr}`,
+                    "En el local",
+                    start
+                  );
+
+                  const targetJid = phoneArg.replace(/\D/g, "") + "@s.whatsapp.net";
+
+                  await session.socket.sendMessage(targetJid, {
+                    document: icsBuffer,
+                    mimetype: "text/calendar; charset=utf-8",
+                    fileName: "cita.ics",
+                    caption: "📅 Tu cita ha sido agendada. Guarda este archivo.",
+                  });
+                  logger.info(
+                    { tenantId, bookingId: booking.id },
+                    "✅ ICS enviado automáticamente desde el servidor"
+                  );
+                }
+              } catch (errICS) {
+                logger.error(
+                  { err: errICS },
+                  "Error enviando ICS automático (no crítico)"
+                );
+              }
+              // FIN MAGIA NUEVA
+
               response = JSON.stringify({
                 success: true,
                 bookingId: booking.id,
-                message: "Reserva/Cita creada exitosamente en el sistema.",
+                message: "Reserva creada y archivo enviado al cliente.",
               });
             } else {
               response = JSON.stringify({
@@ -746,6 +786,7 @@ INSTRUCCIONES:
               });
             }
           }
+          // --- FIN DEL FIX ---
         } else if (fnName === "human_handoff") {
           if (humanPhone) {
             const clean = humanPhone.replace(/\D/g, "");
