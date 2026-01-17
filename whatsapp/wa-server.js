@@ -1,10 +1,11 @@
 /**
- * wa-server.js — VERSIÓN FINAL CORREGIDA (N8N + NUCLEAR FIX + AUTO-ICS)
+ * wa-server.js — VERSIÓN FINAL CORREGIDA (FUSIÓN BOT + WEB + AUTO-ICS)
  *
  * ✅ CEREBRO: n8n (Prioridad) + OpenAI (Fallback).
  * ✅ CONEXIÓN: Nuclear (Borrado físico de sesión + Tiempos de espera).
  * ✅ COMPATIBILIDAD: Browser "Creativa Web" en Windows (Universal).
  * ✅ AUTO-ICS: Envío automático de archivo de calendario al crear reserva.
+ * ✅ FUSIÓN: Maneja tráfico de Next.js (Dashboard) y del Bot en el mismo puerto.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -20,6 +21,7 @@ const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
+const next = require("next"); // 👈 FUSIÓN: Importamos Next.js
 
 // Importaciones de Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -28,8 +30,12 @@ const { startOfWeek, addDays, startOfDay } = require("date-fns");
 const convoState = require("./conversationState");
 
 // ---------------------------------------------------------------------
-// CONFIGURACIÓN GLOBAL
+// CONFIGURACIÓN GLOBAL & NEXT.JS
 // ---------------------------------------------------------------------
+
+const dev = process.env.NODE_ENV !== "production";
+const nextApp = next({ dev });
+const handle = nextApp.getRequestHandler();
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -1941,12 +1947,24 @@ async function restoreSessions() {
 }
 
 // ---------------------------------------------------------------------
-// 17. START SERVER
+// 17. START SERVER (MODIFICADO PARA NEXT.JS)
 // ---------------------------------------------------------------------
 
-app.listen(PORT, () => {
-  logger.info(`🚀 WA server escuchando en puerto ${PORT}`);
-  restoreSessions().catch((e) =>
-    logger.error(e, "Error al intentar restaurar sesiones al inicio")
-  );
+// 🛑 FUSIÓN: Ruta comodín para Next.js
+app.all("*", (req, res) => {
+  return handle(req, res);
+});
+
+// 🔥 ENCENDIDO DEL MOTOR HÍBRIDO
+nextApp.prepare().then(() => {
+  app.listen(PORT, (err) => {
+    if (err) throw err;
+    logger.info(`🚀 Servidor FUSIONADO (Bot + Web) escuchando en puerto ${PORT}`);
+    restoreSessions().catch((e) =>
+      logger.error(e, "Error al intentar restaurar sesiones al inicio")
+    );
+  });
+}).catch((ex) => {
+  console.error(ex.stack);
+  process.exit(1);
 });
