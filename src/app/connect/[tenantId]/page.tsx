@@ -1,7 +1,8 @@
+
 // src/app/connect/[tenantId]/page.tsx
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import QRCode from "react-qr-code";
 import { Check, LogOut } from "lucide-react";
@@ -28,16 +29,48 @@ type SessionResponse = {
   error?: string;
 };
 
+function safeTenantIdFromParams(p: unknown): string {
+  // useParams puede ser string o string[]
+  const raw =
+    typeof p === "string"
+      ? p
+      : Array.isArray(p)
+        ? (p[0] ?? "")
+        : "";
+  return String(raw || "").trim();
+}
+
 export default function PublicConnectWhatsAppPage() {
   // 👇 leemos el tenantId directamente de la URL (/connect/[tenantId])
   const params = useParams();
-  const tenantId = (params?.tenantId as string) || "";
+  const tenantId = useMemo(
+    () => safeTenantIdFromParams((params as any)?.tenantId),
+    [params]
+  );
 
   const [session, setSession] = useState<SessionDTO | null>(null);
   const [loading, setLoading] = useState(true);
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+
+  // anti-race / abort
+  const abortRef = useRef<AbortController | null>(null);
+  const connectTriggeredRef = useRef(false);
+
+  function resetAbort() {
+    if (abortRef.current) abortRef.current.abort();
+    abortRef.current = new AbortController();
+    return abortRef.current;
+  }
+
+  function stamp() {
+    try {
+      return new Date().toLocaleTimeString();
+    } catch {
+      return "";
+    }
+  }
 
   // helper: estado derivado
   const rawStatus: SessionStatus = session?.status ?? "disconnected";
@@ -48,21 +81,33 @@ export default function PublicConnectWhatsAppPage() {
 
   // --- llamadas a API ---
 
-  async function fetchSession() {
+  async function fetchSession(signal?: AbortSignal) {
     if (!tenantId) return;
+
     try {
       const res = await fetch(
-        `/api/wa/session?tenantId=${encodeURIComponent(tenantId)}`,
-        { cache: "no-store" }
+        `/api/wa/session?tenantId=${encodeURIComponent(tenantId)}&t=${Date.now()}`,
+        { cache: "no-store", signal }
       );
-      const json = (await res.json()) as SessionResponse;
-      if (!json.ok) {
-        throw new Error(json.error || "Error al cargar sesión");
+
+      // 🔥 FIX: si middleware/auth redirige, esto NO será JSON
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) {
+        const text = await res.text().catch(() => "");
+        throw new Error(
+          "La API no devolvió JSON (probable redirect a login / middleware). " +
+            (text ? `Preview: ${text.slice(0, 120)}...` : "")
+        );
       }
+
+      const json = (await res.json()) as SessionResponse;
+      if (!json.ok) throw new Error(json.error || "Error al cargar sesión");
+
       setSession(json.session);
       setError(null);
-      setLastUpdated(new Date().toLocaleTimeString());
+      setLastUpdated(stamp());
     } catch (err: any) {
+      if (err?.name === "AbortError") return;
       console.error("[PublicConnect] fetchSession error:", err);
       setError(err?.message || "No se pudo cargar la sesión");
       setSession(null);
@@ -71,21 +116,35 @@ export default function PublicConnectWhatsAppPage() {
     }
   }
 
-  async function ensureConnectedSession() {
+  async function ensureConnectedSession(signal?: AbortSignal) {
     if (!tenantId) return;
     setConnecting(true);
+
     try {
-      const res = await fetch("/api/wa/session", {
+      const res = await fetch(`/api/wa/session?t=${Date.now()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify({ tenantId, action: "connect" }),
+        signal,
       });
-      const json = (await res.json()) as SessionResponse;
-      if (!json.ok) {
-        throw new Error(json.error || "No se pudo iniciar la sesión");
+
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) {
+        const text = await res.text().catch(() => "");
+        throw new Error(
+          "El connect no devolvió JSON (probable redirect a login / middleware). " +
+            (text ? `Preview: ${text.slice(0, 120)}...` : "")
+        );
       }
-      await fetchSession();
+
+      const json = (await res.json()) as SessionResponse;
+      if (!json.ok) throw new Error(json.error || "No se pudo iniciar la sesión");
+
+      // refresca una vez para intentar agarrar QR rápido
+      await fetchSession(signal);
     } catch (err: any) {
+      if (err?.name === "AbortError") return;
       console.error("[PublicConnect] ensureConnectedSession error:", err);
       setError(err?.message || "No se pudo iniciar la sesión");
     } finally {
@@ -96,42 +155,111 @@ export default function PublicConnectWhatsAppPage() {
   async function handleDisconnect() {
     if (!tenantId) return;
     if (!confirm("¿Seguro que quieres desconectar este WhatsApp?")) return;
+
+    const controller = resetAbort();
+
     try {
-      await fetch("/api/wa/session", {
+      const res = await fetch(`/api/wa/session?t=${Date.now()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify({ tenantId, action: "disconnect" }),
+        signal: controller.signal,
       });
+
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) {
+        // aunque falle, refrescamos estado
+        setSession(null);
+        await fetchSession(controller.signal);
+        return;
+      }
+
       setSession(null);
-      await fetchSession();
-    } catch (err) {
+      await fetchSession(controller.signal);
+    } catch (err: any) {
+      if (err?.name === "AbortError") return;
       console.error("[PublicConnect] handleDisconnect error:", err);
+      setError(err?.message || "No se pudo desconectar");
     }
   }
 
-  // --- efecto principal: iniciar sesión + polling ---
+  // --- efecto principal: iniciar + polling ---
   useEffect(() => {
+    // reset state por tenant
+    connectTriggeredRef.current = false;
+    setSession(null);
+    setError(null);
+    setLastUpdated(null);
+    setLoading(true);
+
     if (!tenantId) {
       setError("El enlace no tiene un negocio válido.");
       setLoading(false);
       return;
     }
 
+    const controller = resetAbort();
     let interval: NodeJS.Timeout | null = null;
 
     (async () => {
-      setLoading(true);
-      setError(null);
-      await ensureConnectedSession();
-      // Poll cada 4s para actualizar QR / estado
-      interval = setInterval(fetchSession, 4000);
+      // 1) primero intentamos leer session
+      await fetchSession(controller.signal);
+
+      // 2) si está disconnected/error y no hay QR, disparamos connect UNA sola vez
+      //    (si ya estaba qrcode/connecting/connected no lo tocamos)
+      const statusNow: SessionStatus = (session?.status as SessionStatus) || "disconnected";
+      const hasQrNow = !!session?.qr_data;
+
+      if (!connectTriggeredRef.current) {
+        connectTriggeredRef.current = true;
+
+        // re-consultamos directo para no depender de state viejo
+        // (evita race con React state)
+        try {
+          const res = await fetch(
+            `/api/wa/session?tenantId=${encodeURIComponent(tenantId)}&t=${Date.now()}`,
+            { cache: "no-store", signal: controller.signal }
+          );
+          const ct = res.headers.get("content-type") || "";
+          if (ct.includes("application/json")) {
+            const j = (await res.json()) as SessionResponse;
+            const s = j?.session;
+            const st = (s?.status as SessionStatus) || "disconnected";
+            const hq = !!s?.qr_data;
+
+            if ((st === "disconnected" || st === "error") && !hq) {
+              await ensureConnectedSession(controller.signal);
+            }
+          } else {
+            // si no es json, lo dejamos que caiga en fetchSession con error visible
+            await fetchSession(controller.signal);
+          }
+        } catch (e: any) {
+          if (e?.name !== "AbortError") {
+            await ensureConnectedSession(controller.signal);
+          }
+        }
+      }
+
+      // 3) Poll cada 3.5s para actualizar QR / estado
+      interval = setInterval(() => {
+        fetchSession(controller.signal);
+      }, 3500);
     })();
 
     return () => {
       if (interval) clearInterval(interval);
+      controller.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId]);
+
+  // key para re-render QR cuando cambia el QR o tenant
+  const qrKey = useMemo(() => {
+    const prefix = session?.qr_data ? session.qr_data.slice(0, 25) : "noqr";
+    return `${tenantId}:${prefix}`;
+  }, [tenantId, session?.qr_data]);
 
   return (
     <div className="min-h-screen w-full bg-slate-950 text-slate-50 flex items-center justify-center px-4">
@@ -144,16 +272,12 @@ export default function PublicConnectWhatsAppPage() {
             <h1 className="text-xl font-semibold mb-1">Conectar Asistente</h1>
             <p className="text-xs text-slate-400">
               Negocio ID:{" "}
-              <span className="font-mono">
-                {tenantId || "—"}
-              </span>
+              <span className="font-mono">{tenantId || "—"}</span>
             </p>
           </div>
 
           {error && (
-            <p className="text-xs text-red-400 mb-3">
-              {error}
-            </p>
+            <p className="text-xs text-red-400 mb-3">{error}</p>
           )}
 
           {/* 1) Loading inicial */}
@@ -181,6 +305,7 @@ export default function PublicConnectWhatsAppPage() {
 
               <div className="bg-white p-3 rounded-2xl inline-flex">
                 <QRCode
+                  key={qrKey}
                   value={session?.qr_data || ""}
                   size={220}
                   bgColor="#FFFFFF"
@@ -233,15 +358,14 @@ export default function PublicConnectWhatsAppPage() {
           {!loading && !hasQr && !isConnected && !error && (
             <div className="py-4">
               <p className="text-sm text-slate-300 mb-2">
-                Preparando el código QR...
+                {connecting ? "Generando QR..." : "Preparando el código QR..."}
               </p>
               <div className="mx-auto h-6 w-6 rounded-full border-2 border-violet-400 border-t-transparent animate-spin" />
             </div>
           )}
 
           <p className="mt-6 text-[10px] text-slate-500">
-            Powered by PymeBOT • Última actualización:{" "}
-            {lastUpdated || "—"}
+            Powered by PymeBOT • Última actualización: {lastUpdated || "—"}
           </p>
         </div>
       </div>
