@@ -45,7 +45,7 @@ type ActiveTenantResponse = {
   error?: string;
 };
 
-function safeNowTime() {
+function nowTime() {
   try {
     return new Date().toLocaleTimeString();
   } catch {
@@ -57,7 +57,7 @@ export default function ConnectWhatsAppPage() {
   const { tenantId, loading: loadingTenant } = useActiveTenant();
 
   // -----------------------
-  // REFS anti "QR pegado"
+  // Anti-race / Abort
   // -----------------------
   const tenantRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -87,10 +87,11 @@ export default function ConnectWhatsAppPage() {
 
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
 
-  // Estado para el botón de copiar link
   const [copiedLink, setCopiedLink] = useState(false);
 
-  // Helper: headers anti-cache (por si hay proxy caching raro)
+  // tenant efectivo (fuente única para TODO en esta pantalla)
+  const effectiveTenantId = tenantId ?? null;
+
   const noCacheHeaders = useMemo(
     () => ({
       "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
@@ -100,7 +101,9 @@ export default function ConnectWhatsAppPage() {
     []
   );
 
-  // 1) Estado global del servidor WA
+  // -----------------------
+  // 1) Estado del servidor WA
+  // -----------------------
   async function fetchServerStatus(signal?: AbortSignal) {
     try {
       const res = await fetch(`/api/wa/status?t=${Date.now()}`, {
@@ -119,36 +122,27 @@ export default function ConnectWhatsAppPage() {
       setServerStatus({ ok: false, status: "offline" });
     } finally {
       setServerLoading(false);
-      setLastUpdated(safeNowTime());
+      setLastUpdated(nowTime());
     }
   }
 
-  // 2) Datos del tenant (estado WA guardado en tu BD / backend)
-  async function fetchActiveTenant(signal?: AbortSignal) {
-    if (!tenantId) {
-      setTenantName(null);
-      setTenantWaConnected(false);
-      setTenantWaPhone(null);
-      setTenantWaLastConnectedAt(null);
-      return;
-    }
-
+  // -----------------------
+  // 2) Activar tenant REAL en backend (clave del bug)
+  // -----------------------
+  async function activateTenantInBackend(tid: string, signal?: AbortSignal) {
     try {
-      // Nota: si tu endpoint /api/admin/tenants/activate usa cookies/sesión para saber el tenant activo,
-      // esto igual funciona. Si en el futuro aceptas ?tenantId=, aquí se lo pasas y quedas blindado.
-      const res = await fetch(
-        `/api/admin/tenants/activate?t=${Date.now()}`,
-        {
-          cache: "no-store",
-          signal,
-          headers: noCacheHeaders,
-        }
-      );
+      const res = await fetch(`/api/admin/tenants/activate?t=${Date.now()}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...noCacheHeaders },
+        body: JSON.stringify({ tenantId: tid }),
+        cache: "no-store",
+        signal,
+      });
 
       const json = (await res.json()) as ActiveTenantResponse;
 
-      // ✅ Ignora respuestas tardías del tenant anterior (anti-race)
-      if (tenantRef.current !== tenantId) return;
+      // ignora respuestas tardías
+      if (tenantRef.current !== tid) return;
 
       if (json.ok && json.tenantId) {
         setTenantName(json.tenantName ?? json.tenantId);
@@ -156,6 +150,7 @@ export default function ConnectWhatsAppPage() {
         setTenantWaPhone(json.waPhone ?? null);
         setTenantWaLastConnectedAt(json.waLastConnectedAt ?? null);
       } else {
+        // fallback mínimo
         setTenantName(null);
         setTenantWaConnected(false);
         setTenantWaPhone(null);
@@ -163,24 +158,25 @@ export default function ConnectWhatsAppPage() {
       }
     } catch (err: any) {
       if (err?.name === "AbortError") return;
-      console.error("[ConnectWhatsApp] fetchActiveTenant error:", err);
+      console.error("[ConnectWhatsApp] activateTenantInBackend error:", err);
+      // fallback: al menos muestra algo
+      if (tenantRef.current === tid) setTenantName(null);
     }
   }
 
-  // 3) Sesión WA por negocio (QR real por tenant)
-  async function fetchSession(signal?: AbortSignal) {
-    if (!tenantId) return;
-
+  // -----------------------
+  // 3) Sesión WA por tenant (QR real)
+  // -----------------------
+  async function fetchSession(tid: string, signal?: AbortSignal) {
     setSessionLoading(true);
     try {
       const res = await fetch(
-        `/api/wa/session?tenantId=${encodeURIComponent(tenantId)}&t=${Date.now()}`,
+        `/api/wa/session?tenantId=${encodeURIComponent(tid)}&t=${Date.now()}`,
         { cache: "no-store", signal, headers: noCacheHeaders }
       );
       const json = (await res.json()) as SessionResponse;
 
-      // ✅ Ignora respuestas tardías del tenant anterior (anti-race)
-      if (tenantRef.current !== tenantId) return;
+      if (tenantRef.current !== tid) return;
 
       if (!json.ok) throw new Error(json.error || "Error al cargar sesión de WhatsApp");
 
@@ -192,22 +188,23 @@ export default function ConnectWhatsAppPage() {
       setSession(null);
       setSessionError(err?.message || "Error al cargar sesión de WhatsApp");
     } finally {
-      // ✅ solo baja loading si seguimos en el mismo tenant
-      if (tenantRef.current === tenantId) setSessionLoading(false);
+      if (tenantRef.current === tid) setSessionLoading(false);
     }
   }
 
+  // -----------------------
   // 4) Acción conectar / desconectar
+  // -----------------------
   async function handleAction(action: "connect" | "disconnect") {
-    if (!tenantId) return;
+    const tid = effectiveTenantId;
+    if (!tid) return;
 
-    // ✅ al accionar, abortamos cualquier polling en vuelo para evitar pisadas
     const controller = newAbortController();
+    tenantRef.current = tid;
 
     setSessionLoading(true);
     setSessionError(null);
 
-    // Optimistic update al desconectar
     if (action === "disconnect") {
       setSession(null);
       setTenantWaConnected(false);
@@ -219,45 +216,43 @@ export default function ConnectWhatsAppPage() {
       const res = await fetch(`/api/wa/session?t=${Date.now()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...noCacheHeaders },
-        body: JSON.stringify({ tenantId, action }),
+        body: JSON.stringify({ tenantId: tid, action }),
         cache: "no-store",
         signal: controller.signal,
       });
 
       const json = (await res.json()) as SessionResponse;
 
-      if (tenantRef.current !== tenantId) return;
+      if (tenantRef.current !== tid) return;
 
       if (!json.ok) throw new Error(json.error || "Error al ejecutar acción");
 
-      // ✅ refresca forzado
-      await fetchSession(controller.signal);
-      await fetchActiveTenant(controller.signal);
+      // refresca
+      await fetchSession(tid, controller.signal);
+      await activateTenantInBackend(tid, controller.signal);
       await fetchServerStatus(controller.signal);
     } catch (err: any) {
       if (err?.name === "AbortError") return;
       console.error("[ConnectWhatsApp] handleAction error:", err);
       setSessionError(err?.message || "Error al ejecutar acción");
     } finally {
-      if (tenantRef.current === tenantId) setSessionLoading(false);
+      if (tenantRef.current === tid) setSessionLoading(false);
     }
   }
 
-  // 5) Copiar Link Remoto (100% tenant real + fallback si clipboard falla)
+  // -----------------------
+  // 5) Copiar link remoto (tenant REAL)
+  // -----------------------
   const copyRemoteLink = async () => {
-    if (!tenantId) return;
-
-    // tenant real que está activo en este instante
-    const tid = tenantId;
+    const tid = effectiveTenantId;
+    if (!tid) return;
 
     const link = `${window.location.origin}/connect/${encodeURIComponent(tid)}`;
 
     try {
-      // Preferido (seguro) si hay permiso
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(link);
       } else {
-        // Fallback viejo (por compatibilidad)
         const ta = document.createElement("textarea");
         ta.value = link;
         ta.style.position = "fixed";
@@ -274,24 +269,19 @@ export default function ConnectWhatsAppPage() {
       setTimeout(() => setCopiedLink(false), 2000);
     } catch (err) {
       console.error("[ConnectWhatsApp] copyRemoteLink error:", err);
-      // si falla, al menos mostramos el link en consola
       console.log("[ConnectWhatsApp] Link:", link);
     }
   };
 
   // -----------------------
-  // EFFECT: polling + anti-race + abort
+  // EFFECT: al cambiar tenant, sincroniza backend + reset + polling
   // -----------------------
   useEffect(() => {
     if (loadingTenant) return;
 
-    // ✅ guarda el tenant actual
-    tenantRef.current = tenantId ?? null;
+    const tid = effectiveTenantId;
 
-    // ✅ aborta requests del tenant anterior
-    const controller = newAbortController();
-
-    // ✅ reset fuerte (mata “QR pegado”)
+    // reset duro para evitar “arrastrar” QR viejo
     setSession(null);
     setSessionError(null);
     setSessionLoading(false);
@@ -301,17 +291,25 @@ export default function ConnectWhatsAppPage() {
     setTenantWaPhone(null);
     setTenantWaLastConnectedAt(null);
 
-    // ✅ primer fetch inmediato
-    fetchServerStatus(controller.signal);
-    fetchActiveTenant(controller.signal);
-    fetchSession(controller.signal);
+    // si no hay tenant, solo status server
+    const controller = newAbortController();
+    tenantRef.current = tid;
 
+    fetchServerStatus(controller.signal);
+
+    if (!tid) return () => controller.abort();
+
+    // 🔥 AQUÍ está el fix: activamos tenant REAL en backend una sola vez por cambio
+    activateTenantInBackend(tid, controller.signal);
+
+    // carga sesión qr por ese tenant
+    fetchSession(tid, controller.signal);
+
+    // polling SOLO de QR + server (NO activar tenant cada 5s)
     const id = setInterval(() => {
-      // Si ya cambió tenant, no sigas poll
-      if (tenantRef.current !== (tenantId ?? null)) return;
+      if (tenantRef.current !== tid) return;
       fetchServerStatus(controller.signal);
-      fetchActiveTenant(controller.signal);
-      fetchSession(controller.signal);
+      fetchSession(tid, controller.signal);
     }, 5000);
 
     return () => {
@@ -319,10 +317,10 @@ export default function ConnectWhatsAppPage() {
       controller.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenantId, loadingTenant]);
+  }, [effectiveTenantId, loadingTenant]);
 
   // -----------------------
-  // Derived UI flags
+  // Derived flags
   // -----------------------
   const isServerOnline =
     !serverStatus || serverStatus.status === "online" || serverStatus.ok;
@@ -330,34 +328,26 @@ export default function ConnectWhatsAppPage() {
   const rawStatus: SessionStatus = session?.status ?? "disconnected";
   const hasQr = !!session?.qr_data;
 
-  // Conectado si:
-  // - backend tenant dice conectado, o
-  // - session status conectado,
-  // y NO hay QR activo.
   const isConnected =
     !hasQr && (tenantWaConnected || rawStatus === "connected");
 
   const showQr = hasQr && !isConnected;
-  const connectedPhone = tenantWaPhone || session?.phone_number || null;
-  const connectedAt =
-    tenantWaLastConnectedAt || session?.last_connected_at || null;
 
-  // key para forzar remount del QR por tenant y por contenido (evita reuso visual)
+  const connectedPhone = tenantWaPhone || session?.phone_number || null;
+  const connectedAt = tenantWaLastConnectedAt || session?.last_connected_at || null;
+
   const qrKey = useMemo(() => {
-    const tid = tenantId || "no-tenant";
+    const tid = effectiveTenantId || "no-tenant";
     const prefix = session?.qr_data ? session.qr_data.slice(0, 24) : "noqr";
     return `${tid}:${prefix}`;
-  }, [tenantId, session?.qr_data]);
+  }, [effectiveTenantId, session?.qr_data]);
 
   return (
     <div className="min-h-screen w-full bg-slate-950 text-slate-50 flex flex-col items-center">
       <div className="w-full max-w-3xl px-4 py-8">
-        <h1 className="text-3xl font-semibold mb-2">
-          Conectar WhatsApp del negocio
-        </h1>
+        <h1 className="text-3xl font-semibold mb-2">Conectar WhatsApp del negocio</h1>
         <p className="text-slate-300 mb-4">
-          Escanea el código QR con el WhatsApp del negocio para vincular el
-          asistente.
+          Escanea el código QR con el WhatsApp del negocio para vincular el asistente.
         </p>
 
         <div className="flex items-center justify-between text-xs text-slate-400 mb-4">
@@ -371,9 +361,7 @@ export default function ConnectWhatsAppPage() {
               <span className="text-red-400 font-medium">OFFLINE</span>
             )}
           </span>
-          <span>
-            Última actualización: {lastUpdated ? lastUpdated : "cargando..."}
-          </span>
+          <span>Última actualización: {lastUpdated ? lastUpdated : "cargando..."}</span>
         </div>
 
         <Separator className="bg-slate-800 mb-6" />
@@ -389,22 +377,20 @@ export default function ConnectWhatsAppPage() {
               </div>
             )}
 
-            {isServerOnline && !tenantId && (
+            {isServerOnline && !effectiveTenantId && (
               <div className="text-center">
-                <p className="text-amber-300 text-sm mb-2">
-                  No se detectó un negocio activo.
-                </p>
-                <p className="text-xs text-slate-500">
-                  Selecciona un negocio arriba.
-                </p>
+                <p className="text-amber-300 text-sm mb-2">No se detectó un negocio activo.</p>
+                <p className="text-xs text-slate-500">Selecciona un negocio arriba.</p>
               </div>
             )}
 
-            {isServerOnline && tenantId && (
+            {isServerOnline && effectiveTenantId && (
               <>
                 <p className="text-xs text-slate-400 mb-4">
                   Negocio:{" "}
-                  <span className="font-medium">{tenantName || tenantId}</span>
+                  <span className="font-medium">
+                    {tenantName || effectiveTenantId}
+                  </span>
                 </p>
 
                 {sessionError && (
@@ -448,8 +434,7 @@ export default function ConnectWhatsAppPage() {
                 {!sessionLoading && showQr && (
                   <>
                     <p className="text-sm text-slate-300 mb-3 text-center">
-                      Ve a WhatsApp &gt; Configuración &gt; Dispositivos
-                      vinculados &gt; Vincular
+                      Ve a WhatsApp &gt; Configuración &gt; Dispositivos vinculados &gt; Vincular
                     </p>
 
                     <div className="bg-white p-4 rounded-xl flex justify-center items-center">
@@ -460,11 +445,7 @@ export default function ConnectWhatsAppPage() {
                         bgColor="#FFFFFF"
                         fgColor="#000000"
                         level="M"
-                        style={{
-                          height: "auto",
-                          maxWidth: "100%",
-                          width: "100%",
-                        }}
+                        style={{ height: "auto", maxWidth: "100%", width: "100%" }}
                         viewBox="0 0 256 256"
                       />
                     </div>
@@ -503,57 +484,39 @@ export default function ConnectWhatsAppPage() {
 
                     {connectedAt && (
                       <p className="text-[10px] text-slate-600 mt-4">
-                        Conectado desde:{" "}
-                        {new Date(connectedAt).toLocaleString()}
+                        Conectado desde: {new Date(connectedAt).toLocaleString()}
                       </p>
                     )}
                   </div>
                 )}
 
-                {!sessionLoading &&
-                  !showQr &&
-                  !isConnected &&
-                  rawStatus === "error" && (
-                    <div className="text-center">
-                      <p className="text-red-400 text-sm mb-2">
-                        Error en la sesión.
-                      </p>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => handleAction("connect")}
-                      >
-                        Reintentar
-                      </Button>
-                    </div>
-                  )}
+                {!sessionLoading && !showQr && !isConnected && rawStatus === "error" && (
+                  <div className="text-center">
+                    <p className="text-red-400 text-sm mb-2">Error en la sesión.</p>
+                    <Button size="sm" variant="outline" onClick={() => handleAction("connect")}>
+                      Reintentar
+                    </Button>
+                  </div>
+                )}
               </>
             )}
           </div>
 
           <div className="md:w-64 bg-slate-950/60 border border-slate-800 rounded-2xl p-4 text-sm flex flex-col gap-3">
-            {/* --- SECCIÓN: BOTÓN LINK REMOTO --- */}
             <div className="bg-violet-500/10 border border-violet-500/20 rounded-xl p-3 mb-2">
-              <p className="text-xs text-violet-300 mb-2 font-medium">
-                ¿Cliente remoto?
-              </p>
+              <p className="text-xs text-violet-300 mb-2 font-medium">¿Cliente remoto?</p>
               <Button
                 variant="secondary"
                 size="sm"
                 className="w-full bg-violet-600 hover:bg-violet-700 text-white border-none flex gap-2 items-center justify-center text-xs"
                 onClick={copyRemoteLink}
-                disabled={!tenantId}
+                disabled={!effectiveTenantId}
               >
-                {copiedLink ? (
-                  <Check className="w-3 h-3" />
-                ) : (
-                  <LinkIcon className="w-3 h-3" />
-                )}
+                {copiedLink ? <Check className="w-3 h-3" /> : <LinkIcon className="w-3 h-3" />}
                 {copiedLink ? "¡Copiado!" : "Copiar Link de Conexión"}
               </Button>
               <p className="text-[10px] text-slate-500 mt-2 leading-tight">
-                Envía este enlace para que el cliente pueda escanear el QR desde
-                su casa.
+                Envía este enlace para que el cliente pueda escanear el QR desde su casa.
               </p>
             </div>
 
@@ -574,10 +537,13 @@ export default function ConnectWhatsAppPage() {
               size="sm"
               className="mt-2 border-slate-700 text-slate-200 hover:bg-slate-800"
               onClick={() => {
+                const tid = effectiveTenantId;
                 const controller = newAbortController();
                 fetchServerStatus(controller.signal);
-                fetchActiveTenant(controller.signal);
-                fetchSession(controller.signal);
+                if (tid) {
+                  activateTenantInBackend(tid, controller.signal);
+                  fetchSession(tid, controller.signal);
+                }
               }}
             >
               Refrescar estado
@@ -587,4 +553,4 @@ export default function ConnectWhatsAppPage() {
       </div>
     </div>
   );
-}
+                    }
