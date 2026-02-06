@@ -22,7 +22,7 @@ function normalizePhone(raw: string) {
 
 export default function NewTenantPage() {
   const router = useRouter();
-  
+   
   // Estados del formulario
   const [name, setName] = useState("");
   const [vertical, setVertical] = useState("general");
@@ -46,7 +46,7 @@ export default function NewTenantPage() {
         notification_email: email.trim() || null, // 👈 Enviamos el email al backend
         timezone: timezone || DEFAULT_TZ,
       };
-      
+       
       const normalized = normalizePhone(phone);
       if (normalized) payload.phone = normalized;
 
@@ -63,7 +63,9 @@ export default function NewTenantPage() {
       }
 
       const j = await r.json();
-      if (!j.ok) {
+      
+      // ✅ CORRECCIÓN AQUÍ: Usamos r.ok (estado HTTP) en lugar de j.ok
+      if (!r.ok) {
         alert(j.error || "No se pudo crear el negocio");
         return;
       }
@@ -101,7 +103,7 @@ export default function NewTenantPage() {
 
           {/* Body */}
           <div className="p-6 md:p-8 space-y-6">
-            
+             
             {/* 1. Nombre */}
             <div>
               <label className="block text-sm font-medium text-gray-700">Nombre del Negocio</label>
