@@ -3,7 +3,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Building2, ShieldCheck, Phone, Store, FileText, Mail } from "lucide-react"; // 👈 Agregamos Mail
+import { Building2, ShieldCheck, Phone, Store, FileText, Mail } from "lucide-react"; 
 import { Button } from "@/componentes/ui/button";
 import { VERTICALS } from "@/app/lib/constants";
 
@@ -28,7 +28,7 @@ export default function NewTenantPage() {
   const [vertical, setVertical] = useState("general");
   const [description, setDescription] = useState("");
   const [phone, setPhone] = useState("");
-  const [email, setEmail] = useState(""); // 👈 Nuevo estado para el Email
+  const [email, setEmail] = useState(""); 
   const [timezone, setTimezone] = useState(DEFAULT_TZ);
   const [loading, setLoading] = useState(false);
 
@@ -39,16 +39,22 @@ export default function NewTenantPage() {
 
     setLoading(true);
     try {
+      // PREPARAMOS LOS DATOS
       const payload: any = {
         name: name.trim(),
         vertical,
-        description: description.trim() || null,
-        notification_email: email.trim() || null, // 👈 Enviamos el email al backend
+        description: description.trim() || undefined,
+        // ⚠️ IMPORTANTE: Comentamos esto temporalmente. 
+        // Si el backend no ha actualizado la base de datos para recibir 'notification_email',
+        // enviar esto causa que explote y de "Error de Red".
+        // notification_email: email.trim() || undefined, 
         timezone: timezone || DEFAULT_TZ,
       };
        
       const normalized = normalizePhone(phone);
       if (normalized) payload.phone = normalized;
+
+      console.log("Enviando payload:", payload); // Para depurar en consola
 
       const r = await fetch("/api/admin/new-business", {
         method: "POST",
@@ -58,22 +64,34 @@ export default function NewTenantPage() {
       });
 
       if (r.status === 401) {
-        alert("Inicia sesión");
+        alert("Tu sesión ha expirado. Por favor, inicia sesión de nuevo.");
         return;
+      }
+
+      // Si el servidor devuelve error (500, 404, etc)
+      if (!r.ok) {
+        // Intentamos leer el mensaje de error del servidor
+        const errorText = await r.text();
+        console.error("Error del servidor:", errorText);
+        throw new Error(`El servidor rechazó la solicitud (${r.status}). Revisa la consola.`);
       }
 
       const j = await r.json();
-      
-      // ✅ CORRECCIÓN AQUÍ: Usamos r.ok (estado HTTP) en lugar de j.ok
-      if (!r.ok) {
-        alert(j.error || "No se pudo crear el negocio");
+
+      // Si el JSON dice que hubo error lógico
+      if (j && j.error) {
+        alert("Error: " + j.error);
         return;
       }
 
+      // ¡ÉXITO!
+      console.log("Negocio creado:", j);
       router.push("/dashboard");
-    } catch (e) {
-      console.error(e);
-      alert("Error de red");
+
+    } catch (e: any) {
+      console.error("Error al crear:", e);
+      // Aquí mostramos el error real
+      alert("No se pudo guardar: " + (e.message || "Error de conexión"));
     } finally {
       setLoading(false);
     }
