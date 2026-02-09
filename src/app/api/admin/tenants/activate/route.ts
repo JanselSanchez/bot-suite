@@ -1,89 +1,47 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { createServerClient } from "@supabase/ssr";
+import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
-type SupabaseInit =
-  | { supabase: ReturnType<typeof createServerClient>; envError: null }
-  | { supabase: null; envError: "SUPABASE_ENV_NOT_SET" };
-
-async function getSupabase(): Promise<SupabaseInit> {
+// Usamos createClient normal para evitar problemas de compilación
+function getAdminClient() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  if (!url || !anon) {
-    return { supabase: null, envError: "SUPABASE_ENV_NOT_SET" };
-  }
-
-  const cookieStore = await cookies();
-
-  const supabase = createServerClient(url, anon, {
-    cookies: {
-      getAll() { return cookieStore.getAll(); },
-      setAll(cookiesToSet) {
-        cookiesToSet.forEach(({ name, value, options }) => {
-          cookieStore.set(name, value, options);
-        });
-      },
-    },
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  
+  if (!url || !key) return null;
+  
+  return createClient(url, key, {
+    auth: { persistSession: false }
   });
-
-  return { supabase, envError: null };
 }
 
 export async function POST(req: Request) {
-  console.log("👉 [API ACTIVATE TENANT][POST] hit");
-
   try {
-    const body = await req.json().catch(() => null);
-    const tenantId = body?.tenantId;
+    const body = await req.json().catch(() => ({}));
+    const { tenantId } = body;
 
     if (!tenantId || typeof tenantId !== "string") {
-      return NextResponse.json({ ok: false, error: "tenantId requerido" }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "Falta tenantId" }, { status: 400 });
     }
 
-    const supa = await getSupabase();
-    if (supa.envError) {
-      return NextResponse.json({ ok: false, error: supa.envError }, { status: 500 });
+    // 1. Validar que el negocio existe
+    const sbAdmin = getAdminClient();
+    if (!sbAdmin) {
+      return NextResponse.json({ ok: false, error: "Error servidor (env)" }, { status: 500 });
     }
 
-    const supabase = supa.supabase;
-    const { data: userData, error: userErr } = await supabase.auth.getUser();
-
-    if (userErr || !userData?.user) {
-      return NextResponse.json({ ok: false, error: "No autorizado" }, { status: 401 });
-    }
-
-    // 1. Buscamos info del Tenant
-    let tenantName: string | null = null;
-    const { data: tenantRow } = await supabase
+    const { data: tenant, error } = await sbAdmin
       .from("tenants")
-      .select("id,name")
+      .select("id, name")
       .eq("id", tenantId)
       .maybeSingle();
 
-    if (tenantRow) tenantName = tenantRow.name;
-
-    // 2. Buscamos info de sesión WA
-    let waConnected = false;
-    let waPhone: string | null = null;
-    let waLastConnectedAt: string | null = null;
-
-    const { data: waRow } = await supabase
-      .from("wa_sessions") // Asegúrate que tu tabla se llame wa_sessions o whatsapp_sessions
-      .select("connected, phone_number, last_connected_at")
-      .eq("tenant_id", tenantId)
-      .maybeSingle();
-
-    if (waRow) {
-      waConnected = !!waRow.connected; // O ajusta según tu columna 'status'
-      waPhone = waRow.phone_number;
-      waLastConnectedAt = waRow.last_connected_at;
+    if (error || !tenant) {
+      return NextResponse.json({ ok: false, error: "Negocio no encontrado" }, { status: 404 });
     }
 
-    // 🔥🔥 LA PARTE CRÍTICA QUE FALTABA: GUARDAR LA COOKIE 🔥🔥
+    // 2. GUARDAR LA COOKIE (La parte clave)
     const cookieStore = await cookies();
     cookieStore.set("pyme.active_tenant", tenantId, {
       httpOnly: true,
@@ -91,22 +49,30 @@ export async function POST(req: Request) {
       path: "/",
       maxAge: 60 * 60 * 24 * 180, // 180 días
     });
-    // 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
 
-    return NextResponse.json({
-      ok: true,
-      tenantId,
-      tenantName,
-      waConnected,
-      waPhone,
-      waLastConnectedAt,
+    return NextResponse.json({ 
+      ok: true, 
+      tenantId: tenant.id,
+      tenantName: tenant.name 
     });
 
   } catch (error: any) {
-    console.error("💥 [API ACTIVATE TENANT][CRASH]:", error);
-    return NextResponse.json(
-      { ok: false, error: error?.message || String(error) },
-      { status: 500 }
-    );
+    console.error("[activate] Error:", error);
+    return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
+  }
+}
+
+export async function GET() {
+  try {
+    const cookieStore = await cookies();
+    const tenantId = cookieStore.get("pyme.active_tenant")?.value;
+
+    if (!tenantId) {
+      return NextResponse.json({ ok: false, tenantId: null }, { status: 200 });
+    }
+
+    return NextResponse.json({ ok: true, tenantId }, { status: 200 });
+  } catch (e) {
+    return NextResponse.json({ ok: false, error: "Error" }, { status: 500 });
   }
 }
