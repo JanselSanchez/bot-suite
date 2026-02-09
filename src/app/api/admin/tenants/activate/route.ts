@@ -7,14 +7,12 @@ export const runtime = "nodejs";
 
 /**
  * POST /api/admin/tenants/activate
- * Body: { tenantId }
- *
- * - Valida que el tenant exista.
- * - Guarda cookie httpOnly "pyme.active_tenant" por 180 días.
  */
 export async function POST(req: Request) {
   try {
-    const { tenantId } = await req.json().catch(() => ({} as any));
+    // Lectura segura del body
+    const body = await req.json().catch(() => ({}));
+    const { tenantId } = body;
 
     if (!tenantId || typeof tenantId !== "string") {
       return NextResponse.json(
@@ -23,7 +21,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // Validamos tenant usando service role (no lee cookies de sesión)
+    // Validamos tenant usando service role
     const { data, error } = await supabaseAdmin
       .from("tenants")
       .select("id")
@@ -45,17 +43,18 @@ export async function POST(req: Request) {
       );
     }
 
-    const res = NextResponse.json({ ok: true, tenantId });
-
-    // Cookie con tenant activo
-    res.cookies.set("pyme.active_tenant", tenantId, {
+    // CORRECCIÓN: Usamos (await cookies()).set() en lugar de manipular la respuesta
+    const cookieStore = await cookies();
+    
+    cookieStore.set("pyme.active_tenant", tenantId, {
       httpOnly: true,
       sameSite: "lax",
       path: "/",
       maxAge: 60 * 60 * 24 * 180, // 180 días
     });
 
-    return res;
+    return NextResponse.json({ ok: true, tenantId });
+
   } catch (err: any) {
     console.error("[tenants/activate:POST] internal error:", err);
     return NextResponse.json(
@@ -71,9 +70,6 @@ export async function POST(req: Request) {
 
 /**
  * GET /api/admin/tenants/activate
- *
- * - Lee la cookie "pyme.active_tenant"
- * - Devuelve { ok, tenantId, tenantName? }
  */
 export async function GET() {
   try {
@@ -104,7 +100,7 @@ export async function GET() {
     if (!data) {
       return NextResponse.json(
         { ok: false, tenantId: null, error: "TENANT_NOT_FOUND" },
-        { status: 404 },
+        { status: 404 }, // O 200 con null, según prefieras manejarlo en el front
       );
     }
 
