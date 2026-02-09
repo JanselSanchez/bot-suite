@@ -1,139 +1,127 @@
 import { NextResponse } from "next/server";
 
-// 1. URL del Servidor de Bots
-// Si no hay variables de entorno, intenta conectarse a localhost (para desarrollo local)
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+// 1. Configuración de la URL del Bot
+// Si no existe la variable en Render, asumimos localhost (esto evita crashes por undefined)
 const WA_BOT_URL = (
   process.env.WA_SERVER_URL || 
   process.env.NEXT_PUBLIC_WA_SERVER_URL || 
   "http://localhost:4001"
-).replace(/\/$/, ""); // Quitamos la barra final si existe
+).replace(/\/$/, ""); // Quitamos barra final si existe
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-/**
- * GET: Obtener estado actual de la sesión
- */
 export async function GET(req: Request) {
+  // 🕵️ LOG PARA RENDER: Queremos ver si la petición llega
+  console.log("👉 [API SESSION] Iniciando petición...");
+
   try {
     const { searchParams } = new URL(req.url);
-    const tenantId = searchParams.get("t") || searchParams.get("tenantId"); 
+    const tenantId = searchParams.get("t") || searchParams.get("tenantId");
 
-    console.log(`🔌 [API WA SESSION] Checkeando: ${tenantId}`);
+    console.log(`👤 Tenant ID: ${tenantId}`);
+    console.log(`🤖 Bot URL: ${WA_BOT_URL}`);
 
     if (!tenantId) {
       return NextResponse.json({ ok: false, error: "Falta tenantId" }, { status: 400 });
     }
 
+    // 2. Intentamos conectar al servidor de bots
     const targetUrl = `${WA_BOT_URL}/sessions/${tenantId}`;
     
-    // Timeout de seguridad (5s)
+    // Timeout de 4 segundos (para que no se quede colgado eternamente)
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const timeoutId = setTimeout(() => controller.abort(), 4000);
 
     let res;
     try {
       res = await fetch(targetUrl, {
-        cache: "no-store",
         headers: { "Content-Type": "application/json" },
-        signal: controller.signal
+        signal: controller.signal,
+        cache: "no-store"
       });
     } catch (fetchError: any) {
-        console.warn(`⚠️ [API WA] Bot server offline o timeout: ${fetchError.message}`);
-        // Si el bot server no responde, decimos que está desconectado en vez de dar error 500
-        return NextResponse.json({ 
-            ok: true, 
-            session: { status: "disconnected", error: "Bot server unreachable" } 
-        });
+      console.error(`❌ [API SESSION] No se pudo conectar al Bot Server: ${fetchError.message}`);
+      // EN VEZ DE ERROR 500, devolvemos JSON diciendo que está desconectado
+      return NextResponse.json({ 
+        ok: true, 
+        session: { status: "disconnected", error: "Bot server unreachable" } 
+      });
     } finally {
-        clearTimeout(timeoutId);
+      clearTimeout(timeoutId);
     }
 
-    // 🛡️ BLINDAJE ANTI-HTML: Verificamos si es JSON real
+    // 3. BLINDAJE: Verificamos si la respuesta es JSON real
     const contentType = res.headers.get("content-type");
     if (!contentType || !contentType.includes("application/json")) {
-        // Si recibimos HTML (ej: error 404 de nginx/cloudflare), no intentamos parsear
-        console.error(`🔥 [API WA] Respuesta inválida (No JSON) del bot server.`);
-        return NextResponse.json({ 
-            ok: true, 
-            session: { status: "disconnected", qr_data: null } 
-        });
+      const text = await res.text();
+      console.error(`🔥 [API SESSION] El bot devolvió HTML/Texto en vez de JSON: ${text.slice(0, 100)}`);
+      // Si el bot devuelve error HTML, asumimos desconectado
+      return NextResponse.json({ 
+        ok: true, 
+        session: { status: "disconnected", error: "Bot server error" } 
+      });
     }
 
+    // 4. Si es JSON seguro, lo leemos
     const data = await res.json();
     
-    // Extraemos la sesión soportando diferentes formatos de respuesta
-    const botSession = data.session || data || {};
+    // Manejo flexible de la estructura de respuesta
+    const sessionData = data.session || data || {};
 
     return NextResponse.json({
       ok: true,
       session: {
         id: tenantId,
-        status: botSession.status || "disconnected",
-        qr_data: botSession.qr_data || botSession.qr || null, 
-        phone_number: botSession.phone_number || null,
-      },
+        status: sessionData.status || "disconnected",
+        qr_data: sessionData.qr_data || sessionData.qr || null,
+        phone: sessionData.phone_number || null
+      }
     });
 
   } catch (error: any) {
-    console.error("🚨 [API WA CRASH]:", error);
-    return NextResponse.json(
-      { ok: false, error: "Error interno API: " + error.message },
-      { status: 500 }
-    );
+    console.error("💥 [API SESSION CRASH]:", error);
+    // IMPORTANTE: Devolvemos JSON incluso en el peor error
+    return NextResponse.json({ 
+      ok: false, 
+      error: "Error interno: " + error.message 
+    }, { status: 500 });
   }
 }
 
-/**
- * POST: Conectar o Desconectar
- */
+// POST: Para conectar/desconectar
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const tenantId = body.tenantId || body.t || body.id;
-    const action = body.action; 
+    const { action, tenantId } = body;
+    const tId = tenantId || body.t || body.id;
 
-    if (!tenantId || !action) {
-      return NextResponse.json({ ok: false, error: "Faltan datos" }, { status: 400 });
-    }
+    if (!tId || !action) return NextResponse.json({ error: "Datos incompletos" }, { status: 400 });
 
     const endpoint = action === "disconnect" 
-        ? `${WA_BOT_URL}/sessions/${tenantId}/disconnect`
-        : `${WA_BOT_URL}/sessions/${tenantId}/connect`;
+      ? `${WA_BOT_URL}/sessions/${tId}/disconnect`
+      : `${WA_BOT_URL}/sessions/${tId}/connect`;
 
-    console.log(`🚀 [API WA POST] ${action} -> ${endpoint}`);
+    console.log(`🚀 [API POST] Enviando ${action} a ${endpoint}`);
 
     const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
     });
-    
+
+    // Mismo blindaje que el GET
     const contentType = res.headers.get("content-type");
     if (!contentType || !contentType.includes("application/json")) {
-        throw new Error("El bot server devolvió HTML en vez de JSON");
+        console.error("🔥 [API POST] Respuesta no JSON del bot server");
+        throw new Error("Respuesta inválida del servidor de bots");
     }
-    
+
     const data = await res.json();
-
-    if (!res.ok) {
-      return NextResponse.json({ ok: false, error: data.error || "Error bot" }, { status: 500 });
-    }
-
-    return NextResponse.json({
-        ok: true,
-        session: {
-            id: tenantId,
-            status: data.status || "connecting",
-            qr_data: null, 
-        }
-    });
+    return NextResponse.json({ ok: true, session: data });
 
   } catch (error: any) {
-    console.error("🚨 [API WA POST ERROR]:", error);
-    return NextResponse.json(
-      { ok: false, error: "Error comunicación: " + error.message },
-      { status: 500 }
-    );
+    console.error("💥 [API POST CRASH]:", error);
+    return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
   }
 }
