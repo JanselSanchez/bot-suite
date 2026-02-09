@@ -3,7 +3,6 @@ import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Bot server URL
 const WA_BOT_URL = (
   process.env.WA_SERVER_URL ||
   process.env.NEXT_PUBLIC_WA_SERVER_URL ||
@@ -19,7 +18,7 @@ function safeJsonParse(raw: string) {
   }
 }
 
-function buildDisconnectedSession(tenantId: string | null, error: string) {
+function disconnectedSession(tenantId: string | null, error: string) {
   return {
     id: tenantId ?? null,
     status: "disconnected",
@@ -30,7 +29,7 @@ function buildDisconnectedSession(tenantId: string | null, error: string) {
   };
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
+async function fetchTextWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -43,14 +42,15 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 export async function GET(req: Request) {
-  console.log("👉 [API WA SESSION][GET] hit");
+  const rid = Math.random().toString(16).slice(2);
+  console.log(`👉 [API WA SESSION][GET][${rid}] hit`);
 
   try {
     const { searchParams } = new URL(req.url);
     const tenantId = searchParams.get("t") || searchParams.get("tenantId");
 
-    console.log("👤 tenantId:", tenantId);
-    console.log("🤖 WA_BOT_URL:", WA_BOT_URL);
+    console.log(`👤 [${rid}] tenantId:`, tenantId);
+    console.log(`🤖 [${rid}] WA_BOT_URL:`, WA_BOT_URL);
 
     if (!tenantId) {
       return NextResponse.json({ ok: false, error: "Falta tenantId" }, { status: 400 });
@@ -58,86 +58,92 @@ export async function GET(req: Request) {
 
     const targetUrl = `${WA_BOT_URL}/sessions/${encodeURIComponent(tenantId)}`;
 
-    let res: Response;
-    let raw = "";
+    let out: { res: Response; raw: string };
     try {
-      const out = await fetchWithTimeout(
+      out = await fetchTextWithTimeout(
         targetUrl,
         { headers: { "Content-Type": "application/json" } },
         5000
       );
-      res = out.res;
-      raw = out.raw;
     } catch (e: any) {
-      console.error("❌ [API WA SESSION][GET] bot unreachable:", e?.message || e);
+      console.error(`❌ [${rid}] bot unreachable:`, e?.message || e);
       return NextResponse.json({
         ok: true,
-        session: buildDisconnectedSession(tenantId, "Bot server unreachable"),
+        session: disconnectedSession(tenantId, "Bot server unreachable"),
+        _debug: { rid, where: "GET.fetch", WA_BOT_URL, targetUrl },
       });
     }
 
-    const contentType = res.headers.get("content-type") || "";
+    const contentType = out.res.headers.get("content-type") || "";
+    const status = out.res.status;
+
     if (!contentType.includes("application/json")) {
       console.error(
-        `🔥 [API WA SESSION][GET] bot non-JSON (status=${res.status}). preview=${raw.slice(0, 140)}`
+        `🔥 [${rid}] non-JSON from bot (status=${status}, ct=${contentType}). preview=${out.raw.slice(0, 160)}`
       );
       return NextResponse.json({
         ok: true,
-        session: buildDisconnectedSession(tenantId, "Bot server error (non-JSON)"),
+        session: disconnectedSession(tenantId, "Bot server error (non-JSON)"),
+        _debug: { rid, where: "GET.nonJSON", status, contentType, preview: out.raw.slice(0, 160) },
       });
     }
 
-    const data = safeJsonParse(raw);
+    const data = safeJsonParse(out.raw);
     if (!data) {
       console.error(
-        `🔥 [API WA SESSION][GET] invalid JSON (status=${res.status}). preview=${raw.slice(0, 140)}`
+        `🔥 [${rid}] invalid JSON from bot (status=${status}). preview=${out.raw.slice(0, 160)}`
       );
       return NextResponse.json({
         ok: true,
-        session: buildDisconnectedSession(tenantId, "Bot server invalid JSON"),
+        session: disconnectedSession(tenantId, "Bot server invalid JSON"),
+        _debug: { rid, where: "GET.badJSON", status, preview: out.raw.slice(0, 160) },
       });
     }
 
-    const sessionData = data.session || data || {};
-
+    const s = data.session || data || {};
     return NextResponse.json({
       ok: true,
       session: {
         id: tenantId,
-        status: sessionData.status || "disconnected",
-        qr_data: sessionData.qr_data || sessionData.qr || null,
-        phone_number: sessionData.phone_number || null,
-        last_connected_at: sessionData.last_connected_at || null,
+        status: s.status || "disconnected",
+        qr_data: s.qr_data || s.qr || null,
+        phone_number: s.phone_number || null,
+        last_connected_at: s.last_connected_at || null,
       },
+      _debug: { rid, where: "GET.ok", status },
     });
-  } catch (error: any) {
-    console.error("💥 [API WA SESSION][GET][CRASH]:", error);
-    return NextResponse.json(
-      { ok: false, error: "Error interno: " + (error?.message || String(error)) },
-      { status: 500 }
-    );
+  } catch (e: any) {
+    console.error(`💥 [API WA SESSION][GET][${rid}] crash:`, e);
+    // ✅ NO 500: para que el UI no reviente
+    return NextResponse.json({
+      ok: true,
+      session: disconnectedSession(null, "Internal error (GET)"),
+      _debug: { rid, where: "GET.catch", message: e?.message || String(e) },
+    });
   }
 }
 
 export async function POST(req: Request) {
-  console.log("👉 [API WA SESSION][POST] hit");
+  const rid = Math.random().toString(16).slice(2);
+  console.log(`👉 [API WA SESSION][POST][${rid}] hit`);
 
+  // ✅ SIEMPRE devolvemos 200 con JSON, aunque algo truene.
   try {
-    // IMPORTANTE: req.json() puede fallar si viene vacío/mal
     const body = await req.json().catch(() => null);
 
     const action = body?.action;
     const tenantId = body?.tenantId || body?.t || body?.id;
 
-    console.log("👤 tenantId:", tenantId);
-    console.log("🎬 action:", action);
-    console.log("🤖 WA_BOT_URL:", WA_BOT_URL);
+    console.log(`👤 [${rid}] tenantId:`, tenantId);
+    console.log(`🎬 [${rid}] action:`, action);
+    console.log(`🤖 [${rid}] WA_BOT_URL:`, WA_BOT_URL);
 
     if (!tenantId || !action) {
-      return NextResponse.json(
-        { ok: false, error: "Datos incompletos (tenantId/action)" },
-        { status: 400 }
-      );
+      return NextResponse.json({
+        ok: true,
+        session: disconnectedSession(tenantId ?? null, "Datos incompletos (tenantId/action)"),
+        _debug: { rid, where: "POST.validate", got: { tenantId, action } },
+      });
     }
 
     const endpoint =
@@ -145,10 +151,9 @@ export async function POST(req: Request) {
         ? `${WA_BOT_URL}/sessions/${encodeURIComponent(tenantId)}/disconnect`
         : `${WA_BOT_URL}/sessions/${encodeURIComponent(tenantId)}/connect`;
 
-    let res: Response;
-    let raw = "";
+    let out: { res: Response; raw: string };
     try {
-      const out = await fetchWithTimeout(
+      out = await fetchTextWithTimeout(
         endpoint,
         {
           method: "POST",
@@ -157,60 +162,60 @@ export async function POST(req: Request) {
         },
         8000
       );
-      res = out.res;
-      raw = out.raw;
     } catch (e: any) {
-      console.error("❌ [API WA SESSION][POST] bot unreachable:", e?.message || e);
-      // 👇 NO devolvemos 500; tu UI se rompe si ve ok:false/500
+      console.error(`❌ [${rid}] bot unreachable:`, e?.message || e);
       return NextResponse.json({
         ok: true,
-        session: buildDisconnectedSession(tenantId, "Bot server unreachable"),
+        session: disconnectedSession(tenantId, "Bot server unreachable"),
+        _debug: { rid, where: "POST.fetch", endpoint },
       });
     }
 
-    const contentType = res.headers.get("content-type") || "";
+    const contentType = out.res.headers.get("content-type") || "";
+    const status = out.res.status;
 
-    // Si el bot devolvió no-JSON (HTML/502), NO tiramos 500.
+    // ✅ No convertimos no-JSON en 500
     if (!contentType.includes("application/json")) {
       console.error(
-        `🔥 [API WA SESSION][POST] bot non-JSON (status=${res.status}). preview=${raw.slice(0, 140)}`
+        `🔥 [${rid}] non-JSON from bot (status=${status}, ct=${contentType}). preview=${out.raw.slice(0, 160)}`
       );
       return NextResponse.json({
         ok: true,
-        session: buildDisconnectedSession(tenantId, "Bot server error (non-JSON)"),
+        session: disconnectedSession(tenantId, "Bot server error (non-JSON)"),
+        _debug: { rid, where: "POST.nonJSON", status, contentType, preview: out.raw.slice(0, 160) },
       });
     }
 
-    const data = safeJsonParse(raw);
+    const data = safeJsonParse(out.raw);
     if (!data) {
       console.error(
-        `🔥 [API WA SESSION][POST] invalid JSON (status=${res.status}). preview=${raw.slice(0, 140)}`
+        `🔥 [${rid}] invalid JSON from bot (status=${status}). preview=${out.raw.slice(0, 160)}`
       );
       return NextResponse.json({
         ok: true,
-        session: buildDisconnectedSession(tenantId, "Bot server invalid JSON"),
+        session: disconnectedSession(tenantId, "Bot server invalid JSON"),
+        _debug: { rid, where: "POST.badJSON", status, preview: out.raw.slice(0, 160) },
       });
     }
 
-    const sessionData = data.session || data || {};
-
-    // Respuesta final alineada con tu UI
+    const s = data.session || data || {};
     return NextResponse.json({
       ok: true,
       session: {
         id: tenantId,
-        status: sessionData.status || (action === "disconnect" ? "disconnected" : "connecting"),
-        qr_data: sessionData.qr_data || sessionData.qr || null,
-        phone_number: sessionData.phone_number || null,
-        last_connected_at: sessionData.last_connected_at || null,
+        status: s.status || (action === "disconnect" ? "disconnected" : "connecting"),
+        qr_data: s.qr_data || s.qr || null,
+        phone_number: s.phone_number || null,
+        last_connected_at: s.last_connected_at || null,
       },
+      _debug: { rid, where: "POST.ok", status },
     });
-  } catch (error: any) {
-    console.error("💥 [API WA SESSION][POST][CRASH]:", error);
-    // Aquí sí es crash real del handler
-    return NextResponse.json(
-      { ok: false, error: error?.message || String(error) },
-      { status: 500 }
-    );
+  } catch (e: any) {
+    console.error(`💥 [API WA SESSION][POST][${rid}] crash:`, e);
+    return NextResponse.json({
+      ok: true,
+      session: disconnectedSession(null, "Internal error (POST)"),
+      _debug: { rid, where: "POST.catch", message: e?.message || String(e) },
+    });
   }
 }
