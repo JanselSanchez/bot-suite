@@ -117,6 +117,7 @@ export async function POST(req: Request) {
       waPhone,
       waLastConnectedAt,
     });
+    
   } catch (error: any) {
     console.error("💥 [API ACTIVATE TENANT][CRASH]:", error);
     return NextResponse.json(
