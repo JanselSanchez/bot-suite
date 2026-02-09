@@ -1,62 +1,69 @@
 // src/app/api/admin/tenants/activate/route.ts
-import { NextResponse, type NextRequest } from "next/server";
+import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function createSupabase(req: NextRequest) {
-  // Creamos una respuesta "vacía" que devolveremos al final para poder setear cookies.
-  const res = NextResponse.next();
+function getSupabase() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return req.cookies.getAll(); // ✅ AQUÍ estaba el bug
-        },
-        setAll(cookiesToSet) {
-          // ✅ Setear cookies en la RESPUESTA
-          cookiesToSet.forEach(({ name, value, options }) => {
-            res.cookies.set(name, value, options);
-          });
-        },
+  if (!url || !anon) {
+    // No tiramos throw sin control: devolvemos error claro (esto evita 500 silencioso)
+    return { supabase: null as any, envError: "SUPABASE_ENV_NOT_SET" as const };
+  }
+
+  const cookieStore = cookies();
+
+  const supabase = createServerClient(url, anon, {
+    cookies: {
+      getAll() {
+        return cookieStore.getAll();
       },
-    }
-  );
+      setAll(cookiesToSet) {
+        cookiesToSet.forEach(({ name, value, options }) => {
+          cookieStore.set(name, value, options);
+        });
+      },
+    },
+  });
 
-  return { supabase, res };
+  return { supabase, envError: null as const };
 }
 
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   console.log("👉 [API ACTIVATE TENANT][POST] hit");
 
   try {
     const body = await req.json().catch(() => null);
     const tenantId = body?.tenantId;
 
-    if (!tenantId) {
+    if (!tenantId || typeof tenantId !== "string") {
       return NextResponse.json({ ok: false, error: "tenantId requerido" }, { status: 400 });
     }
 
-    const { supabase, res } = createSupabase(req);
+    const { supabase, envError } = getSupabase();
+    if (envError) {
+      return NextResponse.json(
+        { ok: false, error: envError, details: "Configura NEXT_PUBLIC_SUPABASE_URL y NEXT_PUBLIC_SUPABASE_ANON_KEY" },
+        { status: 500 }
+      );
+    }
 
-    // ✅ Auth real (con cookies)
+    // ✅ Auth real con cookies reales
     const { data: userData, error: userErr } = await supabase.auth.getUser();
 
     if (userErr) {
       console.error("❌ [API ACTIVATE TENANT] getUser error:", userErr);
-      // devolvemos 401, sin 500
       return NextResponse.json({ ok: false, error: "No autorizado" }, { status: 401 });
     }
-
     if (!userData?.user) {
       return NextResponse.json({ ok: false, error: "No autorizado" }, { status: 401 });
     }
 
-    // ---- Tenant info (opcional, no fatal) ----
+    // -------- Tenant info (no fatal) --------
     let tenantName: string | null = null;
 
     try {
@@ -75,7 +82,7 @@ export async function POST(req: NextRequest) {
       console.warn("⚠️ [API ACTIVATE TENANT] tenants lookup crash:", e);
     }
 
-    // ---- WA state (opcional, no fatal) ----
+    // -------- WA session state (no fatal) --------
     let waConnected = false;
     let waPhone: string | null = null;
     let waLastConnectedAt: string | null = null;
@@ -98,28 +105,20 @@ export async function POST(req: NextRequest) {
       console.warn("⚠️ [API ACTIVATE TENANT] wa_sessions crash:", e);
     }
 
-    // ✅ Importante: devolver la respuesta FINAL usando res.headers/cookies si setAll fue usado
-    // Como estamos retornando JSON, copiamos las cookies de `res` a esta respuesta:
-    const jsonRes = NextResponse.json(
-      {
-        ok: true,
-        tenantId,
-        tenantName,
-        waConnected,
-        waPhone,
-        waLastConnectedAt,
-      },
-      { status: 200 }
-    );
-
-    // Copiar cookies seteadas por supabase al JSON response
-    res.cookies.getAll().forEach((c) => {
-      jsonRes.cookies.set(c);
+    // ✅ Respuesta EXACTA esperada por tu UI
+    return NextResponse.json({
+      ok: true,
+      tenantId,
+      tenantName,
+      waConnected,
+      waPhone,
+      waLastConnectedAt,
     });
-
-    return jsonRes;
   } catch (error: any) {
     console.error("💥 [API ACTIVATE TENANT][CRASH]:", error);
-    return NextResponse.json({ ok: false, error: error?.message || String(error) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: error?.message || String(error) },
+      { status: 500 }
+    );
   }
 }
