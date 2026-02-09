@@ -11,11 +11,14 @@ import { LogOut, Link as LinkIcon, Check } from "lucide-react";
 type ServerStatus = {
   ok: boolean;
   status: "online" | "waiting_qr" | "starting" | "offline" | string;
-  error?: string | null;
-  details?: string | null;
 };
 
-type SessionStatus = "disconnected" | "qrcode" | "connecting" | "connected" | "error";
+type SessionStatus =
+  | "disconnected"
+  | "qrcode"
+  | "connecting"
+  | "connected"
+  | "error";
 
 interface SessionDTO {
   id: string;
@@ -24,6 +27,7 @@ interface SessionDTO {
   qr_data?: string | null;
   phone_number?: string | null;
   last_connected_at?: string | null;
+  // opcional: si tu backend lo manda
   error?: string | null;
 }
 
@@ -31,7 +35,6 @@ type SessionResponse = {
   ok: boolean;
   session: SessionDTO | null;
   error?: string;
-  // algunos endpoints devuelven debug:
   _debug?: any;
 };
 
@@ -53,29 +56,23 @@ function nowTime() {
   }
 }
 
-async function safeReadJson<T>(res: Response): Promise<{ ok: true; data: T } | { ok: false; error: string }> {
+/**
+ * Lee JSON de forma segura. Si el servidor devuelve HTML/text (como cuando Next rompe con 500),
+ * devolvemos un error con preview para que tú veas el motivo real.
+ */
+async function readJsonSafe<T = any>(res: Response): Promise<T> {
   const ct = res.headers.get("content-type") || "";
-
-  // Si NO es JSON, leemos texto para mostrar un preview real (evita “error eterno” sin info)
-  if (!ct.includes("application/json")) {
-    let preview = "";
-    try {
-      preview = (await res.text()).slice(0, 220);
-    } catch {
-      // ignore
-    }
-    return {
-      ok: false,
-      error: `Non-JSON response (status=${res.status}, ct=${ct}). ${preview ? `preview=${preview}` : ""}`.trim(),
-    };
+  if (ct.includes("application/json")) {
+    return (await res.json()) as T;
   }
 
-  try {
-    const data = (await res.json()) as T;
-    return { ok: true, data };
-  } catch (e: any) {
-    return { ok: false, error: `Invalid JSON (status=${res.status}). ${e?.message || String(e)}` };
-  }
+  const text = await res.text().catch(() => "");
+  const preview = (text || "").slice(0, 260);
+
+  // Esto replica exactamente lo que tú estás viendo en pantalla (y te da pista real)
+  throw new Error(
+    `Non-JSON response (status=${res.status}, ct=${ct}). preview=${preview}`
+  );
 }
 
 export default function ConnectWhatsAppPage() {
@@ -103,7 +100,8 @@ export default function ConnectWhatsAppPage() {
   const [tenantName, setTenantName] = useState<string | null>(null);
   const [tenantWaConnected, setTenantWaConnected] = useState(false);
   const [tenantWaPhone, setTenantWaPhone] = useState<string | null>(null);
-  const [tenantWaLastConnectedAt, setTenantWaLastConnectedAt] = useState<string | null>(null);
+  const [tenantWaLastConnectedAt, setTenantWaLastConnectedAt] =
+    useState<string | null>(null);
 
   const [session, setSession] = useState<SessionDTO | null>(null);
   const [sessionLoading, setSessionLoading] = useState(false);
@@ -112,6 +110,7 @@ export default function ConnectWhatsAppPage() {
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
 
+  // tenant efectivo (fuente única para TODO en esta pantalla)
   const effectiveTenantId = tenantId ?? null;
 
   const noCacheHeaders = useMemo(
@@ -134,19 +133,16 @@ export default function ConnectWhatsAppPage() {
         headers: noCacheHeaders,
       });
 
-      const parsed = await safeReadJson<ServerStatus>(res);
-      if (!parsed.ok) throw new Error(parsed.error);
+      const json = await readJsonSafe<any>(res);
 
       setServerStatus({
-        ok: parsed.data.ok ?? true,
-        status: (parsed.data.status as ServerStatus["status"]) ?? "online",
-        error: (parsed.data as any).error ?? null,
-        details: (parsed.data as any).details ?? null,
+        ok: json.ok ?? true,
+        status: (json.status as ServerStatus["status"]) ?? "online",
       });
     } catch (err: any) {
       if (err?.name === "AbortError") return;
       console.error("[ConnectWhatsApp] fetchServerStatus error:", err);
-      setServerStatus({ ok: false, status: "offline", error: err?.message || String(err) });
+      setServerStatus({ ok: false, status: "offline" });
     } finally {
       setServerLoading(false);
       setLastUpdated(nowTime());
@@ -166,13 +162,10 @@ export default function ConnectWhatsAppPage() {
         signal,
       });
 
-      const parsed = await safeReadJson<ActiveTenantResponse>(res);
-      if (!parsed.ok) throw new Error(parsed.error);
+      const json = await readJsonSafe<ActiveTenantResponse>(res);
 
       // ignora respuestas tardías
       if (tenantRef.current !== tid) return;
-
-      const json = parsed.data;
 
       if (json.ok && json.tenantId) {
         setTenantName(json.tenantName ?? json.tenantId);
@@ -187,10 +180,15 @@ export default function ConnectWhatsAppPage() {
       }
     } catch (err: any) {
       if (err?.name === "AbortError") return;
+
+      // 👇 aquí vas a ver el error REAL si el activate está devolviendo HTML 500
       console.error("[ConnectWhatsApp] activateTenantInBackend error:", err);
+
       if (tenantRef.current === tid) {
         setTenantName(null);
-        // NO matamos la UI; solo dejamos “sin info”
+        setTenantWaConnected(false);
+        setTenantWaPhone(null);
+        setTenantWaLastConnectedAt(null);
       }
     }
   }
@@ -201,28 +199,26 @@ export default function ConnectWhatsAppPage() {
   async function fetchSession(tid: string, signal?: AbortSignal) {
     setSessionLoading(true);
     try {
-      const res = await fetch(`/api/wa/session?tenantId=${encodeURIComponent(tid)}&t=${Date.now()}`, {
-        cache: "no-store",
-        signal,
-        headers: noCacheHeaders,
-      });
+      const res = await fetch(
+        `/api/wa/session?tenantId=${encodeURIComponent(tid)}&t=${Date.now()}`,
+        { cache: "no-store", signal, headers: noCacheHeaders }
+      );
 
-      const parsed = await safeReadJson<SessionResponse>(res);
-      if (!parsed.ok) throw new Error(parsed.error);
+      const json = await readJsonSafe<SessionResponse>(res);
 
       if (tenantRef.current !== tid) return;
 
-      const json = parsed.data;
-
-      // Si el backend devuelve ok=false, mostramos el error
       if (!json.ok) throw new Error(json.error || "Error al cargar sesión de WhatsApp");
 
       setSession(json.session);
       setSessionError(null);
     } catch (err: any) {
       if (err?.name === "AbortError") return;
+
       console.error("[ConnectWhatsApp] fetchSession error:", err);
+
       setSession(null);
+      // 👇 aquí te va a salir el “Non-JSON response … preview=<!doctype html>…”
       setSessionError(err?.message || "Error al cargar sesión de WhatsApp");
     } finally {
       if (tenantRef.current === tid) setSessionLoading(false);
@@ -258,23 +254,19 @@ export default function ConnectWhatsAppPage() {
         signal: controller.signal,
       });
 
-      const parsed = await safeReadJson<SessionResponse>(res);
-      if (!parsed.ok) throw new Error(parsed.error);
+      const json = await readJsonSafe<SessionResponse>(res);
 
       if (tenantRef.current !== tid) return;
 
-      const json = parsed.data;
-
-      // Nota: tu backend “siempre ok=true” aunque haya error del bot.
-      // Pero si algún deploy viejo responde ok=false, igual lo manejamos:
       if (!json.ok) throw new Error(json.error || "Error al ejecutar acción");
 
-      // refresca
+      // refresca (sin depender de la respuesta del POST)
       await fetchSession(tid, controller.signal);
       await activateTenantInBackend(tid, controller.signal);
       await fetchServerStatus(controller.signal);
     } catch (err: any) {
       if (err?.name === "AbortError") return;
+
       console.error("[ConnectWhatsApp] handleAction error:", err);
       setSessionError(err?.message || "Error al ejecutar acción");
     } finally {
@@ -340,16 +332,15 @@ export default function ConnectWhatsAppPage() {
 
     if (!tid) return () => controller.abort();
 
-    // activar tenant 1 vez por cambio
+    // activar tenant SOLO una vez por cambio
     activateTenantInBackend(tid, controller.signal);
-    // cargar sesión/QR
+
+    // carga sesión
     fetchSession(tid, controller.signal);
 
-    // polling SOLO server+session
+    // polling SOLO session + status (sin activar tenant)
     const id = setInterval(() => {
       if (tenantRef.current !== tid) return;
-      // evita spamear mientras se ejecuta acción manual
-      if (!abortRef.current || abortRef.current.signal.aborted) return;
       fetchServerStatus(controller.signal);
       fetchSession(tid, controller.signal);
     }, 5000);
@@ -364,18 +355,20 @@ export default function ConnectWhatsAppPage() {
   // -----------------------
   // Derived flags
   // -----------------------
-  const isServerOnline = !serverStatus || serverStatus.status === "online" || serverStatus.ok;
+  const isServerOnline =
+    !serverStatus || serverStatus.status === "online" || serverStatus.ok;
 
   const rawStatus: SessionStatus = session?.status ?? "disconnected";
   const hasQr = !!session?.qr_data;
 
-  const isConnected = !hasQr && (tenantWaConnected || rawStatus === "connected");
+  const isConnected =
+    !hasQr && (tenantWaConnected || rawStatus === "connected");
+
   const showQr = hasQr && !isConnected;
 
   const connectedPhone = tenantWaPhone || session?.phone_number || null;
   const connectedAt = tenantWaLastConnectedAt || session?.last_connected_at || null;
 
-  // Forzar re-render del QR cuando cambia
   const qrKey = useMemo(() => {
     const tid = effectiveTenantId || "no-tenant";
     const prefix = session?.qr_data ? session.qr_data.slice(0, 24) : "noqr";
@@ -410,10 +403,10 @@ export default function ConnectWhatsAppPage() {
           <div className="flex-1 flex flex-col items-center justify-center">
             {!isServerOnline && (
               <div className="text-center">
-                <p className="text-red-400 text-sm mb-2">El servidor de WhatsApp está OFFLINE.</p>
-                <p className="text-xs text-slate-500">
-                  {serverStatus?.error ? String(serverStatus.error) : "Contacta soporte."}
+                <p className="text-red-400 text-sm mb-2">
+                  El servidor de WhatsApp está OFFLINE.
                 </p>
+                <p className="text-xs text-slate-500">Contacta soporte.</p>
               </div>
             )}
 
@@ -427,28 +420,49 @@ export default function ConnectWhatsAppPage() {
             {isServerOnline && effectiveTenantId && (
               <>
                 <p className="text-xs text-slate-400 mb-4">
-                  Negocio: <span className="font-medium">{tenantName || effectiveTenantId}</span>
+                  Negocio:{" "}
+                  <span className="font-medium">{tenantName || effectiveTenantId}</span>
                 </p>
 
-                {sessionError && <p className="text-red-400 text-xs mb-2">{sessionError}</p>}
-
-                {sessionLoading && <p className="text-slate-400 text-sm">Cargando estado...</p>}
-
-                {!sessionLoading && !isConnected && !showQr && rawStatus === "disconnected" && (
-                  <div className="text-center">
-                    <p className="text-slate-300 text-sm mb-2">Este negocio no tiene WhatsApp vinculado.</p>
-                    <Button size="sm" disabled={!isServerOnline} onClick={() => handleAction("connect")}>
-                      Generar Código QR
-                    </Button>
-                  </div>
+                {sessionError && (
+                  <p className="text-red-400 text-xs mb-2 whitespace-pre-wrap">
+                    {sessionError}
+                  </p>
                 )}
 
-                {!sessionLoading && !isConnected && !showQr && rawStatus === "connecting" && (
-                  <div className="text-center">
-                    <p className="text-slate-300 text-sm mb-2">Iniciando conexión...</p>
-                    <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white mx-auto" />
-                  </div>
+                {sessionLoading && (
+                  <p className="text-slate-400 text-sm">Cargando estado...</p>
                 )}
+
+                {!sessionLoading &&
+                  !isConnected &&
+                  !showQr &&
+                  rawStatus === "disconnected" && (
+                    <div className="text-center">
+                      <p className="text-slate-300 text-sm mb-2">
+                        Este negocio no tiene WhatsApp vinculado.
+                      </p>
+                      <Button
+                        size="sm"
+                        disabled={!isServerOnline}
+                        onClick={() => handleAction("connect")}
+                      >
+                        Generar Código QR
+                      </Button>
+                    </div>
+                  )}
+
+                {!sessionLoading &&
+                  !isConnected &&
+                  !showQr &&
+                  rawStatus === "connecting" && (
+                    <div className="text-center">
+                      <p className="text-slate-300 text-sm mb-2">
+                        Iniciando conexión...
+                      </p>
+                      <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white mx-auto" />
+                    </div>
+                  )}
 
                 {!sessionLoading && showQr && (
                   <>
@@ -469,16 +483,22 @@ export default function ConnectWhatsAppPage() {
                       />
                     </div>
 
-                    <p className="text-xs text-slate-400 mt-3 text-center">El QR se actualiza automáticamente.</p>
+                    <p className="text-xs text-slate-400 mt-3 text-center">
+                      El QR se actualiza automáticamente.
+                    </p>
                   </>
                 )}
 
                 {!sessionLoading && isConnected && (
                   <div className="text-center animate-in fade-in zoom-in">
-                    <p className="text-emerald-400 font-medium mb-2 text-lg">✅ WhatsApp Conectado</p>
+                    <p className="text-emerald-400 font-medium mb-2 text-lg">
+                      ✅ WhatsApp Conectado
+                    </p>
                     <p className="text-xs text-slate-500 mb-4">
                       Número:{" "}
-                      <span className="font-semibold text-slate-300">{connectedPhone || "..."}</span>
+                      <span className="font-semibold text-slate-300">
+                        {connectedPhone || "..."}
+                      </span>
                     </p>
 
                     <Button
@@ -486,7 +506,9 @@ export default function ConnectWhatsAppPage() {
                       size="sm"
                       className="bg-red-500/10 text-red-500 hover:bg-red-500/20 border border-red-500/20"
                       onClick={() => {
-                        if (confirm("¿Seguro que deseas desconectar el bot?")) handleAction("disconnect");
+                        if (confirm("¿Seguro que deseas desconectar el bot?")) {
+                          handleAction("disconnect");
+                        }
                       }}
                     >
                       <LogOut className="w-4 h-4 mr-2" />
@@ -550,7 +572,6 @@ export default function ConnectWhatsAppPage() {
               onClick={() => {
                 const tid = effectiveTenantId;
                 const controller = newAbortController();
-                tenantRef.current = tid;
                 fetchServerStatus(controller.signal);
                 if (tid) {
                   activateTenantInBackend(tid, controller.signal);
