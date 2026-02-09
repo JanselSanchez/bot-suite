@@ -10,51 +10,41 @@ type ServerStatus = {
   details?: string | null;
 };
 
-/**
- * GET /api/wa
- *
- * Devuelve el estado del servidor local de WhatsApp (wa-server.js).
- * NO usa Baileys directo (evita errores de jimp/sharp) y nunca devuelve 400,
- * sólo 200 con status "online" u "offline".
- */
 export async function GET() {
   const baseUrl = process.env.WA_SERVER_URL;
 
-  // Si no está configurado, lo tratamos como OFFLINE pero no rompemos el dashboard.
   if (!baseUrl) {
     const body: ServerStatus = {
       ok: false,
       status: "offline",
       error: "WA_SERVER_URL_NOT_SET",
-      details: "Configura WA_SERVER_URL en .env.local (ej: http://localhost:4001)",
+      details: "Configura WA_SERVER_URL en .env.local",
     };
     return NextResponse.json(body, { status: 200 });
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5_000);
+    const resp = await fetch(`${baseUrl}/health`, {
+      method: "GET",
+      signal: controller.signal,
+    });
 
-    let resp: Response;
+    // Limpiamos el timeout en cuanto responde
+    clearTimeout(timeout);
 
-    try {
-      resp = await fetch(`${baseUrl}/health`, {
-        method: "GET",
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    // Intentamos leer JSON, pero si falla igual devolvemos "offline"
+    // Intentamos leer JSON de forma segura
     let data: any = null;
     try {
       data = await resp.json();
     } catch {
-      // ignore
+      // Si no es JSON, data se queda null
     }
 
     const isOk = resp.ok && data && data.ok;
+
     const body: ServerStatus = {
       ok: isOk,
       status: isOk ? "online" : "offline",
@@ -63,7 +53,12 @@ export async function GET() {
     };
 
     return NextResponse.json(body, { status: 200 });
+
   } catch (err: any) {
+    // Si entra aquí es porque falló el fetch (timeout o red)
+    // Aseguramos limpiar el timeout por si acaso
+    clearTimeout(timeout);
+
     console.error("[api/wa:GET] error llamando a WA_SERVER_URL/health:", err);
 
     const body: ServerStatus = {
