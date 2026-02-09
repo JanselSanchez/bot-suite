@@ -6,15 +6,19 @@ import { createServerClient } from "@supabase/ssr";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-async function getSupabase() {
+type SupabaseInit =
+  | { supabase: ReturnType<typeof createServerClient>; envError: null }
+  | { supabase: null; envError: "SUPABASE_ENV_NOT_SET" };
+
+async function getSupabase(): Promise<SupabaseInit> {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   if (!url || !anon) {
-    return { supabase: null as any, envError: "SUPABASE_ENV_NOT_SET" as const };
+    return { supabase: null, envError: "SUPABASE_ENV_NOT_SET" };
   }
 
-  // ✅ En tu build (Next 15.5.9 + Turbopack) esto puede ser Promise
+  // ✅ Next 15 puede tipar cookies() como Promise
   const cookieStore = await cookies();
 
   const supabase = createServerClient(url, anon, {
@@ -30,7 +34,7 @@ async function getSupabase() {
     },
   });
 
-  return { supabase, envError: null as const };
+  return { supabase, envError: null };
 }
 
 export async function POST(req: Request) {
@@ -44,19 +48,21 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "tenantId requerido" }, { status: 400 });
     }
 
-    const { supabase, envError } = await getSupabase();
-    if (envError) {
+    const supa = await getSupabase();
+    if (supa.envError) {
       return NextResponse.json(
         {
           ok: false,
-          error: envError,
+          error: supa.envError,
           details: "Configura NEXT_PUBLIC_SUPABASE_URL y NEXT_PUBLIC_SUPABASE_ANON_KEY",
         },
         { status: 500 }
       );
     }
 
-    // ✅ Auth real con cookies reales
+    const supabase = supa.supabase;
+
+    // ✅ Auth real
     const { data: userData, error: userErr } = await supabase.auth.getUser();
 
     if (userErr) {
@@ -69,7 +75,6 @@ export async function POST(req: Request) {
 
     // -------- Tenant info (no fatal) --------
     let tenantName: string | null = null;
-
     try {
       const { data: tenantRow, error: tenantErr } = await supabase
         .from("tenants")
@@ -117,7 +122,6 @@ export async function POST(req: Request) {
       waPhone,
       waLastConnectedAt,
     });
-    
   } catch (error: any) {
     console.error("💥 [API ACTIVATE TENANT][CRASH]:", error);
     return NextResponse.json(
