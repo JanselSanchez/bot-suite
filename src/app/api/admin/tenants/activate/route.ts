@@ -6,16 +6,16 @@ import { createServerClient } from "@supabase/ssr";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function getSupabase() {
+async function getSupabase() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   if (!url || !anon) {
-    // No tiramos throw sin control: devolvemos error claro (esto evita 500 silencioso)
     return { supabase: null as any, envError: "SUPABASE_ENV_NOT_SET" as const };
   }
 
-  const cookieStore = cookies();
+  // ✅ En tu build (Next 15.5.9 + Turbopack) esto puede ser Promise
+  const cookieStore = await cookies();
 
   const supabase = createServerClient(url, anon, {
     cookies: {
@@ -44,10 +44,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "tenantId requerido" }, { status: 400 });
     }
 
-    const { supabase, envError } = getSupabase();
+    const { supabase, envError } = await getSupabase();
     if (envError) {
       return NextResponse.json(
-        { ok: false, error: envError, details: "Configura NEXT_PUBLIC_SUPABASE_URL y NEXT_PUBLIC_SUPABASE_ANON_KEY" },
+        {
+          ok: false,
+          error: envError,
+          details: "Configura NEXT_PUBLIC_SUPABASE_URL y NEXT_PUBLIC_SUPABASE_ANON_KEY",
+        },
         { status: 500 }
       );
     }
@@ -105,7 +109,6 @@ export async function POST(req: Request) {
       console.warn("⚠️ [API ACTIVATE TENANT] wa_sessions crash:", e);
     }
 
-    // ✅ Respuesta EXACTA esperada por tu UI
     return NextResponse.json({
       ok: true,
       tenantId,
