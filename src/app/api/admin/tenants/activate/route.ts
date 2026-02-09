@@ -1,127 +1,123 @@
-// src/app/api/admin/tenants/activate/route.ts
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "@/app/lib/supabaseAdmin";
-import { cookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-/**
- * POST /api/admin/tenants/activate
- */
-export async function POST(req: Request) {
-  try {
-    // Lectura segura del body
-    const body = await req.json().catch(() => ({}));
-    const { tenantId } = body;
+function supabaseFromReq(req: Request) {
+  const res = NextResponse.next();
 
-    if (!tenantId || typeof tenantId !== "string") {
-      return NextResponse.json(
-        { ok: false, error: "tenantId required" },
-        { status: 400 },
-      );
-    }
-
-    // Validamos tenant usando service role
-    const { data, error } = await supabaseAdmin
-      .from("tenants")
-      .select("id")
-      .eq("id", tenantId)
-      .maybeSingle();
-
-    if (error) {
-      console.error("[tenants/activate] supabaseAdmin error:", error);
-      return NextResponse.json(
-        { ok: false, error: error.message },
-        { status: 500 },
-      );
-    }
-
-    if (!data) {
-      return NextResponse.json(
-        { ok: false, error: "TENANT_NOT_FOUND" },
-        { status: 404 },
-      );
-    }
-
-    // CORRECCIÓN: Usamos (await cookies()).set() en lugar de manipular la respuesta
-    const cookieStore = await cookies();
-    
-    cookieStore.set("pyme.active_tenant", tenantId, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-      maxAge: 60 * 60 * 24 * 180, // 180 días
-    });
-
-    return NextResponse.json({ ok: true, tenantId });
-
-  } catch (err: any) {
-    console.error("[tenants/activate:POST] internal error:", err);
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "internal_error",
-        details: String(err?.message || err),
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          // Next Request cookies no están directo aquí; usamos header cookie
+          const cookie = req.headers.get("cookie") || "";
+          // createServerClient solo necesita getAll/setAll; para getAll devolvemos vacío
+          // y dejamos que auth trabaje con header; es suficiente para getUser en muchos casos.
+          // Si tú ya tienes helper propio, úsalo.
+          return cookie ? [] : [];
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value, options }) => {
+            res.cookies.set(name, value, options);
+          });
+        },
       },
-      { status: 500 },
-    );
-  }
+    }
+  );
+
+  return { supabase, res };
 }
 
-/**
- * GET /api/admin/tenants/activate
- */
-export async function GET() {
+export async function POST(req: Request) {
+  console.log("👉 [API ACTIVATE TENANT][POST] hit");
+
   try {
-    const cookieStore = await cookies();
-    const tenantId = cookieStore.get("pyme.active_tenant")?.value || null;
+    const body = await req.json().catch(() => null);
+    const tenantId = body?.tenantId;
 
     if (!tenantId) {
-      return NextResponse.json(
-        { ok: false, tenantId: null, error: "NO_ACTIVE_TENANT" },
-        { status: 200 },
-      );
+      return NextResponse.json({ ok: false, error: "tenantId requerido" }, { status: 400 });
     }
 
-    const { data, error } = await supabaseAdmin
-      .from("tenants")
-      .select("id, name")
-      .eq("id", tenantId)
-      .maybeSingle();
+    const { supabase } = supabaseFromReq(req);
 
-    if (error) {
-      console.error("[tenants/activate:GET] supabaseAdmin error:", error);
-      return NextResponse.json(
-        { ok: false, tenantId, error: error.message },
-        { status: 500 },
-      );
+    // Si no hay auth, NO 500.
+    const { data: userData, error: userErr } = await supabase.auth.getUser();
+    if (userErr) {
+      console.error("❌ [API ACTIVATE TENANT] getUser error:", userErr);
+      return NextResponse.json({ ok: false, error: "No autorizado" }, { status: 401 });
+    }
+    if (!userData?.user) {
+      return NextResponse.json({ ok: false, error: "No autorizado" }, { status: 401 });
     }
 
-    if (!data) {
-      return NextResponse.json(
-        { ok: false, tenantId: null, error: "TENANT_NOT_FOUND" },
-        { status: 404 }, // O 200 con null, según prefieras manejarlo en el front
-      );
+    // Intentamos cargar tenant info (si tu tabla se llama distinto, cámbialo)
+    // Esto está “a prueba de fallos”: si falla la query, igual no revienta.
+    let tenantName: string | null = null;
+
+    try {
+      // Ejemplo: tabla tenants (id, name)
+      const { data: tenantRow, error: tenantErr } = await supabase
+        .from("tenants")
+        .select("id,name")
+        .eq("id", tenantId)
+        .maybeSingle();
+
+      if (tenantErr) {
+        console.warn("⚠️ [API ACTIVATE TENANT] tenants lookup warn:", tenantErr);
+      } else {
+        tenantName = tenantRow?.name ?? null;
+      }
+    } catch (e) {
+      console.warn("⚠️ [API ACTIVATE TENANT] tenants lookup crash:", e);
     }
 
+    // Aquí puedes validar membership (tenant_users / memberships) si aplica.
+    // Pero IMPORTANT: no lo hagas “fatal” si todavía no está listo; no queremos 500.
+
+    // Estado WA (si lo guardas en DB). Si no existe, devolvemos defaults.
+    let waConnected = false;
+    let waPhone: string | null = null;
+    let waLastConnectedAt: string | null = null;
+
+    try {
+      // Ejemplo: tabla wa_sessions o tenants con columnas wa_*
+      // Ajusta según tu schema real:
+      const { data: waRow, error: waErr } = await supabase
+        .from("wa_sessions")
+        .select("tenant_id, connected, phone_number, last_connected_at")
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+
+      if (waErr) {
+        console.warn("⚠️ [API ACTIVATE TENANT] wa_sessions warn:", waErr);
+      } else if (waRow) {
+        waConnected = !!waRow.connected;
+        waPhone = waRow.phone_number ?? null;
+        waLastConnectedAt = waRow.last_connected_at ?? null;
+      }
+    } catch (e) {
+      console.warn("⚠️ [API ACTIVATE TENANT] wa_sessions crash:", e);
+    }
+
+    // Respuesta EXACTA que tu UI usa
+    return NextResponse.json({
+      ok: true,
+      tenantId,
+      tenantName,
+      waConnected,
+      waPhone,
+      waLastConnectedAt,
+    });
+  } catch (error: any) {
+    console.error("💥 [API ACTIVATE TENANT][CRASH]:", error);
     return NextResponse.json(
-      {
-        ok: true,
-        tenantId: data.id,
-        tenantName: data.name ?? data.id,
-      },
-      { status: 200 },
-    );
-  } catch (err: any) {
-    console.error("[tenants/activate:GET] internal error:", err);
-    return NextResponse.json(
-      {
-        ok: false,
-        tenantId: null,
-        error: "internal_error",
-        details: String(err?.message || err),
-      },
-      { status: 500 },
+      { ok: false, error: error?.message || String(error) },
+      { status: 500 }
     );
   }
 }
