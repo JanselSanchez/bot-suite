@@ -53,6 +53,55 @@ function nowTime() {
   }
 }
 
+function isAbortError(err: any) {
+  return err?.name === "AbortError";
+}
+
+// ✅ Fetch robusto: nunca revienta por HTML/500/no-json
+async function fetchJsonSafe<T>(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<{ ok: boolean; status: number; data: T | null; error?: string; raw?: string }> {
+  try {
+    const res = await fetch(input, init);
+    const status = res.status;
+
+    const contentType = res.headers.get("content-type") || "";
+    const text = await res.text();
+
+    if (!contentType.includes("application/json")) {
+      return {
+        ok: false,
+        status,
+        data: null,
+        error: `Non-JSON response (ct=${contentType || "unknown"})`,
+        raw: text.slice(0, 200),
+      };
+    }
+
+    try {
+      const json = JSON.parse(text) as T;
+      return { ok: true, status, data: json };
+    } catch {
+      return {
+        ok: false,
+        status,
+        data: null,
+        error: "Invalid JSON",
+        raw: text.slice(0, 200),
+      };
+    }
+  } catch (err: any) {
+    if (isAbortError(err)) throw err;
+    return {
+      ok: false,
+      status: 0,
+      data: null,
+      error: err?.message || String(err),
+    };
+  }
+}
+
 export default function ConnectWhatsAppPage() {
   const { tenantId, loading: loadingTenant } = useActiveTenant();
 
@@ -61,12 +110,20 @@ export default function ConnectWhatsAppPage() {
   // -----------------------
   const tenantRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const pollIdRef = useRef<number | null>(null);
 
   function newAbortController() {
     if (abortRef.current) abortRef.current.abort();
     const c = new AbortController();
     abortRef.current = c;
     return c;
+  }
+
+  function clearPolling() {
+    if (pollIdRef.current) {
+      clearInterval(pollIdRef.current);
+      pollIdRef.current = null;
+    }
   }
 
   // -----------------------
@@ -106,19 +163,28 @@ export default function ConnectWhatsAppPage() {
   // -----------------------
   async function fetchServerStatus(signal?: AbortSignal) {
     try {
-      const res = await fetch(`/api/wa/status?t=${Date.now()}`, {
-        cache: "no-store",
-        signal,
-        headers: noCacheHeaders,
-      });
-      const json = await res.json();
+      const out = await fetchJsonSafe<ServerStatus>(
+        `/api/wa/status?t=${Date.now()}`,
+        {
+          cache: "no-store",
+          signal,
+          headers: noCacheHeaders,
+        }
+      );
+
+      if (!out.ok || !out.data) {
+        console.error("[ConnectWhatsApp] /api/wa/status bad:", out.error, out.raw);
+        setServerStatus({ ok: false, status: "offline" });
+        return;
+      }
+
       setServerStatus({
-        ok: json.ok ?? true,
-        status: (json.status as ServerStatus["status"]) ?? "online",
+        ok: out.data.ok ?? true,
+        status: (out.data.status as ServerStatus["status"]) ?? "online",
       });
     } catch (err: any) {
-      if (err?.name === "AbortError") return;
-      console.error("[ConnectWhatsApp] fetchServerStatus error:", err);
+      if (isAbortError(err)) return;
+      console.error("[ConnectWhatsApp] fetchServerStatus crash:", err);
       setServerStatus({ ok: false, status: "offline" });
     } finally {
       setServerLoading(false);
@@ -127,22 +193,34 @@ export default function ConnectWhatsAppPage() {
   }
 
   // -----------------------
-  // 2) Activar tenant REAL en backend (clave del bug)
+  // 2) Activar tenant REAL en backend
   // -----------------------
   async function activateTenantInBackend(tid: string, signal?: AbortSignal) {
     try {
-      const res = await fetch(`/api/admin/tenants/activate?t=${Date.now()}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...noCacheHeaders },
-        body: JSON.stringify({ tenantId: tid }),
-        cache: "no-store",
-        signal,
-      });
-
-      const json = (await res.json()) as ActiveTenantResponse;
+      const out = await fetchJsonSafe<ActiveTenantResponse>(
+        `/api/admin/tenants/activate?t=${Date.now()}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...noCacheHeaders },
+          body: JSON.stringify({ tenantId: tid }),
+          cache: "no-store",
+          signal,
+        }
+      );
 
       // ignora respuestas tardías
       if (tenantRef.current !== tid) return;
+
+      if (!out.ok || !out.data) {
+        console.error("[ConnectWhatsApp] activate bad:", out.error, out.raw);
+        setTenantName(null);
+        setTenantWaConnected(false);
+        setTenantWaPhone(null);
+        setTenantWaLastConnectedAt(null);
+        return;
+      }
+
+      const json = out.data;
 
       if (json.ok && json.tenantId) {
         setTenantName(json.tenantName ?? json.tenantId);
@@ -150,16 +228,14 @@ export default function ConnectWhatsAppPage() {
         setTenantWaPhone(json.waPhone ?? null);
         setTenantWaLastConnectedAt(json.waLastConnectedAt ?? null);
       } else {
-        // fallback mínimo
         setTenantName(null);
         setTenantWaConnected(false);
         setTenantWaPhone(null);
         setTenantWaLastConnectedAt(null);
       }
     } catch (err: any) {
-      if (err?.name === "AbortError") return;
-      console.error("[ConnectWhatsApp] activateTenantInBackend error:", err);
-      // fallback: al menos muestra algo
+      if (isAbortError(err)) return;
+      console.error("[ConnectWhatsApp] activateTenantInBackend crash:", err);
       if (tenantRef.current === tid) setTenantName(null);
     }
   }
@@ -170,21 +246,32 @@ export default function ConnectWhatsAppPage() {
   async function fetchSession(tid: string, signal?: AbortSignal) {
     setSessionLoading(true);
     try {
-      const res = await fetch(
+      const out = await fetchJsonSafe<SessionResponse>(
         `/api/wa/session?tenantId=${encodeURIComponent(tid)}&t=${Date.now()}`,
         { cache: "no-store", signal, headers: noCacheHeaders }
       );
-      const json = (await res.json()) as SessionResponse;
 
       if (tenantRef.current !== tid) return;
 
-      if (!json.ok) throw new Error(json.error || "Error al cargar sesión de WhatsApp");
+      if (!out.ok || !out.data) {
+        console.error("[ConnectWhatsApp] session bad:", out.error, out.raw);
+        setSession(null);
+        setSessionError(out.error || "Error al cargar sesión de WhatsApp");
+        return;
+      }
+
+      const json = out.data;
+      if (!json.ok) {
+        setSession(null);
+        setSessionError(json.error || "Error al cargar sesión de WhatsApp");
+        return;
+      }
 
       setSession(json.session);
       setSessionError(null);
     } catch (err: any) {
-      if (err?.name === "AbortError") return;
-      console.error("[ConnectWhatsApp] fetchSession error:", err);
+      if (isAbortError(err)) return;
+      console.error("[ConnectWhatsApp] fetchSession crash:", err);
       setSession(null);
       setSessionError(err?.message || "Error al cargar sesión de WhatsApp");
     } finally {
@@ -213,7 +300,7 @@ export default function ConnectWhatsAppPage() {
     }
 
     try {
-      const res = await fetch(`/api/wa/session?t=${Date.now()}`, {
+      const out = await fetchJsonSafe<SessionResponse>(`/api/wa/session?t=${Date.now()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...noCacheHeaders },
         body: JSON.stringify({ tenantId: tid, action }),
@@ -221,19 +308,27 @@ export default function ConnectWhatsAppPage() {
         signal: controller.signal,
       });
 
-      const json = (await res.json()) as SessionResponse;
-
       if (tenantRef.current !== tid) return;
 
-      if (!json.ok) throw new Error(json.error || "Error al ejecutar acción");
+      if (!out.ok || !out.data) {
+        console.error("[ConnectWhatsApp] action bad:", out.error, out.raw);
+        setSessionError(out.error || "Error al ejecutar acción");
+        return;
+      }
+
+      const json = out.data;
+      if (!json.ok) {
+        setSessionError(json.error || "Error al ejecutar acción");
+        return;
+      }
 
       // refresca
       await fetchSession(tid, controller.signal);
       await activateTenantInBackend(tid, controller.signal);
       await fetchServerStatus(controller.signal);
     } catch (err: any) {
-      if (err?.name === "AbortError") return;
-      console.error("[ConnectWhatsApp] handleAction error:", err);
+      if (isAbortError(err)) return;
+      console.error("[ConnectWhatsApp] handleAction crash:", err);
       setSessionError(err?.message || "Error al ejecutar acción");
     } finally {
       if (tenantRef.current === tid) setSessionLoading(false);
@@ -281,6 +376,8 @@ export default function ConnectWhatsAppPage() {
 
     const tid = effectiveTenantId;
 
+    clearPolling();
+
     // reset duro para evitar “arrastrar” QR viejo
     setSession(null);
     setSessionError(null);
@@ -291,29 +388,33 @@ export default function ConnectWhatsAppPage() {
     setTenantWaPhone(null);
     setTenantWaLastConnectedAt(null);
 
-    // si no hay tenant, solo status server
     const controller = newAbortController();
     tenantRef.current = tid;
 
     fetchServerStatus(controller.signal);
 
-    if (!tid) return () => controller.abort();
+    if (!tid) {
+      return () => {
+        clearPolling();
+        controller.abort();
+      };
+    }
 
-    // 🔥 AQUÍ está el fix: activamos tenant REAL en backend una sola vez por cambio
+    // ✅ activar tenant una vez
     activateTenantInBackend(tid, controller.signal);
 
-    // carga sesión qr por ese tenant
+    // ✅ sesión qr por tenant
     fetchSession(tid, controller.signal);
 
-    // polling SOLO de QR + server (NO activar tenant cada 5s)
-    const id = setInterval(() => {
+    // ✅ polling solo status + session
+    pollIdRef.current = window.setInterval(() => {
       if (tenantRef.current !== tid) return;
       fetchServerStatus(controller.signal);
       fetchSession(tid, controller.signal);
     }, 5000);
 
     return () => {
-      clearInterval(id);
+      clearPolling();
       controller.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -553,4 +654,4 @@ export default function ConnectWhatsAppPage() {
       </div>
     </div>
   );
-                    }
+}
