@@ -1,4 +1,3 @@
-// src/app/api/admin/new-business/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
@@ -7,17 +6,16 @@ import { createClient } from "@supabase/supabase-js";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Versión de control: 1.0.5 - Si no ves este número en los logs de Render, no se ha actualizado.
 export async function POST(req: Request) {
-  console.log(">>> [DEBUG V1.0.5] Iniciando creación de negocio...");
+  // CLONAMOS la petición para evitar el error "body is disturbed"
+  const reqClone = req.clone();
 
   try {
     const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 
     if (!serviceRoleKey || !supabaseUrl) {
-      console.error(">>> [ERROR] Faltan variables de entorno en Render.");
-      return NextResponse.json({ error: "Configuración incompleta en el servidor." }, { status: 500 });
+      return NextResponse.json({ error: "Faltan variables de entorno" }, { status: 500 });
     }
 
     const cookieStore = await cookies();
@@ -29,65 +27,58 @@ export async function POST(req: Request) {
       },
     });
 
+    // Verificamos usuario
     const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return NextResponse.json({ error: "Sesión expirada." }, { status: 401 });
+    if (!user) return NextResponse.json({ error: "No autorizado" }, { status: 401 });
 
-    const body = await req.json();
-    console.log(">>> [PAYLOAD RECIBIDO]:", body);
+    // Leemos el JSON de la petición clonada
+    const body = await reqClone.json();
 
     const sbAdmin = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false }
     });
 
-    // --- ESTRATEGIA DE INSERCIÓN SEGURA ---
-    // Solo enviamos las columnas que confirmamos que existen en tu captura de DB inicial.
-    const cleanData: any = {
+    // Filtramos SOLO las columnas que existen en la tabla 'tenants' (según tu DB)
+    const tenantPayload = {
       name: body.name.trim(),
       timezone: body.timezone || "America/Santo_Domingo",
       phone: body.phone || null,
       status: "active"
     };
 
-    // Intentamos añadir las nuevas columnas SOLO si el backend las reconoce.
-    // Si esto falla, el error nos dirá exactamente qué columna falta.
+    // 1. Insertar negocio
     const { data: tenant, error: insErr } = await sbAdmin
       .from("tenants")
-      .insert(cleanData)
+      .insert(tenantPayload)
       .select("id")
       .single();
 
     if (insErr) {
-      console.error(">>> [DETALLE ERROR SUPABASE]:", insErr);
-      return NextResponse.json({ 
-        error: `Supabase dice: ${insErr.message}`,
-        hint: insErr.hint,
-        code: insErr.code 
-      }, { status: 500 });
+      return NextResponse.json({ error: insErr.message }, { status: 500 });
     }
 
-    // Relación de dueño
+    // 2. Relación de dueño
     await sbAdmin
       .from("tenant_members")
       .insert({ tenant_id: tenant.id, user_id: user.id, role: "owner" });
 
-    // Intentamos guardar los datos extra en una tabla secundaria para no romper 'tenants'
+    // 3. Intentar guardar vertical/descripción en tabla secundaria (si existe)
     try {
       await sbAdmin.from("business_profiles").insert({
         tenant_id: tenant.id,
-        vertical: body.vertical,
-        description: body.description
+        vertical: body.vertical || "general",
+        description: body.description || ""
       });
     } catch (e) {
-      console.log(">>> [INFO] No se pudo guardar en business_profiles, ignorando...");
+      console.log("Tabla business_profiles no encontrada, ignorando datos extra.");
     }
 
     cookieStore.set("pyme.active_tenant", tenant.id, { path: "/" });
-    console.log(">>> [EXITO] Negocio creado ID:", tenant.id);
 
     return NextResponse.json({ ok: true, tenantId: tenant.id });
 
   } catch (error: any) {
-    console.error(">>> [CRASH]:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error("Error en servidor:", error);
+    return NextResponse.json({ error: "Error interno del servidor" }, { status: 500 });
   }
 }
