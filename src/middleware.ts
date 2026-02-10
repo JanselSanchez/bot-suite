@@ -6,17 +6,27 @@ import { createServerClient } from "@supabase/ssr";
 export async function middleware(req: NextRequest) {
   const path = req.nextUrl.pathname;
 
-  // ✅ NUNCA interceptar API routes
-  if (path.startsWith("/api/")) {
+  // 1. PRIORIDAD ABSOLUTA: Si es API, estática o assets, salir de inmediato sin tocar NADA.
+  // Esto evita que Supabase intente inicializarse en rutas que no debe.
+  if (
+    path.startsWith("/api") || 
+    path.startsWith("/_next") || 
+    path.includes(".") // Excluye archivos como favicon.ico, etc.
+  ) {
     return NextResponse.next();
   }
 
-  // ✅ Rutas públicas
+  // 2. Rutas públicas directas
   if (path.startsWith("/connect")) {
     return NextResponse.next();
   }
 
-  let res = NextResponse.next();
+  // Creamos una respuesta base
+  let response = NextResponse.next({
+    request: {
+      headers: req.headers,
+    },
+  });
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -27,40 +37,47 @@ export async function middleware(req: NextRequest) {
           return req.cookies.getAll();
         },
         setAll(cookiesToSet) {
-          // Importante: setear en la respuesta (no en req)
           cookiesToSet.forEach(({ name, value, options }) => {
-            res.cookies.set(name, value, options);
+            req.cookies.set(name, value); // Actualiza la petición
+            response.cookies.set(name, value, options); // Actualiza la respuesta
           });
         },
       },
     }
   );
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  // IMPORTANTE: Solo llamar a getUser en rutas que realmente requieren auth (dashboard o login)
+  // No lo llames para cada ruta del sitio para no gastar recursos ni bloquear el body.
+  const isDashboard = path.startsWith("/dashboard");
+  const isLogin = path === "/login";
 
-  // Si intenta ir al login y ya está logueado -> Dashboard
-  if (path === "/login" && user) {
-    const url = req.nextUrl.clone();
-    url.pathname = "/dashboard";
-    return NextResponse.redirect(url);
+  if (isDashboard || isLogin) {
+    const { data: { user } } = await supabase.auth.getUser();
+
+    if (isLogin && user) {
+      return NextResponse.redirect(new URL("/dashboard", req.url));
+    }
+
+    if (isDashboard && !user) {
+      const url = new URL("/login", req.url);
+      url.searchParams.set("redirectedFrom", path);
+      return NextResponse.redirect(url);
+    }
   }
 
-  // Si intenta ir al dashboard y NO está logueado -> Login
-  if (path.startsWith("/dashboard") && !user) {
-    const url = req.nextUrl.clone();
-    url.pathname = "/login";
-    url.searchParams.set("redirectedFrom", path);
-    return NextResponse.redirect(url);
-  }
-
-  return res;
+  return response;
 }
 
+// El Matcher debe ser lo más específico posible para no atrapar peticiones POST de la API
 export const config = {
   matcher: [
-    // ✅ Excluye api y assets
-    "/((?!api|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+    /*
+     * Coincide con todas las rutas excepto:
+     * - api (rutas de backend)
+     * - _next/static (archivos estáticos)
+     * - _next/image (optimización de imágenes)
+     * - favicon.ico (icono del sitio)
+     */
+    "/((?!api|_next/static|_next/image|favicon.ico).*)",
   ],
 };
