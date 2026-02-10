@@ -7,8 +7,14 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
-  // CLONAMOS la petición para evitar el error "body is disturbed"
-  const reqClone = req.clone();
+  // --- PASO 1: LEER EL BODY ANTES QUE CUALQUIER OTRA COSA ---
+  // Hacemos esto primero para que no haya conflictos con el flujo (stream) de la petición.
+  let body: any;
+  try {
+    body = await req.json();
+  } catch (e) {
+    return NextResponse.json({ error: "No se pudo leer el cuerpo de la petición" }, { status: 400 });
+  }
 
   try {
     const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -18,6 +24,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Faltan variables de entorno" }, { status: 500 });
     }
 
+    // --- PASO 2: AUTENTICACIÓN ---
     const cookieStore = await cookies();
     const supabase = createServerClient(supabaseUrl, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
       cookies: {
@@ -27,13 +34,10 @@ export async function POST(req: Request) {
       },
     });
 
-    // Verificamos usuario
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return NextResponse.json({ error: "No autorizado" }, { status: 401 });
 
-    // Leemos el JSON de la petición clonada
-    const body = await reqClone.json();
-
+    // --- PASO 3: LÓGICA DE BASE DE DATOS ---
     const sbAdmin = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false }
     });
@@ -54,15 +58,20 @@ export async function POST(req: Request) {
       .single();
 
     if (insErr) {
+      console.error("Error al insertar tenant:", insErr.message);
       return NextResponse.json({ error: insErr.message }, { status: 500 });
     }
 
-    // 2. Relación de dueño
-    await sbAdmin
+    // 2. Relación de dueño en tenant_members
+    const { error: memberErr } = await sbAdmin
       .from("tenant_members")
       .insert({ tenant_id: tenant.id, user_id: user.id, role: "owner" });
 
-    // 3. Intentar guardar vertical/descripción en tabla secundaria (si existe)
+    if (memberErr) {
+      console.error("Error al insertar miembro:", memberErr.message);
+    }
+
+    // 3. Intentar guardar vertical/descripción en tabla secundaria
     try {
       await sbAdmin.from("business_profiles").insert({
         tenant_id: tenant.id,
@@ -70,15 +79,16 @@ export async function POST(req: Request) {
         description: body.description || ""
       });
     } catch (e) {
-      console.log("Tabla business_profiles no encontrada, ignorando datos extra.");
+      console.log("Tabla business_profiles no encontrada u omitida.");
     }
 
+    // Establecer la cookie de negocio activo
     cookieStore.set("pyme.active_tenant", tenant.id, { path: "/" });
 
     return NextResponse.json({ ok: true, tenantId: tenant.id });
 
   } catch (error: any) {
-    console.error("Error en servidor:", error);
+    console.error("Error crítico en servidor:", error);
     return NextResponse.json({ error: "Error interno del servidor" }, { status: 500 });
   }
 }
