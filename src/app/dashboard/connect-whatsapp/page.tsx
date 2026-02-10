@@ -553,7 +553,7 @@ export default function ConnectWhatsAppPage() {
               </p>
             </div>
 
-            <Separator className="bg-slate-800 my-1" />
+            <Separator className="bg-slate-800 my-1 h-[1px]" />
 
             <h2 className="font-semibold text-slate-100 mb-1">Instrucciones</h2>
             <ol className="list-decimal list-inside space-y-1 text-slate-300 text-xs">
@@ -563,7 +563,7 @@ export default function ConnectWhatsAppPage() {
               <li>Escanea el código QR.</li>
             </ol>
 
-            <Separator className="bg-slate-800 my-2" />
+            <Separator className="bg-slate-800 my-2 h-[1px]" />
 
             <Button
               variant="outline"
