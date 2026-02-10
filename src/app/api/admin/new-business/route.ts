@@ -7,42 +7,42 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
-  // --- PASO 1: LEER EL BODY ANTES QUE CUALQUIER OTRA COSA ---
-  // Hacemos esto primero para que no haya conflictos con el flujo (stream) de la petición.
+  // 1. EXTRAER EL BODY DE INMEDIATO
+  // Esto vacía el flujo antes de que Supabase le ponga un candado.
   let body: any;
   try {
     body = await req.json();
   } catch (e) {
-    return NextResponse.json({ error: "No se pudo leer el cuerpo de la petición" }, { status: 400 });
+    return NextResponse.json({ error: "Cuerpo de petición inválido" }, { status: 400 });
   }
 
   try {
-    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
-    if (!serviceRoleKey || !supabaseUrl) {
-      return NextResponse.json({ error: "Faltan variables de entorno" }, { status: 500 });
-    }
-
-    // --- PASO 2: AUTENTICACIÓN ---
+    // 2. VALIDAR AUTENTICACIÓN (Ahora que el body ya está en la variable 'body')
     const cookieStore = await cookies();
-    const supabase = createServerClient(supabaseUrl, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
-      cookies: {
-        get(name: string) { return cookieStore.get(name)?.value; },
-        set(name: string, value: string, options: any) { cookieStore.set({ name, value, ...options }); },
-        remove(name: string, options: any) { cookieStore.set({ name, value: "", ...options }); },
-      },
-    });
+    const supabase = createServerClient(
+      supabaseUrl,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        cookies: {
+          get(name: string) { return cookieStore.get(name)?.value; },
+          set(name: string, value: string, options: any) { cookieStore.set({ name, value, ...options }); },
+          remove(name: string, options: any) { cookieStore.set({ name, value: "", ...options }); },
+        },
+      }
+    );
 
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return NextResponse.json({ error: "No autorizado" }, { status: 401 });
 
-    // --- PASO 3: LÓGICA DE BASE DE DATOS ---
+    // 3. INSERTAR EN BASE DE DATOS
     const sbAdmin = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false }
     });
 
-    // Filtramos SOLO las columnas que existen en la tabla 'tenants' (según tu DB)
+    // Solo columnas confirmadas en tu tabla 'tenants'
     const tenantPayload = {
       name: body.name.trim(),
       timezone: body.timezone || "America/Santo_Domingo",
@@ -50,7 +50,6 @@ export async function POST(req: Request) {
       status: "active"
     };
 
-    // 1. Insertar negocio
     const { data: tenant, error: insErr } = await sbAdmin
       .from("tenants")
       .insert(tenantPayload)
@@ -58,37 +57,22 @@ export async function POST(req: Request) {
       .single();
 
     if (insErr) {
-      console.error("Error al insertar tenant:", insErr.message);
+      console.error("Error DB:", insErr.message);
       return NextResponse.json({ error: insErr.message }, { status: 500 });
     }
 
-    // 2. Relación de dueño en tenant_members
-    const { error: memberErr } = await sbAdmin
+    // Relación de dueño
+    await sbAdmin
       .from("tenant_members")
       .insert({ tenant_id: tenant.id, user_id: user.id, role: "owner" });
 
-    if (memberErr) {
-      console.error("Error al insertar miembro:", memberErr.message);
-    }
-
-    // 3. Intentar guardar vertical/descripción en tabla secundaria
-    try {
-      await sbAdmin.from("business_profiles").insert({
-        tenant_id: tenant.id,
-        vertical: body.vertical || "general",
-        description: body.description || ""
-      });
-    } catch (e) {
-      console.log("Tabla business_profiles no encontrada u omitida.");
-    }
-
-    // Establecer la cookie de negocio activo
+    // Cookie de negocio activo
     cookieStore.set("pyme.active_tenant", tenant.id, { path: "/" });
 
     return NextResponse.json({ ok: true, tenantId: tenant.id });
 
   } catch (error: any) {
-    console.error("Error crítico en servidor:", error);
+    console.error("Crash crítico:", error.message);
     return NextResponse.json({ error: "Error interno del servidor" }, { status: 500 });
   }
 }
