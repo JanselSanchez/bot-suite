@@ -7,11 +7,11 @@ export async function middleware(req: NextRequest) {
   const path = req.nextUrl.pathname;
 
   // 1. PRIORIDAD ABSOLUTA: Si es API, estática o assets, salir de inmediato sin tocar NADA.
-  // Esto evita que Supabase intente inicializarse en rutas que no debe.
+  // Esto garantiza que el body de las peticiones POST llegue intacto a tus rutas.
   if (
     path.startsWith("/api") || 
     path.startsWith("/_next") || 
-    path.includes(".") // Excluye archivos como favicon.ico, etc.
+    path.includes(".") 
   ) {
     return NextResponse.next();
   }
@@ -21,13 +21,14 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  // Creamos una respuesta base
+  // Creamos la respuesta base
   let response = NextResponse.next({
     request: {
       headers: req.headers,
     },
   });
 
+  // Inicializamos Supabase solo para rutas que no son de la API
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
@@ -38,19 +39,18 @@ export async function middleware(req: NextRequest) {
         },
         setAll(cookiesToSet) {
           cookiesToSet.forEach(({ name, value, options }) => {
-            req.cookies.set(name, value); // Actualiza la petición
-            response.cookies.set(name, value, options); // Actualiza la respuesta
+            req.cookies.set(name, value);
+            response.cookies.set(name, value, options);
           });
         },
       },
     }
   );
 
-  // IMPORTANTE: Solo llamar a getUser en rutas que realmente requieren auth (dashboard o login)
-  // No lo llames para cada ruta del sitio para no gastar recursos ni bloquear el body.
   const isDashboard = path.startsWith("/dashboard");
   const isLogin = path === "/login";
 
+  // Solo ejecutamos getUser si estamos en rutas protegidas o de acceso
   if (isDashboard || isLogin) {
     const { data: { user } } = await supabase.auth.getUser();
 
@@ -68,16 +68,17 @@ export async function middleware(req: NextRequest) {
   return response;
 }
 
-// El Matcher debe ser lo más específico posible para no atrapar peticiones POST de la API
+// Configuración del Matcher: Ahora es selectivo para NO interceptar la API
 export const config = {
   matcher: [
     /*
-     * Coincide con todas las rutas excepto:
-     * - api (rutas de backend)
-     * - _next/static (archivos estáticos)
-     * - _next/image (optimización de imágenes)
-     * - favicon.ico (icono del sitio)
+     * Coincidimos solo con rutas que SI necesitan middleware.
+     * Al excluir explícitamente el patrón de la API aquí, 
+     * Next.js no bloqueará el body en las peticiones de tus negocios.
      */
-    "/((?!api|_next/static|_next/image|favicon.ico).*)",
+    "/",
+    "/login",
+    "/dashboard/:path*",
+    "/connect/:path*",
   ],
 };
