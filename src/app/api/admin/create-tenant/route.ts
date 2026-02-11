@@ -37,15 +37,16 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3) Auth (cookie-based) — solo LEER cookies
-    const cookieStore = cookies(); // <-- sin await
+    // 3) Auth (cookie-based) — leer cookies sin tocar body
+    // Next 15: cookies() puede ser async en algunos targets -> usar await.
+    const cookieStore = await cookies();
+
     const supabaseAuth = createServerClient(supabaseUrl, anonKey, {
       cookies: {
         getAll() {
           return cookieStore.getAll();
         },
-        // IMPORTANTÍSIMO: no necesitamos setAll aquí para auth.getUser(),
-        // y evitamos manipular cookies en el request.
+        // No necesitamos setAll para solo validar sesión.
         setAll() {},
       },
     });
