@@ -8,55 +8,76 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
-  // --- PASO 1: LEER EL BODY DE PRIMERO ---
-  // Esto es lo más importante para evitar el error "disturbed or locked"
+  // 1) Leer body primero (evita disturbed/locked)
   let body: any;
   try {
     body = await req.json();
-  } catch (e) {
-    return NextResponse.json({ error: "Cuerpo de petición inválido" }, { status: 400 });
+  } catch {
+    return NextResponse.json(
+      { ok: false, error: "Cuerpo de petición inválido" },
+      { status: 400 }
+    );
   }
 
   try {
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+    // 2) Env vars (TRIM para Render)
+    const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL || "").trim();
+    const anonKey = (process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "").trim();
+    const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
-    // --- PASO 2: AUTENTICACIÓN (Ahora que el body está seguro en una variable) ---
-    const cookieStore = await cookies();
-    const supabase = createServerClient(
-      supabaseUrl,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-      {
-        cookies: {
-          get(name: string) { return cookieStore.get(name)?.value; },
-          set(name: string, value: string, options: any) { cookieStore.set({ name, value, ...options }); },
-          remove(name: string, options: any) { cookieStore.set({ name, value: "", ...options }); },
-        },
-      }
-    );
-
-    const { data: { user }, error: authError } = await supabase.auth.getUser();
-    if (authError || !user) {
-      return NextResponse.json({ error: "No autorizado o sesión expirada" }, { status: 401 });
+    if (!supabaseUrl || !anonKey || !serviceRoleKey) {
+      console.error("❌ Env faltante", {
+        hasUrl: !!supabaseUrl,
+        hasAnon: !!anonKey,
+        hasService: !!serviceRoleKey,
+      });
+      return NextResponse.json(
+        { ok: false, error: "Faltan variables de entorno de Supabase" },
+        { status: 500 }
+      );
     }
 
-    // --- PASO 3: INSERCIÓN CON SERVICE ROLE (Bypass RLS) ---
-    const sbAdmin = createClient(supabaseUrl, serviceRoleKey, {
-      auth: { persistSession: false }
+    // 3) Auth (cookie-based) — solo LEER cookies
+    const cookieStore = cookies(); // <-- sin await
+    const supabaseAuth = createServerClient(supabaseUrl, anonKey, {
+      cookies: {
+        getAll() {
+          return cookieStore.getAll();
+        },
+        // IMPORTANTÍSIMO: no necesitamos setAll aquí para auth.getUser(),
+        // y evitamos manipular cookies en el request.
+        setAll() {},
+      },
     });
 
-    // Construimos el payload exacto con las columnas que agregaste en la DB
+    const {
+      data: { user },
+      error: authError,
+    } = await supabaseAuth.auth.getUser();
+
+    if (authError || !user) {
+      return NextResponse.json(
+        { ok: false, error: "No autorizado o sesión expirada" },
+        { status: 401 }
+      );
+    }
+
+    // 4) Admin client (service role)
+    const sbAdmin = createClient(supabaseUrl, serviceRoleKey, {
+      auth: { persistSession: false },
+    });
+
     const tenantPayload = {
-      name: (body.name || "Sin Nombre").trim(),
-      timezone: body.timezone || "America/Santo_Domingo",
-      phone: body.phone || null,
+      name: String(body?.name || "Sin Nombre").trim(),
+      timezone: body?.timezone || "America/Santo_Domingo",
+      phone: body?.phone || null,
       status: "active",
-      vertical: body.vertical || "general",
-      description: body.description || "",
-      notification_email: body.notification_email || null
+      vertical: body?.vertical || "general",
+      description: body?.description || "",
+      notification_email: body?.notification_email || null,
     };
 
-    // 1. Crear Negocio
+    // 5) Insert tenant
     const { data: tenant, error: insErr } = await sbAdmin
       .from("tenants")
       .insert(tenantPayload)
@@ -64,35 +85,40 @@ export async function POST(req: Request) {
       .single();
 
     if (insErr) {
-      console.error("❌ Error en tenants:", insErr.message);
-      return NextResponse.json({ error: `Base de datos: ${insErr.message}` }, { status: 500 });
+      console.error("❌ Error real en DB (tenants):", insErr);
+      return NextResponse.json(
+        { ok: false, error: `Base de datos: ${insErr.message}` },
+        { status: 500 }
+      );
     }
 
-    // 2. Crear relación de dueño
-    const { error: memberErr } = await sbAdmin
-      .from("tenant_members")
-      .insert({ 
-        tenant_id: tenant.id, 
-        user_id: user.id, 
-        role: "owner" 
-      });
-
-    if (memberErr) {
-      console.error("⚠️ Error en miembros:", memberErr.message);
-      // No devolvemos 500 aquí para que el usuario pueda entrar al dashboard
-    }
-
-    // 3. Setear cookie de negocio activo
-    cookieStore.set("pyme.active_tenant", tenant.id, { 
-      path: "/", 
-      maxAge: 31536000, 
-      sameSite: "lax" 
+    // 6) Insert membership (no tumbar flujo si falla)
+    const { error: memberErr } = await sbAdmin.from("tenant_members").insert({
+      tenant_id: tenant.id,
+      user_id: user.id,
+      role: "owner",
     });
 
-    return NextResponse.json({ ok: true, tenantId: tenant.id });
+    if (memberErr) {
+      console.error("⚠️ Error real en DB (tenant_members):", memberErr);
+    }
 
+    // 7) Set cookie correctamente EN LA RESPUESTA
+    const res = NextResponse.json({ ok: true, tenantId: tenant.id });
+    res.cookies.set("pyme.active_tenant", tenant.id, {
+      path: "/",
+      maxAge: 60 * 60 * 24 * 365,
+      sameSite: "lax",
+      httpOnly: false,
+      secure: true,
+    });
+
+    return res;
   } catch (error: any) {
-    console.error("🔥 Error crítico:", error.message);
-    return NextResponse.json({ error: "Error interno del servidor" }, { status: 500 });
+    console.error("🔥 Error crítico:", error);
+    return NextResponse.json(
+      { ok: false, error: "Error interno del servidor" },
+      { status: 500 }
+    );
   }
 }
