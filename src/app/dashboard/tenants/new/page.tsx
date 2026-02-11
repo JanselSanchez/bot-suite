@@ -39,24 +39,22 @@ export default function NewTenantPage() {
 
     setLoading(true);
     try {
-      // PREPARAMOS LOS DATOS
+      // PREPARAMOS LOS DATOS COMPLETOS
       const payload: any = {
         name: name.trim(),
-        vertical,
-        description: description.trim() || undefined,
-        // ⚠️ IMPORTANTE: Comentamos esto temporalmente. 
-        // Si el backend no ha actualizado la base de datos para recibir 'notification_email',
-        // enviar esto causa que explote y de "Error de Red".
-        // notification_email: email.trim() || undefined, 
+        vertical: vertical,
+        description: description.trim() || "",
+        notification_email: email.trim() || null, 
         timezone: timezone || DEFAULT_TZ,
       };
        
       const normalized = normalizePhone(phone);
       if (normalized) payload.phone = normalized;
 
-      console.log("Enviando payload:", payload); // Para depurar en consola
+      console.log("Enviando payload a la nueva ruta:", payload);
 
-      const r = await fetch("/api/admin/new-business", {
+      // CAMBIO CLAVE: Ahora apunta a /create-tenant para evitar el caché viejo
+      const r = await fetch("/api/admin/create-tenant", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
@@ -70,7 +68,6 @@ export default function NewTenantPage() {
 
       // Si el servidor devuelve error (500, 404, etc)
       if (!r.ok) {
-        // Intentamos leer el mensaje de error del servidor
         const errorText = await r.text();
         console.error("Error del servidor:", errorText);
         throw new Error(`El servidor rechazó la solicitud (${r.status}). Revisa la consola.`);
@@ -90,7 +87,6 @@ export default function NewTenantPage() {
 
     } catch (e: any) {
       console.error("Error al crear:", e);
-      // Aquí mostramos el error real
       alert("No se pudo guardar: " + (e.message || "Error de conexión"));
     } finally {
       setLoading(false);
