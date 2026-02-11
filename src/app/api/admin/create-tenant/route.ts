@@ -1,4 +1,3 @@
-// src/app/api/admin/create-tenant/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
@@ -20,7 +19,6 @@ export async function POST(req: Request) {
   }
 
   try {
-    // 2) Env vars (TRIM para Render)
     const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL || "").trim();
     const anonKey = (process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "").trim();
     const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
@@ -37,24 +35,25 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3) Auth (cookie-based) — leer cookies sin tocar body
-    // Next 15: cookies() puede ser async en algunos targets -> usar await.
+    // 2) Cookies store (Next 15 puede tiparlo async → await)
     const cookieStore = await cookies();
 
+    // 3) Auth con SSR client SIN getAll (para evitar el conflicto TS)
     const supabaseAuth = createServerClient(supabaseUrl, anonKey, {
       cookies: {
-        getAll() {
-          return cookieStore.getAll();
+        get(name: string) {
+          return cookieStore.get(name)?.value;
         },
-        // No necesitamos setAll para solo validar sesión.
-        setAll() {},
+        set(name: string, value: string, options: any) {
+          cookieStore.set({ name, value, ...options });
+        },
+        remove(name: string, options: any) {
+          cookieStore.set({ name, value: "", ...options });
+        },
       },
     });
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabaseAuth.auth.getUser();
+    const { data: { user }, error: authError } = await supabaseAuth.auth.getUser();
 
     if (authError || !user) {
       return NextResponse.json(
@@ -104,7 +103,7 @@ export async function POST(req: Request) {
       console.error("⚠️ Error real en DB (tenant_members):", memberErr);
     }
 
-    // 7) Set cookie correctamente EN LA RESPUESTA
+    // 7) Set cookie en la RESPUESTA (lo más confiable)
     const res = NextResponse.json({ ok: true, tenantId: tenant.id });
     res.cookies.set("pyme.active_tenant", tenant.id, {
       path: "/",
