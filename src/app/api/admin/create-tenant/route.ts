@@ -1,3 +1,4 @@
+// src/app/api/admin/create-tenant/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
@@ -7,32 +8,24 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
-  /**
-   * PASO 1: LEER EL BODY DE INMEDIATO
-   * Es vital que esta sea la PRIMERA acción para que el stream de datos
-   * no sea bloqueado por el middleware o el cliente de autenticación.
-   */
+  // --- PASO 1: LEER EL BODY DE PRIMERO ---
+  // Esto es lo más importante para evitar el error "disturbed or locked"
   let body: any;
   try {
     body = await req.json();
   } catch (e) {
-    return NextResponse.json({ error: "Cuerpo de petición inválido o vacío" }, { status: 400 });
+    return NextResponse.json({ error: "Cuerpo de petición inválido" }, { status: 400 });
   }
 
   try {
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-    const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
     const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
-    /**
-     * PASO 2: VALIDAR AUTENTICACIÓN
-     * Ahora que ya tenemos los datos en la variable 'body', podemos inicializar
-     * Supabase sin miedo a que bloquee la petición original.
-     */
+    // --- PASO 2: AUTENTICACIÓN (Ahora que el body está seguro en una variable) ---
     const cookieStore = await cookies();
     const supabase = createServerClient(
       supabaseUrl,
-      supabaseAnonKey,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
       {
         cookies: {
           get(name: string) { return cookieStore.get(name)?.value; },
@@ -43,22 +36,18 @@ export async function POST(req: Request) {
     );
 
     const { data: { user }, error: authError } = await supabase.auth.getUser();
-    
     if (authError || !user) {
-      return NextResponse.json({ error: "Sesión no válida o expirada" }, { status: 401 });
+      return NextResponse.json({ error: "No autorizado o sesión expirada" }, { status: 401 });
     }
 
-    /**
-     * PASO 3: INSERTAR EN BASE DE DATOS
-     * Usamos sbAdmin (Service Role) para asegurar permisos de escritura totales.
-     */
+    // --- PASO 3: INSERCIÓN CON SERVICE ROLE (Bypass RLS) ---
     const sbAdmin = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false }
     });
 
-    // Preparamos el objeto con todas las columnas (incluyendo las nuevas que creaste)
+    // Construimos el payload exacto con las columnas que agregaste en la DB
     const tenantPayload = {
-      name: body.name.trim(),
+      name: (body.name || "Sin Nombre").trim(),
       timezone: body.timezone || "America/Santo_Domingo",
       phone: body.phone || null,
       status: "active",
@@ -67,7 +56,7 @@ export async function POST(req: Request) {
       notification_email: body.notification_email || null
     };
 
-    // 1. Crear el negocio en la tabla 'tenants'
+    // 1. Crear Negocio
     const { data: tenant, error: insErr } = await sbAdmin
       .from("tenants")
       .insert(tenantPayload)
@@ -75,11 +64,11 @@ export async function POST(req: Request) {
       .single();
 
     if (insErr) {
-      console.error("❌ Error Supabase (tenants):", insErr.message);
-      return NextResponse.json({ error: `Error DB: ${insErr.message}` }, { status: 500 });
+      console.error("❌ Error en tenants:", insErr.message);
+      return NextResponse.json({ error: `Base de datos: ${insErr.message}` }, { status: 500 });
     }
 
-    // 2. Crear la relación de membresía como 'owner'
+    // 2. Crear relación de dueño
     const { error: memberErr } = await sbAdmin
       .from("tenant_members")
       .insert({ 
@@ -89,23 +78,21 @@ export async function POST(req: Request) {
       });
 
     if (memberErr) {
-      console.error("⚠️ Error al crear miembro (no crítico):", memberErr.message);
+      console.error("⚠️ Error en miembros:", memberErr.message);
+      // No devolvemos 500 aquí para que el usuario pueda entrar al dashboard
     }
 
-    /**
-     * PASO 4: FINALIZAR
-     * Establecemos la cookie del negocio activo y retornamos éxito.
-     */
+    // 3. Setear cookie de negocio activo
     cookieStore.set("pyme.active_tenant", tenant.id, { 
-      path: "/",
-      maxAge: 31536000, // 1 año
-      sameSite: "lax"
+      path: "/", 
+      maxAge: 31536000, 
+      sameSite: "lax" 
     });
 
     return NextResponse.json({ ok: true, tenantId: tenant.id });
 
   } catch (error: any) {
-    console.error("🔥 Crash crítico en el servidor:", error.message);
+    console.error("🔥 Error crítico:", error.message);
     return NextResponse.json({ error: "Error interno del servidor" }, { status: 500 });
   }
 }
