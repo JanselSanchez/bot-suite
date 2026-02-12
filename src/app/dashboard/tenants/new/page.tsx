@@ -54,7 +54,7 @@ export default function NewTenantPage() {
       console.log("Enviando payload a la nueva ruta:", payload);
 
       // CAMBIO CLAVE: Ahora apunta a /create-tenant para evitar el caché viejo
-      const r = await fetch("/api/admin/create-tenant", {
+      const r = await fetch("/api/admin/create-tenants", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
