@@ -1,95 +1,142 @@
-// src/app/api/admin/metrics/route.ts
-import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET(req: Request) {
+type MetricsResponse = {
+  ok: boolean;
+  tenantId?: string;
+  metrics?: {
+    bookingsToday: number;
+    bookingsUpcoming: number;
+  };
+  error?: string;
+  detail?: any;
+};
+
+function getTenantId(req: Request) {
   const url = new URL(req.url);
-  const tenantId = url.searchParams.get("tenantId")?.trim();
+  const q = url.searchParams.get("tenantId")?.trim();
+  if (q) return q;
 
-  if (!tenantId) {
-    return NextResponse.json(
-      { ok: false, error: "tenantId required" },
-      { status: 400 }
-    );
-  }
+  const h = req.headers.get("x-tenant-id")?.trim();
+  if (h) return h;
 
-  const sb = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!, // SERVICE ROLE (server only)
-    { auth: { persistSession: false } }
-  );
+  return "";
+}
 
+function logSbError(tag: string, err: any) {
+  // Supabase PostgrestError normalmente trae: message, details, hint, code
+  console.error(tag, {
+    message: err?.message ?? "",
+    code: err?.code ?? "",
+    details: err?.details ?? "",
+    hint: err?.hint ?? "",
+    status: err?.status ?? "",
+    name: err?.name ?? "",
+  });
+}
+
+export async function GET(req: Request) {
+  // 🔒 Nunca leer body aquí: nada de req.json()/req.text()
   try {
-    // Ejecutamos todo en paralelo
-    const [
-      bookingsCountRes,
-      tenantsCountRes,
-      messagesCountRes,
-      recentRes,
-    ] = await Promise.all([
-      sb
-        .from("bookings")
-        .select("id", { count: "exact", head: true })
-        .eq("tenant_id", tenantId),
-      sb
-        .from("tenants")
-        .select("id", { count: "exact", head: true }),
-      sb
-        .from("messages")
-        .select("id", { count: "exact", head: true })
-        .eq("tenant_id", tenantId), // ← si quieres global, elimina esta línea
-      sb
-        .from("bookings")
-        .select("id, customer_name, created_at")
-        .eq("tenant_id", tenantId)
-        .order("created_at", { ascending: false })
-        .limit(5),
-    ]);
+    const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL || "").trim();
+    const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
-    const eBk = bookingsCountRes.error;
-    const eTen = tenantsCountRes.error;
-    const eMsg = messagesCountRes.error;
-    const eRecent = recentRes.error;
-
-    if (eBk || eTen || eMsg || eRecent) {
-      console.error("[/api/admin/metrics] ERR", {
-        tenantId,
-        eBk: eBk?.message,
-        eTen: eTen?.message,
-        eMsg: eMsg?.message,
-        eRecent: eRecent?.message,
+    if (!supabaseUrl || !serviceRoleKey) {
+      console.error("[/api/admin/metrics] ENV_MISSING", {
+        hasUrl: !!supabaseUrl,
+        hasService: !!serviceRoleKey,
       });
+      return Response.json({ ok: false, error: "ENV_MISSING" } satisfies MetricsResponse, { status: 500 });
     }
 
-    const recent =
-      (recentRes.data ?? []).map((b: any) => ({
-        id: b.id,
-        title: `Nueva cita ${
-          b.customer_name ? `de ${b.customer_name}` : `#${String(b.id).slice(0, 6)}`
-        }`,
-        created_at: b.created_at as string,
-      })) ?? [];
+    const tenantId = getTenantId(req);
+    if (!tenantId) {
+      return Response.json({ ok: false, error: "tenantId required" } satisfies MetricsResponse, { status: 400 });
+    }
 
-    return NextResponse.json(
+    const sb = createClient(supabaseUrl, serviceRoleKey, {
+      auth: { persistSession: false },
+    });
+
+    const now = new Date();
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
+
+    const isoNow = now.toISOString();
+    const isoStart = start.toISOString();
+
+    // ✅ bookingsToday (solo count)
+    const bookingsTodayRes = await sb
+      .from("bookings")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenantId)
+      .gte("start_at", isoStart)
+      .lte("start_at", isoNow);
+
+    if (bookingsTodayRes.error) {
+      logSbError("[/api/admin/metrics] bookingsToday error", bookingsTodayRes.error);
+      // 🔥 NO devolver el error crudo; devolver strings
+      return Response.json(
+        {
+          ok: false,
+          tenantId,
+          error: "DB_ERROR_BOOKINGS_TODAY",
+          detail: {
+            message: bookingsTodayRes.error.message ?? "",
+            code: (bookingsTodayRes.error as any).code ?? "",
+            details: (bookingsTodayRes.error as any).details ?? "",
+            hint: (bookingsTodayRes.error as any).hint ?? "",
+          },
+        } satisfies MetricsResponse,
+        { status: 500 }
+      );
+    }
+
+    // ✅ upcoming
+    const upcomingRes = await sb
+      .from("bookings")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenantId)
+      .gte("start_at", isoNow);
+
+    if (upcomingRes.error) {
+      logSbError("[/api/admin/metrics] upcoming error", upcomingRes.error);
+      return Response.json(
+        {
+          ok: false,
+          tenantId,
+          error: "DB_ERROR_UPCOMING",
+          detail: {
+            message: upcomingRes.error.message ?? "",
+            code: (upcomingRes.error as any).code ?? "",
+            details: (upcomingRes.error as any).details ?? "",
+            hint: (upcomingRes.error as any).hint ?? "",
+          },
+        } satisfies MetricsResponse,
+        { status: 500 }
+      );
+    }
+
+    return Response.json(
       {
         ok: true,
-        totals: {
-          bookings: bookingsCountRes.count ?? 0, // bookings del tenant
-          tenants: tenantsCountRes.count ?? 0,   // total de tenants (global)
-          messages: messagesCountRes.count ?? 0, // mensajes del tenant (o global si quitas eq)
+        tenantId,
+        metrics: {
+          bookingsToday: bookingsTodayRes.count ?? 0,
+          bookingsUpcoming: upcomingRes.count ?? 0,
         },
-        recent,
-      },
-      { headers: { "cache-control": "no-store" } }
+      } satisfies MetricsResponse,
+      { status: 200 }
     );
   } catch (e: any) {
-    console.error("[/api/admin/metrics] fatal", e);
-    return NextResponse.json(
-      { ok: false, error: e?.message ?? "Unexpected error" },
-      { status: 500 }
-    );
+    console.error("[/api/admin/metrics] FATAL", {
+      message: e?.message,
+      name: e?.name,
+      stack: e?.stack,
+    });
+
+    return Response.json({ ok: false, error: "internal_error" } satisfies MetricsResponse, { status: 500 });
   }
 }
