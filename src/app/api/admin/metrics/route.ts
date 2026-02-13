@@ -1,5 +1,3 @@
-import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
 import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
@@ -11,35 +9,36 @@ type MetricsResponse = {
   metrics?: {
     bookingsToday: number;
     bookingsUpcoming: number;
-    messages24h: number;
-    customersTotal: number;
   };
   error?: string;
   detail?: any;
 };
 
-function pickTenantId(req: Request, cookieStore: Awaited<ReturnType<typeof cookies>>) {
+function getTenantId(req: Request) {
   const url = new URL(req.url);
+  const q = url.searchParams.get("tenantId")?.trim();
+  if (q) return q;
 
-  // 1) query ?tenantId=
-  const q = url.searchParams.get("tenantId");
-  if (q && q.trim()) return q.trim();
-
-  // 2) header x-tenant-id
-  const h = req.headers.get("x-tenant-id");
-  if (h && h.trim()) return h.trim();
-
-  // 3) cookie activa
-  const c = cookieStore.get("pyme.active_tenant")?.value;
-  if (c && c.trim()) return c.trim();
+  const h = req.headers.get("x-tenant-id")?.trim();
+  if (h) return h;
 
   return "";
 }
 
-export async function GET(req: Request) {
-  // ⚠️ IMPORTANTE: NO LEER body aquí. Nada de req.json()/req.text() en metrics.
-  const cookieStore = await cookies();
+function logSbError(tag: string, err: any) {
+  // Supabase PostgrestError normalmente trae: message, details, hint, code
+  console.error(tag, {
+    message: err?.message ?? "",
+    code: err?.code ?? "",
+    details: err?.details ?? "",
+    hint: err?.hint ?? "",
+    status: err?.status ?? "",
+    name: err?.name ?? "",
+  });
+}
 
+export async function GET(req: Request) {
+  // 🔒 Nunca leer body aquí: nada de req.json()/req.text()
   try {
     const supabaseUrl = (process.env.NEXT_PUBLIC_SUPABASE_URL || "").trim();
     const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
@@ -49,55 +48,53 @@ export async function GET(req: Request) {
         hasUrl: !!supabaseUrl,
         hasService: !!serviceRoleKey,
       });
-
-      return NextResponse.json(
-        { ok: false, error: "Error servidor (env)" } satisfies MetricsResponse,
-        { status: 500 }
-      );
+      return Response.json({ ok: false, error: "ENV_MISSING" } satisfies MetricsResponse, { status: 500 });
     }
 
-    const tenantId = pickTenantId(req, cookieStore);
-
+    const tenantId = getTenantId(req);
     if (!tenantId) {
-      return NextResponse.json(
-        { ok: false, error: "tenantId required" } satisfies MetricsResponse,
-        { status: 400 }
-      );
+      return Response.json({ ok: false, error: "tenantId required" } satisfies MetricsResponse, { status: 400 });
     }
 
     const sb = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false },
     });
 
-    // Fechas para métricas simples
     const now = new Date();
-    const startOfToday = new Date(now);
-    startOfToday.setHours(0, 0, 0, 0);
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
 
     const isoNow = now.toISOString();
-    const isoStartToday = startOfToday.toISOString();
+    const isoStart = start.toISOString();
 
-    const dayAgo = new Date(now);
-    dayAgo.setHours(now.getHours() - 24);
-    const isoDayAgo = dayAgo.toISOString();
-
-    // 1) Bookings de hoy
+    // ✅ bookingsToday (solo count)
     const bookingsTodayRes = await sb
       .from("bookings")
       .select("id", { count: "exact", head: true })
       .eq("tenant_id", tenantId)
-      .gte("start_at", isoStartToday)
+      .gte("start_at", isoStart)
       .lte("start_at", isoNow);
 
     if (bookingsTodayRes.error) {
-      console.error("[/api/admin/metrics] bookingsToday error", bookingsTodayRes.error);
-      return NextResponse.json(
-        { ok: false, tenantId, error: "db_error", detail: bookingsTodayRes.error } satisfies MetricsResponse,
+      logSbError("[/api/admin/metrics] bookingsToday error", bookingsTodayRes.error);
+      // 🔥 NO devolver el error crudo; devolver strings
+      return Response.json(
+        {
+          ok: false,
+          tenantId,
+          error: "DB_ERROR_BOOKINGS_TODAY",
+          detail: {
+            message: bookingsTodayRes.error.message ?? "",
+            code: (bookingsTodayRes.error as any).code ?? "",
+            details: (bookingsTodayRes.error as any).details ?? "",
+            hint: (bookingsTodayRes.error as any).hint ?? "",
+          },
+        } satisfies MetricsResponse,
         { status: 500 }
       );
     }
 
-    // 2) Bookings próximos (desde ahora)
+    // ✅ upcoming
     const upcomingRes = await sb
       .from("bookings")
       .select("id", { count: "exact", head: true })
@@ -105,59 +102,41 @@ export async function GET(req: Request) {
       .gte("start_at", isoNow);
 
     if (upcomingRes.error) {
-      console.error("[/api/admin/metrics] upcoming error", upcomingRes.error);
-      return NextResponse.json(
-        { ok: false, tenantId, error: "db_error", detail: upcomingRes.error } satisfies MetricsResponse,
+      logSbError("[/api/admin/metrics] upcoming error", upcomingRes.error);
+      return Response.json(
+        {
+          ok: false,
+          tenantId,
+          error: "DB_ERROR_UPCOMING",
+          detail: {
+            message: upcomingRes.error.message ?? "",
+            code: (upcomingRes.error as any).code ?? "",
+            details: (upcomingRes.error as any).details ?? "",
+            hint: (upcomingRes.error as any).hint ?? "",
+          },
+        } satisfies MetricsResponse,
         { status: 500 }
       );
     }
 
-    // 3) Mensajes últimas 24h (ajusta el nombre de tabla/columna si difiere)
-    // Si tu tabla se llama diferente, cámbiala aquí: messages / conversation_messages / inbound_messages, etc.
-    const messages24hRes = await sb
-      .from("messages")
-      .select("id", { count: "exact", head: true })
-      .eq("tenant_id", tenantId)
-      .gte("created_at", isoDayAgo);
-
-    // Nota: si "messages" no existe, esto te lo dirá con error real y ya sabremos el nombre correcto.
-    if (messages24hRes.error) {
-      console.error("[/api/admin/metrics] messages24h error", messages24hRes.error);
-      // No tumbemos todo: devolvemos 0 pero dejamos el error logueado para corregir tabla real.
-    }
-
-    // 4) Clientes totales (ajusta a tu tabla real: customers/clients/leads)
-    const customersTotalRes = await sb
-      .from("customers")
-      .select("id", { count: "exact", head: true })
-      .eq("tenant_id", tenantId);
-
-    if (customersTotalRes.error) {
-      console.error("[/api/admin/metrics] customersTotal error", customersTotalRes.error);
-      // Igual que arriba: no tumbar todo si la tabla se llama distinto.
-    }
-
-    const data: MetricsResponse = {
-      ok: true,
-      tenantId,
-      metrics: {
-        bookingsToday: bookingsTodayRes.count ?? 0,
-        bookingsUpcoming: upcomingRes.count ?? 0,
-        messages24h: messages24hRes.count ?? 0,
-        customersTotal: customersTotalRes.count ?? 0,
-      },
-    };
-
-    return NextResponse.json(data, { status: 200 });
+    return Response.json(
+      {
+        ok: true,
+        tenantId,
+        metrics: {
+          bookingsToday: bookingsTodayRes.count ?? 0,
+          bookingsUpcoming: upcomingRes.count ?? 0,
+        },
+      } satisfies MetricsResponse,
+      { status: 200 }
+    );
   } catch (e: any) {
     console.error("[/api/admin/metrics] FATAL", {
       message: e?.message,
+      name: e?.name,
       stack: e?.stack,
     });
 
-    return NextResponse.json(
-      { ok: false, error: "internal_error", detail: String(e?.message || e) } satisfies MetricsResponse,
-      { status: 500 }
-    );
+    return Response.json({ ok: false, error: "internal_error" } satisfies MetricsResponse, { status: 500 });
   }
 }
