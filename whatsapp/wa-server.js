@@ -55,18 +55,36 @@ const jsonParser = express.json({ limit: "20mb" });
 // MIDDLEWARES DE RUTAS (CORREGIDO PARA LOGIN)
 // ---------------------------------------------------------------------
 
-// ✅ FIX REAL (sin quitar nada del original):
-// En tu archivo estabas aplicando jsonParser a /api en 2 lugares (arriba y abajo).
-// Eso puede provocar "double parse" y dejar requests en pending / romper el stream.
-// Solución: mantenemos tus 2 app.use("/api"...), pero hacemos el parser idempotente
-// (se ejecuta 1 sola vez por request) usando una bandera interna.
-function guardedJsonParser(req, res, next) {
-  // bandera para evitar doble parse si el middleware se registra 2 veces
+// ✅ FIX DEFINITIVO (sin quitar nada del original):
+// /api pertenece a Next.js (Route Handlers / Auth callbacks / etc).
+// Si Express intenta parsear body ahí, puede dejar requests pending o romper el stream.
+// Solución: mantener tus app.use("/api"...), pero hacer el parser CONDICIONAL:
+// - Solo parsea cuando: method != GET/HEAD, content-type json, y NO es ruta de auth.
+// - En todo lo demás, Next maneja el request completo.
+function shouldParseJson(req) {
+  const method = (req.method || "GET").toUpperCase();
+  if (method === "GET" || method === "HEAD") return false;
+
+  const ct = String(req.headers["content-type"] || "").toLowerCase();
+  if (!ct.includes("application/json")) return false;
+
+  // No tocar auth (Supabase helpers / callbacks) aunque sean /api/*
+  // (y por seguridad también /auth directo si lo tuvieras)
+  const p = String(req.path || "");
+  if (p.startsWith("/auth")) return false;
+
+  return true;
+}
+
+function conditionalJsonParser(req, res, next) {
+  // bandera idempotente por si el middleware está registrado 2 veces (como en tu archivo)
   if (req.__pymebot_json_parsed) return next();
   req.__pymebot_json_parsed = true;
 
-  // si ya hay body parseado por otro middleware, no vuelvas a parsear
-  // (Express suele setear req.body cuando ya está listo)
+  // si no aplica, que Next controle el request
+  if (!shouldParseJson(req)) return next();
+
+  // si ya está parseado por algo, no lo vuelvas a leer
   if (req.body !== undefined) return next();
 
   return jsonParser(req, res, next);
@@ -81,8 +99,8 @@ app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) {
     return next();
   }
-  // ⬇️ CORRECCIÓN: usar parser con guard para evitar doble parse
-  guardedJsonParser(req, res, next);
+  // ✅ CORRECCIÓN: parser condicional (NO rompe Next)
+  conditionalJsonParser(req, res, next);
 });
 
 app.use("/health", jsonParser);
@@ -109,18 +127,10 @@ const logger = P({
   },
 });
 
-// ✅ FIX SUAVE (sin quitar nada): log útil si faltan envs
-const SUPABASE_URL =
-  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || null;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || null;
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn(
-    "[wa-server] ⚠️ Supabase env faltante. Revisa SUPABASE_URL/NEXT_PUBLIC_SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY."
-  );
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(
+  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // OpenAI con fallback
 const openaiApiKey =
@@ -152,8 +162,7 @@ const WA_SESSIONS_ROOT =
   process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
 
 try {
-  if (!fs.existsSync(WA_SESSIONS_ROOT))
-    fs.mkdirSync(WA_SESSIONS_ROOT, { recursive: true });
+  if (!fs.existsSync(WA_SESSIONS_ROOT)) fs.mkdirSync(WA_SESSIONS_ROOT, { recursive: true });
 } catch (e) {
   console.error("[wa-server] No pude crear WA_SESSIONS_ROOT:", WA_SESSIONS_ROOT, e);
 }
@@ -379,9 +388,7 @@ function parseLocalDateTimeToDate(dateStr, timeStr) {
   let hh = 9;
   let mm = 0;
   if (t) {
-    const match =
-      t.match(/(\d{1,2})\s*:\s*(\d{2})\s*(AM|PM)?/i) ||
-      t.match(/(\d{1,2})\s*(AM|PM)/i);
+    const match = t.match(/(\d{1,2})\s*:\s*(\d{2})\s*(AM|PM)?/i) || t.match(/(\d{1,2})\s*(AM|PM)/i);
     if (match) {
       hh = Number(match[1]);
       mm = match[2] ? Number(match[2]) : 0;
@@ -509,8 +516,7 @@ async function buildIntentHints(tenantId, userText) {
         row.locale &&
         normalizeForIntent(row.locale) !== normalizeForIntent("es-DO") &&
         normalizeForIntent(row.locale) !== normalizeForIntent("es")
-      )
-        continue;
+      ) continue;
 
       if (row.es_error) continue;
 
@@ -767,13 +773,15 @@ INSTRUCCIONES:
             const listText = slotObjects.map((s) => s.label).join("\n");
 
             response = JSON.stringify({
-              message: "Aquí tienes los horarios disponibles. Elige un número.",
+              message:
+                "Aquí tienes los horarios disponibles. Elige un número.",
               slots: slotObjects,
               plain_list: listText,
             });
           } else {
             response = JSON.stringify({
-              message: "No hay horarios disponibles para esa fecha. Intenta otro día.",
+              message:
+                "No hay horarios disponibles para esa fecha. Intenta otro día.",
               slots: [],
             });
           }
@@ -794,7 +802,8 @@ INSTRUCCIONES:
             response = JSON.stringify({ catalog: list });
           } else {
             response = JSON.stringify({
-              message: "El catálogo está vacío en el sistema.",
+              message:
+                "El catálogo está vacío en el sistema.",
             });
           }
         } else if (fnName === "create_booking") {
@@ -1692,9 +1701,8 @@ app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) {
     return next();
   }
-  // ⬇️ CORRECCIÓN: mismo guard aquí para que este segundo app.use("/api"...)
-  // no vuelva a parsear y no rompa Next.js.
-  guardedJsonParser(req, res, next);
+  // ✅ CORRECCIÓN: mismo parser condicional aquí (tu archivo lo declara 2 veces, lo respetamos)
+  conditionalJsonParser(req, res, next);
 });
 
 // Sin ruta para evitar error PathError (*)
