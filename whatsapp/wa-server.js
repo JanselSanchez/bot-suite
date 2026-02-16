@@ -52,7 +52,7 @@ const app = express();
 const jsonParser = express.json({ limit: "20mb" });
 
 // ---------------------------------------------------------------------
-// MIDDLEWARES DE RUTAS (CORREGIDO PARA LOGIN)
+// MIDDLEWARES DE RUTAS (CORREGIDO PARA LOGIN + NEXT15 LOCK FIX)
 // ---------------------------------------------------------------------
 
 // ✅ FIX DEFINITIVO (sin quitar nada del original):
@@ -61,6 +61,7 @@ const jsonParser = express.json({ limit: "20mb" });
 // Solución: mantener tus app.use("/api"...), pero hacer el parser CONDICIONAL:
 // - Solo parsea cuando: method != GET/HEAD, content-type json, y NO es ruta de auth.
 // - En todo lo demás, Next maneja el request completo.
+
 function shouldParseJson(req) {
   const method = (req.method || "GET").toUpperCase();
   if (method === "GET" || method === "HEAD") return false;
@@ -69,7 +70,6 @@ function shouldParseJson(req) {
   if (!ct.includes("application/json")) return false;
 
   // No tocar auth (Supabase helpers / callbacks) aunque sean /api/*
-  // (y por seguridad también /auth directo si lo tuvieras)
   const p = String(req.path || "");
   if (p.startsWith("/auth")) return false;
 
@@ -77,7 +77,7 @@ function shouldParseJson(req) {
 }
 
 function conditionalJsonParser(req, res, next) {
-  // bandera idempotente por si el middleware está registrado 2 veces (como en tu archivo)
+  // ✅ idempotente por si el middleware está registrado 2 veces
   if (req.__pymebot_json_parsed) return next();
   req.__pymebot_json_parsed = true;
 
@@ -94,12 +94,11 @@ function conditionalJsonParser(req, res, next) {
 app.use("/sessions", jsonParser);
 
 // ✅ FIX AUTH: Excluimos explícitamente las rutas de Auth de Next.js del parser de Express
-// para evitar que las peticiones se queden en (pending).
+// para evitar que las peticiones se queden en (pending) o "locked".
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) {
     return next();
   }
-  // ✅ CORRECCIÓN: parser condicional (NO rompe Next)
   conditionalJsonParser(req, res, next);
 });
 
@@ -162,7 +161,8 @@ const WA_SESSIONS_ROOT =
   process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
 
 try {
-  if (!fs.existsSync(WA_SESSIONS_ROOT)) fs.mkdirSync(WA_SESSIONS_ROOT, { recursive: true });
+  if (!fs.existsSync(WA_SESSIONS_ROOT))
+    fs.mkdirSync(WA_SESSIONS_ROOT, { recursive: true });
 } catch (e) {
   console.error("[wa-server] No pude crear WA_SESSIONS_ROOT:", WA_SESSIONS_ROOT, e);
 }
@@ -274,13 +274,7 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
 // 2. HELPERS: ICS
 // ---------------------------------------------------------------------
 
-function createICSFile(
-  title,
-  description,
-  location,
-  startDate,
-  durationMinutes = 60
-) {
+function createICSFile(title, description, location, startDate, durationMinutes = 60) {
   const formatTime = (date) =>
     date.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
 
@@ -372,27 +366,26 @@ async function sendICS(sock, remoteJid, icsData, opts = {}) {
 
 // ✅ Parsing robusto de date+time usando offset fijo
 function parseLocalDateTimeToDate(dateStr, timeStr) {
-  // soporta: dateStr "YYYY-MM-DD" y timeStr "HH:mm" o "HH:mmAM/PM" o "3:00 PM"
   const d = String(dateStr || "").trim();
   const t = String(timeStr || "").trim().toUpperCase();
 
   if (!d) return null;
 
-  // Si viene ISO completo ya, úsalo
   if (d.includes("T")) {
     const dt = new Date(d);
     return isNaN(dt.getTime()) ? null : dt;
   }
 
-  // time limpio
   let hh = 9;
   let mm = 0;
   if (t) {
-    const match = t.match(/(\d{1,2})\s*:\s*(\d{2})\s*(AM|PM)?/i) || t.match(/(\d{1,2})\s*(AM|PM)/i);
+    const match =
+      t.match(/(\d{1,2})\s*:\s*(\d{2})\s*(AM|PM)?/i) ||
+      t.match(/(\d{1,2})\s*(AM|PM)/i);
     if (match) {
       hh = Number(match[1]);
       mm = match[2] ? Number(match[2]) : 0;
-      const ampm = match[3] || match[2]; // según regex
+      const ampm = match[3] || match[2];
       const ap = ampm ? String(ampm).toUpperCase() : null;
       if (ap === "PM" && hh < 12) hh += 12;
       if (ap === "AM" && hh === 12) hh = 0;
@@ -408,7 +401,6 @@ function parseLocalDateTimeToDate(dateStr, timeStr) {
   const hh2 = pad2(hh);
   const mm2 = pad2(mm);
 
-  // RD offset fijo
   const iso = `${d}T${hh2}:${mm2}:00${TZ_OFFSET}`;
   const dt = new Date(iso);
   return isNaN(dt.getTime()) ? null : dt;
@@ -509,7 +501,7 @@ async function buildIntentHints(tenantId, userText) {
 
     if (error || !data || data.length === 0) return "";
 
-    const scores = {}; // intent -> { score, terms: Set<string> }
+    const scores = {};
 
     for (const row of data) {
       if (
@@ -773,15 +765,13 @@ INSTRUCCIONES:
             const listText = slotObjects.map((s) => s.label).join("\n");
 
             response = JSON.stringify({
-              message:
-                "Aquí tienes los horarios disponibles. Elige un número.",
+              message: "Aquí tienes los horarios disponibles. Elige un número.",
               slots: slotObjects,
               plain_list: listText,
             });
           } else {
             response = JSON.stringify({
-              message:
-                "No hay horarios disponibles para esa fecha. Intenta otro día.",
+              message: "No hay horarios disponibles para esa fecha. Intenta otro día.",
               slots: [],
             });
           }
@@ -802,8 +792,7 @@ INSTRUCCIONES:
             response = JSON.stringify({ catalog: list });
           } else {
             response = JSON.stringify({
-              message:
-                "El catálogo está vacío en el sistema.",
+              message: "El catálogo está vacío en el sistema.",
             });
           }
         } else if (fnName === "create_booking") {
@@ -859,7 +848,8 @@ INSTRUCCIONES:
                     start
                   );
 
-                  const targetJid = phoneArg.replace(/\D/g, "") + "@s.whatsapp.net";
+                  const targetJid =
+                    phoneArg.replace(/\D/g, "") + "@s.whatsapp.net";
 
                   await session.socket.sendMessage(targetJid, {
                     document: icsBuffer,
@@ -869,7 +859,10 @@ INSTRUCCIONES:
                   });
                 }
               } catch (errICS) {
-                logger.error({ err: errICS }, "Error enviando ICS automático (no crítico)");
+                logger.error(
+                  { err: errICS },
+                  "Error enviando ICS automático (no crítico)"
+                );
               }
 
               response = JSON.stringify({
@@ -898,7 +891,9 @@ INSTRUCCIONES:
             });
           }
         } else if (fnName === "reschedule_booking") {
-          const phoneFilter = String(args.customerPhone || args.phone || userPhone || "").trim();
+          const phoneFilter = String(
+            args.customerPhone || args.phone || userPhone || ""
+          ).trim();
 
           if (!phoneFilter) {
             response = JSON.stringify({ success: false, error: "missing_phone" });
@@ -928,11 +923,16 @@ INSTRUCCIONES:
                 ? JSON.stringify({ success: true, message: "Cita reagendada." })
                 : JSON.stringify({ success: false, error: "db_update_failed" });
             } else {
-              response = JSON.stringify({ success: false, error: "no_active_booking_found" });
+              response = JSON.stringify({
+                success: false,
+                error: "no_active_booking_found",
+              });
             }
           }
         } else if (fnName === "cancel_booking") {
-          const phoneFilter = String(args.customerPhone || args.phone || userPhone || "").trim();
+          const phoneFilter = String(
+            args.customerPhone || args.phone || userPhone || ""
+          ).trim();
 
           if (!phoneFilter) {
             response = JSON.stringify({ success: false, error: "missing_phone" });
@@ -957,7 +957,10 @@ INSTRUCCIONES:
                 ? JSON.stringify({ success: true, message: "Cita cancelada." })
                 : JSON.stringify({ success: false, error: "db_update_failed" });
             } else {
-              response = JSON.stringify({ success: false, error: "no_active_booking_found" });
+              response = JSON.stringify({
+                success: false,
+                error: "no_active_booking_found",
+              });
             }
           }
         } else {
@@ -1239,7 +1242,9 @@ async function getOrCreateSession(tenantId) {
     }
   });
 
-  sock.ev.on("creds.update", async () => { await saveCreds(); });
+  sock.ev.on("creds.update", async () => {
+    await saveCreds();
+  });
 
   sock.ev.on("messages.upsert", async (m) => {
     try {
@@ -1469,13 +1474,19 @@ app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   const { phone, message } = req.body || {};
 
   if (!phone || !message) {
-    return res.status(400).json({ ok: false, error: "missing_fields", detail: "Requiere phone y message" });
+    return res.status(400).json({
+      ok: false,
+      error: "missing_fields",
+      detail: "Requiere phone y message",
+    });
   }
 
   let session = sessions.get(tenantId);
 
   if (!session || session.status !== "connected") {
-    try { session = await getOrCreateSession(tenantId); } catch (e) {}
+    try {
+      session = await getOrCreateSession(tenantId);
+    } catch (e) {}
   }
 
   session = sessions.get(tenantId);
@@ -1503,7 +1514,9 @@ app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
 
   let session = sessions.get(tenantId);
   if (!session || session.status !== "connected") {
-    try { session = await getOrCreateSession(tenantId); } catch (e) {}
+    try {
+      session = await getOrCreateSession(tenantId);
+    } catch (e) {}
   }
 
   session = sessions.get(tenantId);
@@ -1563,7 +1576,9 @@ app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
 
   let session = sessions.get(tenantId);
   if (!session || session.status !== "connected") {
-    try { session = await getOrCreateSession(tenantId); } catch (e) {}
+    try {
+      session = await getOrCreateSession(tenantId);
+    } catch (e) {}
   }
 
   session = sessions.get(tenantId);
@@ -1625,12 +1640,7 @@ app.get("/api/v1/availability", jsonParser, async (req, res) => {
     return res.status(400).json({ error: "Formato de fecha inválido" });
   }
 
-  const slots = await getAvailableSlots(
-    tenantId,
-    resourceId,
-    requestedDate,
-    7
-  );
+  const slots = await getAvailableSlots(tenantId, resourceId, requestedDate, 7);
 
   const sorted = (slots || []).sort((a, b) => a.start.getTime() - b.start.getTime());
 
@@ -1695,32 +1705,41 @@ async function restoreSessions() {
 // 17. FINAL FUSION HANDLER (FIX PARA TODO)
 // ---------------------------------------------------------------------
 
-// 🛑 AQUÍ ESTÁ EL FIX FINAL PARA EL LOGIN:
-// Aseguramos que el parser de JSON no interfiere con las rutas de auth de Next.js
+// 🛑 Mantengo este bloque (lo tenías duplicado). Es idempotente por la bandera.
 app.use("/api", (req, res, next) => {
   if (req.path.startsWith("/auth")) {
     return next();
   }
-  // ✅ CORRECCIÓN: mismo parser condicional aquí (tu archivo lo declara 2 veces, lo respetamos)
   conditionalJsonParser(req, res, next);
 });
 
-// Sin ruta para evitar error PathError (*)
+// ✅ FIX NEXT 15: no usar async/await wrapper aquí (evita “disturbed/locked body”)
 // Next.js ahora sabe dónde encontrar la web gracias a 'dir: projectRoot'
-app.use(async (req, res) => {
-  await handle(req, res);
+app.all("*", (req, res) => {
+  try {
+    return handle(req, res);
+  } catch (e) {
+    logger.error({ err: e }, "[wa-server] Error en handler final de Next");
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      return res.end("Internal Server Error");
+    }
+  }
 });
 
 // 🔥 ENCENDIDO DEL MOTOR HÍBRIDO
-nextApp.prepare().then(() => {
-  app.listen(PORT, (err) => {
-    if (err) throw err;
-    logger.info(`🚀 Servidor FUSIONADO (Bot + Web) escuchando en puerto ${PORT}`);
-    restoreSessions().catch((e) =>
-      logger.error(e, "Error al intentar restaurar sesiones al inicio")
-    );
+nextApp
+  .prepare()
+  .then(() => {
+    app.listen(PORT, (err) => {
+      if (err) throw err;
+      logger.info(`🚀 Servidor FUSIONADO (Bot + Web) escuchando en puerto ${PORT}`);
+      restoreSessions().catch((e) =>
+        logger.error(e, "Error al intentar restaurar sesiones al inicio")
+      );
+    });
+  })
+  .catch((ex) => {
+    console.error(ex.stack);
+    process.exit(1);
   });
-}).catch((ex) => {
-  console.error(ex.stack);
-  process.exit(1);
-});
