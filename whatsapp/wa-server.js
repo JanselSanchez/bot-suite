@@ -1,6 +1,14 @@
 /**
  * wa-server.js — VERSIÓN FINAL CORREGIDA (N8N + NUCLEAR FIX + AUTO-ICS + TEXT IDs)
  *
+ * ✅ FIX #1 (CRASH Render): Express/router nuevo rompe app.all("*") / path-to-regexp
+ *    → NO usamos "*" en rutas. Usamos app.use((req,res)=>handle(req,res)) catch-all.
+ *
+ * ✅ FIX #2 (Next 15 “Response body object should not be disturbed or locked”):
+ *    → Express NO toca /api (Next es dueño de /api). Nada de app.use("/api", jsonParser...).
+ *    → Movimos el availability de Express a /wa/api/v1/availability
+ *    → Dejamos un alias GET /api/v1/availability (SIN parser) para compatibilidad.
+ *
  * ✅ IDs: TODO TEXT (tenantId, customerId, etc.).
  * ✅ CEREBRO: n8n (Prioridad) + OpenAI (Fallback).
  * ✅ CONEXIÓN: Nuclear (Borrado físico de sesión + wait QR/connected).
@@ -13,8 +21,6 @@ require("dotenv").config({ path: ".env.local" });
 require("dotenv").config();
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
-// 🔥 FIX MEMORIA: Forzamos producción explícitamente para evitar caídas
 process.env.NODE_ENV = "production";
 
 const express = require("express");
@@ -25,7 +31,7 @@ const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
-const next = require("next"); // 👈 FUSIÓN: Importamos Next.js
+const next = require("next");
 
 // Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -37,82 +43,48 @@ const convoState = require("./conversationState");
 // CONFIGURACIÓN GLOBAL & NEXT.JS (FIX DIRECTORIO)
 // ---------------------------------------------------------------------
 
-// 🔥 FIX CRÍTICO: Le decimos a Next.js que la web está UNA CARPETA ATRÁS (..)
+// Next app está una carpeta atrás: /whatsapp/wa-server.js -> root del proyecto
 const projectRoot = path.join(__dirname, "..");
-
-// 'dev: false' obliga a usar la versión compilada (Rápida y Ligera)
 const dev = false;
 const nextApp = next({ dev, dir: projectRoot });
 const handle = nextApp.getRequestHandler();
 
 const app = express();
 
-// 🔥 FIX DATOS: NO usamos express.json() global para no romper Next.js
-// Creamos un parser específico para usarlo solo en las rutas del bot.
+// Parser SOLO para endpoints del bot (NO global)
 const jsonParser = express.json({ limit: "20mb" });
 
 // ---------------------------------------------------------------------
-// MIDDLEWARES DE RUTAS (CORREGIDO PARA LOGIN + NEXT15 LOCK FIX)
+// GUARD: aviso si Express 5 (suele causar PathError con "*")
+// ---------------------------------------------------------------------
+try {
+  const expressVersion = require("express/package.json").version;
+  if (String(expressVersion).startsWith("5")) {
+    console.warn(
+      `[wa-server] ⚠️ Detectado express@${expressVersion}. Si ves PathError con rutas, fija express@4.18.2 en package.json.`
+    );
+  }
+} catch {}
+
+// ---------------------------------------------------------------------
+// MIDDLEWARES (IMPORTANTÍSIMO)
 // ---------------------------------------------------------------------
 
-// ✅ FIX DEFINITIVO (sin quitar nada del original):
-// /api pertenece a Next.js (Route Handlers / Auth callbacks / etc).
-// Si Express intenta parsear body ahí, puede dejar requests pending o romper el stream.
-// Solución: mantener tus app.use("/api"...), pero hacer el parser CONDICIONAL:
-// - Solo parsea cuando: method != GET/HEAD, content-type json, y NO es ruta de auth.
-// - En todo lo demás, Next maneja el request completo.
-
-function shouldParseJson(req) {
-  const method = (req.method || "GET").toUpperCase();
-  if (method === "GET" || method === "HEAD") return false;
-
-  const ct = String(req.headers["content-type"] || "").toLowerCase();
-  if (!ct.includes("application/json")) return false;
-
-  // No tocar auth (Supabase helpers / callbacks) aunque sean /api/*
-  const p = String(req.path || "");
-  if (p.startsWith("/auth")) return false;
-
-  return true;
-}
-
-function conditionalJsonParser(req, res, next) {
-  // ✅ idempotente por si el middleware está registrado 2 veces
-  if (req.__pymebot_json_parsed) return next();
-  req.__pymebot_json_parsed = true;
-
-  // si no aplica, que Next controle el request
-  if (!shouldParseJson(req)) return next();
-
-  // si ya está parseado por algo, no lo vuelvas a leer
-  if (req.body !== undefined) return next();
-
-  return jsonParser(req, res, next);
-}
-
-// Aplicamos el parser SOLO a las rutas del Bot
+// ✅ SOLO estas rutas son de Express (bot). Next NO se toca.
+// NO montamos nada en "/api" para no romper Route Handlers / Auth / streams.
 app.use("/sessions", jsonParser);
-
-// ✅ FIX AUTH: Excluimos explícitamente las rutas de Auth de Next.js del parser de Express
-// para evitar que las peticiones se queden en (pending) o "locked".
-app.use("/api", (req, res, next) => {
-  if (req.path.startsWith("/auth")) {
-    return next();
-  }
-  conditionalJsonParser(req, res, next);
-});
-
 app.use("/health", jsonParser);
+// (Si quieres, puedes crear un prefijo /wa para todo lo del bot en el futuro)
 
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
 // Timezone configurable (fallback RD)
 const TIMEZONE_LOCALE = process.env.TIMEZONE_LOCALE || "America/Santo_Domingo";
 
-// ✅ Offset fijo (RD es -04:00 normalmente). Úsalo para parsing ICS robusto.
+// Offset fijo (RD normalmente -04:00). Para parsing ICS robusto.
 const TZ_OFFSET = process.env.TZ_OFFSET || "-04:00";
 
-// Si sigues usando el viejo offset horario para business_hours
+// Si sigues usando offset viejo para business_hours
 const SERVER_OFFSET_HOURS = Number(process.env.SERVER_OFFSET_HOURS || 4);
 
 const logger = P({
@@ -161,8 +133,9 @@ const WA_SESSIONS_ROOT =
   process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
 
 try {
-  if (!fs.existsSync(WA_SESSIONS_ROOT))
+  if (!fs.existsSync(WA_SESSIONS_ROOT)) {
     fs.mkdirSync(WA_SESSIONS_ROOT, { recursive: true });
+  }
 } catch (e) {
   console.error("[wa-server] No pude crear WA_SESSIONS_ROOT:", WA_SESSIONS_ROOT, e);
 }
@@ -175,7 +148,7 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ✅ Espera hasta que esté connected o al menos tenga QR listo
+// Espera hasta que esté connected o al menos tenga QR listo
 async function waitForReady(tenantId, timeoutMs = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -216,7 +189,7 @@ function weeklyOpenWindows(weekStart, businessHours) {
   for (let i = 0; i < 7; i++) {
     const currentDow = currentDayCursor.getDay(); // 0=Dom, 1=Lun...
 
-    const dayConfig = businessHours.find(
+    const dayConfig = (businessHours || []).find(
       (bh) => bh.dow === currentDow && bh.is_closed === false
     );
 
@@ -243,7 +216,7 @@ function weeklyOpenWindows(weekStart, businessHours) {
  */
 function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
   const slots = [];
-  for (const window of openWindows) {
+  for (const window of openWindows || []) {
     let cursor = new Date(window.start);
     const windowEnd = new Date(window.end);
 
@@ -364,13 +337,14 @@ async function sendICS(sock, remoteJid, icsData, opts = {}) {
   return true;
 }
 
-// ✅ Parsing robusto de date+time usando offset fijo
+// Parsing robusto date+time usando offset fijo
 function parseLocalDateTimeToDate(dateStr, timeStr) {
   const d = String(dateStr || "").trim();
   const t = String(timeStr || "").trim().toUpperCase();
 
   if (!d) return null;
 
+  // Si viene ISO completo, úsalo
   if (d.includes("T")) {
     const dt = new Date(d);
     return isNaN(dt.getTime()) ? null : dt;
@@ -378,10 +352,12 @@ function parseLocalDateTimeToDate(dateStr, timeStr) {
 
   let hh = 9;
   let mm = 0;
+
   if (t) {
     const match =
       t.match(/(\d{1,2})\s*:\s*(\d{2})\s*(AM|PM)?/i) ||
       t.match(/(\d{1,2})\s*(AM|PM)/i);
+
     if (match) {
       hh = Number(match[1]);
       mm = match[2] ? Number(match[2]) : 0;
@@ -398,10 +374,7 @@ function parseLocalDateTimeToDate(dateStr, timeStr) {
     }
   }
 
-  const hh2 = pad2(hh);
-  const mm2 = pad2(mm);
-
-  const iso = `${d}T${hh2}:${mm2}:00${TZ_OFFSET}`;
+  const iso = `${d}T${pad2(hh)}:${pad2(mm)}:00${TZ_OFFSET}`;
   const dt = new Date(iso);
   return isNaN(dt.getTime()) ? null : dt;
 }
@@ -421,7 +394,7 @@ async function getTenantContext(tenantId) {
 
     if (!data) return { name: "el negocio", vertical: "general", description: "" };
     return data;
-  } catch (e) {
+  } catch {
     return { name: "el negocio", vertical: "general", description: "" };
   }
 }
@@ -520,9 +493,7 @@ async function buildIntentHints(tenantId, userText) {
 
       if (normalizedUser.includes(normTerm)) {
         const intent = row.intent || "desconocido";
-        if (!scores[intent]) {
-          scores[intent] = { intent, score: 0, terms: new Set() };
-        }
+        if (!scores[intent]) scores[intent] = { intent, score: 0, terms: new Set() };
         const peso = typeof row.peso === "number" ? row.peso : 1;
         scores[intent].score += peso;
         scores[intent].terms.add(term);
@@ -555,8 +526,7 @@ const tools = [
     type: "function",
     function: {
       name: "check_availability",
-      description:
-        "Consulta disponibilidad. Úsalo para ver huecos libres para citas o reservas.",
+      description: "Consulta disponibilidad. Úsalo para ver huecos libres para citas o reservas.",
       parameters: {
         type: "object",
         properties: { requestedDate: { type: "string", description: "Fecha ISO base." } },
@@ -588,8 +558,7 @@ const tools = [
     type: "function",
     function: {
       name: "get_catalog",
-      description:
-        "Consulta el menú, servicios o productos del negocio para dar precios y detalles.",
+      description: "Consulta el menú, servicios o productos del negocio para dar precios y detalles.",
       parameters: { type: "object", properties: {}, required: [] },
     },
   },
@@ -597,8 +566,7 @@ const tools = [
     type: "function",
     function: {
       name: "human_handoff",
-      description:
-        "Úsalo cuando el cliente pida hablar con una persona real o si no sabes la respuesta.",
+      description: "Úsalo cuando el cliente pida hablar con una persona real o si no sabes la respuesta.",
       parameters: { type: "object", properties: {}, required: [] },
     },
   },
@@ -606,8 +574,7 @@ const tools = [
     type: "function",
     function: {
       name: "reschedule_booking",
-      description:
-        "Reagenda una cita activa del cliente usando su teléfono y nueva fecha/hora.",
+      description: "Reagenda una cita activa del cliente usando su teléfono y nueva fecha/hora.",
       parameters: {
         type: "object",
         properties: {
@@ -623,8 +590,7 @@ const tools = [
     type: "function",
     function: {
       name: "cancel_booking",
-      description:
-        "Cancela la última cita activa de un cliente usando su teléfono.",
+      description: "Cancela la última cita activa de un cliente usando su teléfono.",
       parameters: {
         type: "object",
         properties: { customerPhone: { type: "string" } },
@@ -735,16 +701,9 @@ INSTRUCCIONES:
         let response;
 
         if (fnName === "check_availability") {
-          const rawSlots = await getAvailableSlots(
-            tid,
-            null,
-            new Date(args.requestedDate),
-            7
-          );
+          const rawSlots = await getAvailableSlots(tid, null, new Date(args.requestedDate), 7);
 
-          const sortedSlots = (rawSlots || []).sort(
-            (a, b) => a.start.getTime() - b.start.getTime()
-          );
+          const sortedSlots = (rawSlots || []).sort((a, b) => a.start.getTime() - b.start.getTime());
 
           if (sortedSlots.length > 0) {
             const slotObjects = sortedSlots.slice(0, 12).map((s, i) => {
@@ -791,24 +750,17 @@ INSTRUCCIONES:
               .join("\n");
             response = JSON.stringify({ catalog: list });
           } else {
-            response = JSON.stringify({
-              message: "El catálogo está vacío en el sistema.",
-            });
+            response = JSON.stringify({ message: "El catálogo está vacío en el sistema." });
           }
         } else if (fnName === "create_booking") {
           const phoneArg = String(args.phone || userPhone || "").trim();
           const startsISO = String(args.startsAtISO || "").trim();
 
           if (!phoneArg || !startsISO) {
-            response = JSON.stringify({
-              success: false,
-              error: "missing_phone_or_start",
-            });
+            response = JSON.stringify({ success: false, error: "missing_phone_or_start" });
           } else {
             const start = new Date(startsISO);
-            const endISO =
-              args.endsAtISO ||
-              new Date(start.getTime() + 60 * 60000).toISOString();
+            const endISO = args.endsAtISO || new Date(start.getTime() + 60 * 60000).toISOString();
 
             const { data: booking, error } = await supabase
               .from("bookings")
@@ -829,7 +781,7 @@ INSTRUCCIONES:
               .single();
 
             if (!error && booking?.id) {
-              // ✅ AUTO ICS desde servidor (fallback)
+              // AUTO-ICS desde servidor (fallback)
               try {
                 const session = sessions.get(tid);
                 if (session?.status === "connected" && session.socket) {
@@ -848,8 +800,7 @@ INSTRUCCIONES:
                     start
                   );
 
-                  const targetJid =
-                    phoneArg.replace(/\D/g, "") + "@s.whatsapp.net";
+                  const targetJid = phoneArg.replace(/\D/g, "") + "@s.whatsapp.net";
 
                   await session.socket.sendMessage(targetJid, {
                     document: icsBuffer,
@@ -859,17 +810,10 @@ INSTRUCCIONES:
                   });
                 }
               } catch (errICS) {
-                logger.error(
-                  { err: errICS },
-                  "Error enviando ICS automático (no crítico)"
-                );
+                logger.error({ err: errICS }, "Error enviando ICS automático (no crítico)");
               }
 
-              response = JSON.stringify({
-                success: true,
-                bookingId: booking.id,
-                message: "Reserva creada.",
-              });
+              response = JSON.stringify({ success: true, bookingId: booking.id, message: "Reserva creada." });
             } else {
               response = JSON.stringify({
                 success: false,
@@ -881,19 +825,14 @@ INSTRUCCIONES:
         } else if (fnName === "human_handoff") {
           if (humanPhone) {
             const clean = String(humanPhone).replace(/\D/g, "");
-            response = JSON.stringify({
-              message: `Puedes escribir al encargado aquí: https://wa.me/${clean}`,
-            });
+            response = JSON.stringify({ message: `Puedes escribir al encargado aquí: https://wa.me/${clean}` });
           } else {
             response = JSON.stringify({
-              message:
-                "No tengo un número directo configurado. Déjanos tu mensaje y te contactamos.",
+              message: "No tengo un número directo configurado. Déjanos tu mensaje y te contactamos.",
             });
           }
         } else if (fnName === "reschedule_booking") {
-          const phoneFilter = String(
-            args.customerPhone || args.phone || userPhone || ""
-          ).trim();
+          const phoneFilter = String(args.customerPhone || args.phone || userPhone || "").trim();
 
           if (!phoneFilter) {
             response = JSON.stringify({ success: false, error: "missing_phone" });
@@ -910,9 +849,7 @@ INSTRUCCIONES:
 
             if (booking?.id) {
               const newStart = args.newStartsAtISO;
-              const newEnd =
-                args.newEndsAtISO ||
-                new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
+              const newEnd = args.newEndsAtISO || new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
 
               const { error } = await supabase
                 .from("bookings")
@@ -923,16 +860,11 @@ INSTRUCCIONES:
                 ? JSON.stringify({ success: true, message: "Cita reagendada." })
                 : JSON.stringify({ success: false, error: "db_update_failed" });
             } else {
-              response = JSON.stringify({
-                success: false,
-                error: "no_active_booking_found",
-              });
+              response = JSON.stringify({ success: false, error: "no_active_booking_found" });
             }
           }
         } else if (fnName === "cancel_booking") {
-          const phoneFilter = String(
-            args.customerPhone || args.phone || userPhone || ""
-          ).trim();
+          const phoneFilter = String(args.customerPhone || args.phone || userPhone || "").trim();
 
           if (!phoneFilter) {
             response = JSON.stringify({ success: false, error: "missing_phone" });
@@ -948,19 +880,13 @@ INSTRUCCIONES:
               .maybeSingle();
 
             if (booking?.id) {
-              const { error } = await supabase
-                .from("bookings")
-                .update({ status: "cancelled" })
-                .eq("id", booking.id);
+              const { error } = await supabase.from("bookings").update({ status: "cancelled" }).eq("id", booking.id);
 
               response = !error
                 ? JSON.stringify({ success: true, message: "Cita cancelada." })
                 : JSON.stringify({ success: false, error: "db_update_failed" });
             } else {
-              response = JSON.stringify({
-                success: false,
-                error: "no_active_booking_found",
-              });
+              response = JSON.stringify({ success: false, error: "no_active_booking_found" });
             }
           }
         } else {
@@ -979,6 +905,7 @@ INSTRUCCIONES:
         model: "gpt-4o-mini",
         messages,
       });
+
       return finalReply.choices[0].message.content.trim();
     }
 
@@ -1010,35 +937,18 @@ async function updateSessionDB(tenantId, updateData) {
     }
 
     if (existing) {
-      const { error: updateError } = await supabase
-        .from("whatsapp_sessions")
-        .update(updateData)
-        .eq("tenant_id", tid);
-
-      if (updateError) {
-        console.error("[updateSessionDB] Error update whatsapp_sessions:", updateError);
-      }
+      const { error: updateError } = await supabase.from("whatsapp_sessions").update(updateData).eq("tenant_id", tid);
+      if (updateError) console.error("[updateSessionDB] Error update whatsapp_sessions:", updateError);
     } else {
       const row = { tenant_id: tid, ...updateData };
-      const { error: insertError } = await supabase
-        .from("whatsapp_sessions")
-        .insert([row]);
-
-      if (insertError) {
-        console.error("[updateSessionDB] Error insert whatsapp_sessions:", insertError);
-      }
+      const { error: insertError } = await supabase.from("whatsapp_sessions").insert([row]);
+      if (insertError) console.error("[updateSessionDB] Error insert whatsapp_sessions:", insertError);
     }
 
     if (updateData.status) {
       const isConnected = updateData.status === "connected";
-      const { error: tenantError } = await supabase
-        .from("tenants")
-        .update({ wa_connected: isConnected })
-        .eq("id", tid);
-
-      if (tenantError) {
-        console.error("[updateSessionDB] Error update tenants.wa_connected:", tenantError);
-      }
+      const { error: tenantError } = await supabase.from("tenants").update({ wa_connected: isConnected }).eq("id", tid);
+      if (tenantError) console.error("[updateSessionDB] Error update tenants.wa_connected:", tenantError);
     }
   } catch (e) {
     console.error("[updateSessionDB] Error inesperado:", e);
@@ -1094,21 +1004,15 @@ function buildBookingEventFromMessage(text, session) {
     return { type: "CANCEL_FLOW" };
   }
 
-  if (!currentFlow) {
-    return { type: "START_BOOKING" };
-  }
+  if (!currentFlow) return { type: "START_BOOKING" };
 
   if (currentFlow === "BOOKING") {
     if (step === "SELECT_SERVICE") {
       let serviceId = null;
 
-      if (lower.includes("corte") && lower.includes("barba")) {
-        serviceId = "service_corte_barba";
-      } else if (lower.includes("corte")) {
-        serviceId = "service_corte";
-      } else if (lower.includes("barba")) {
-        serviceId = "service_barba";
-      }
+      if (lower.includes("corte") && lower.includes("barba")) serviceId = "service_corte_barba";
+      else if (lower.includes("corte")) serviceId = "service_corte";
+      else if (lower.includes("barba")) serviceId = "service_barba";
 
       return { type: "SERVICE_PROVIDED", serviceId };
     }
@@ -1215,7 +1119,7 @@ async function getOrCreateSession(tenantId) {
       info.qr = null;
 
       logger.info({ tenantId: tid }, "✅ Conectado");
-      let phone = sock?.user?.id ? sock.user.id.split(":")[0] : null;
+      const phone = sock?.user?.id ? sock.user.id.split(":")[0] : null;
 
       await updateSessionDB(tid, {
         status: "connected",
@@ -1322,10 +1226,7 @@ async function getOrCreateSession(tenantId) {
           if (replyText) logger.info({ tenantId: tid }, "[wa-server] ✅ Respuesta recibida desde n8n");
           else logger.warn({ tenantId: tid, d }, "[wa-server] ⚠️ n8n respondió pero sin texto usable");
         } catch (err) {
-          logger.error(
-            "[wa-server] Error al llamar a n8n:",
-            err?.response?.data || err.message
-          );
+          logger.error("[wa-server] Error al llamar a n8n:", err?.response?.data || err.message);
         }
       }
 
@@ -1357,7 +1258,7 @@ async function getOrCreateSession(tenantId) {
 
       await sock.sendMessage(remoteJid, { text: replyText });
 
-      // ✅ Si n8n mandó icsData, lo mandamos también
+      // Si n8n mandó icsData, lo mandamos también
       if (icsData) {
         const ok = await sendICS(sock, remoteJid, icsData, {
           fileName: "cita_confirmada.ics",
@@ -1385,22 +1286,17 @@ async function getOrCreateSession(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 11. API ROUTES (JSON Parser Protected)
+// 11. API ROUTES (BOT)
 // ---------------------------------------------------------------------
 
-app.get("/health", jsonParser, (req, res) =>
-  res.json({ ok: true, active_sessions: sessions.size })
-);
+app.get("/health", jsonParser, (req, res) => res.json({ ok: true, active_sessions: sessions.size }));
 
 app.get("/sessions/:tenantId", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const info = sessions.get(tenantId);
 
   if (!info) {
-    return res.json({
-      ok: true,
-      session: { id: tenantId, status: "disconnected", qr_data: null },
-    });
+    return res.json({ ok: true, session: { id: tenantId, status: "disconnected", qr_data: null } });
   }
 
   return res.json({
@@ -1414,7 +1310,7 @@ app.get("/sessions/:tenantId", jsonParser, async (req, res) => {
   });
 });
 
-// ✅ CONNECT NUCLEAR (corrige wait)
+// CONNECT NUCLEAR (corrige wait)
 app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
 
@@ -1443,14 +1339,9 @@ app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
     }
 
     await getOrCreateSession(tenantId);
-
-    // ✅ Espera por QR o connected
     const ready = await waitForReady(tenantId, 12000);
 
-    return res.json({
-      ok: true,
-      status: ready?.status || "connecting",
-    });
+    return res.json({ ok: true, status: ready?.status || "connecting" });
   } catch (e) {
     console.error("[/sessions/:tenantId/connect] Error:", e);
     return res.status(500).json({
@@ -1482,11 +1373,10 @@ app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   }
 
   let session = sessions.get(tenantId);
-
   if (!session || session.status !== "connected") {
     try {
       session = await getOrCreateSession(tenantId);
-    } catch (e) {}
+    } catch {}
   }
 
   session = sessions.get(tenantId);
@@ -1516,7 +1406,7 @@ app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   if (!session || session.status !== "connected") {
     try {
       session = await getOrCreateSession(tenantId);
-    } catch (e) {}
+    } catch {}
   }
 
   session = sessions.get(tenantId);
@@ -1533,11 +1423,11 @@ app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   try {
     await session.socket.sendMessage(jid, { text: message });
 
-    // ✅ ICS SOLO si date/time vienen y parsea bien
+    // ICS SOLO si date/time vienen y parsea bien
     if (event === "booking_confirmed" && variables?.date && variables?.time) {
       const context = await getTenantContext(tenantId);
-
       const appointmentDate = parseLocalDateTimeToDate(variables.date, variables.time);
+
       if (appointmentDate && !isNaN(appointmentDate.getTime())) {
         const icsBuffer = createICSFile(
           `Cita en ${context.name}`,
@@ -1578,7 +1468,7 @@ app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
   if (!session || session.status !== "connected") {
     try {
       session = await getOrCreateSession(tenantId);
-    } catch (e) {}
+    } catch {}
   }
 
   session = sessions.get(tenantId);
@@ -1601,15 +1491,9 @@ app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
         caption: caption || "",
       };
     } else if (type === "image") {
-      messagePayload = {
-        image: mediaBuffer,
-        caption: caption || "",
-      };
+      messagePayload = { image: mediaBuffer, caption: caption || "" };
     } else if (type === "audio") {
-      messagePayload = {
-        audio: mediaBuffer,
-        mimetype: mimetype || "audio/mp4",
-      };
+      messagePayload = { audio: mediaBuffer, mimetype: mimetype || "audio/mp4" };
     } else {
       return res.status(400).json({ error: "type inválido. Usa document|image|audio" });
     }
@@ -1625,10 +1509,10 @@ app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 12. AVAILABILITY
+// 12. AVAILABILITY (Express) — movido a /wa/api para NO tocar /api de Next
 // ---------------------------------------------------------------------
 
-app.get("/api/v1/availability", jsonParser, async (req, res) => {
+app.get("/wa/api/v1/availability", async (req, res) => {
   const tenantId = String(req.query.tenantId || "");
   const resourceId = req.query.resourceId ? String(req.query.resourceId) : null;
   const date = String(req.query.date || "");
@@ -1641,7 +1525,6 @@ app.get("/api/v1/availability", jsonParser, async (req, res) => {
   }
 
   const slots = await getAvailableSlots(tenantId, resourceId, requestedDate, 7);
-
   const sorted = (slots || []).sort((a, b) => a.start.getTime() - b.start.getTime());
 
   const formattedSlots = sorted.map((s) =>
@@ -1654,11 +1537,20 @@ app.get("/api/v1/availability", jsonParser, async (req, res) => {
     })}`
   );
 
-  res.json({
+  return res.json({
     ok: true,
     available_slots_count: sorted.length,
     available_slots: formattedSlots.slice(0, 40),
   });
+});
+
+// ✅ Alias de compatibilidad: /api/v1/availability (GET-only, SIN parser)
+// Importante: esto NO debe “romper” Next porque es un GET y no lee body.
+// Si prefieres, elimina este alias y ajusta n8n/cliente a /wa/api/v1/availability.
+app.get("/api/v1/availability", (req, res) => {
+  // Reenvía internamente al handler real
+  req.url = "/wa/api/v1/availability" + (req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : "");
+  return app._router.handle(req, res, () => res.status(404).end("Not Found"));
 });
 
 // ---------------------------------------------------------------------
@@ -1702,20 +1594,12 @@ async function restoreSessions() {
 }
 
 // ---------------------------------------------------------------------
-// 17. FINAL FUSION HANDLER (FIX PARA TODO)
+// 17. FINAL FUSION HANDLER (FIX FINAL)
 // ---------------------------------------------------------------------
 
-// 🛑 Mantengo este bloque (lo tenías duplicado). Es idempotente por la bandera.
-app.use("/api", (req, res, next) => {
-  if (req.path.startsWith("/auth")) {
-    return next();
-  }
-  conditionalJsonParser(req, res, next);
-});
-
-// ✅ FIX NEXT 15: no usar async/await wrapper aquí (evita “disturbed/locked body”)
-// Next.js ahora sabe dónde encontrar la web gracias a 'dir: projectRoot'
-app.all("*", (req, res) => {
+// ✅ FIX CRÍTICO: Catch-all para Next SIN "*" y SIN async
+// (evita PathError y reduce chance de “locked body”)
+app.use((req, res) => {
   try {
     return handle(req, res);
   } catch (e) {
@@ -1734,9 +1618,7 @@ nextApp
     app.listen(PORT, (err) => {
       if (err) throw err;
       logger.info(`🚀 Servidor FUSIONADO (Bot + Web) escuchando en puerto ${PORT}`);
-      restoreSessions().catch((e) =>
-        logger.error(e, "Error al intentar restaurar sesiones al inicio")
-      );
+      restoreSessions().catch((e) => logger.error(e, "Error al intentar restaurar sesiones al inicio"));
     });
   })
   .catch((ex) => {
