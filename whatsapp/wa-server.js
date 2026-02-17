@@ -9,6 +9,12 @@
  *    → Movimos el availability de Express a /wa/api/v1/availability
  *    → Dejamos un alias GET /api/v1/availability (SIN parser) para compatibilidad.
  *
+ * ✅ FIX #3 (CLIENT NUMBER REAL): obtener el número real del cliente que escribe (senderJid)
+ *    → En 1:1: sender = remoteJid
+ *    → En grupos: sender = participant (o contextInfo.participant)
+ *    → Normaliza JID: quita @s.whatsapp.net y :device, deja dígitos
+ *    → Evita confundir con el número del bot (sock.user.id)
+ *
  * ✅ IDs: TODO TEXT (tenantId, customerId, etc.).
  * ✅ CEREBRO: n8n (Prioridad) + OpenAI (Fallback).
  * ✅ CONEXIÓN: Nuclear (Borrado físico de sesión + wait QR/connected).
@@ -158,6 +164,79 @@ async function waitForReady(tenantId, timeoutMs = 15000) {
     await sleep(400);
   }
   return sessions.get(String(tenantId)) || null;
+}
+
+// ---------------------------------------------------------------------
+// ✅ FIX #3: RESOLVER EL NÚMERO REAL DEL CLIENTE (senderJid)
+// ---------------------------------------------------------------------
+
+function extractContextInfo(msg) {
+  // intenta encontrar contextInfo en rutas comunes (quoted/ephemeral/buttons/etc.)
+  try {
+    return (
+      msg?.message?.extendedTextMessage?.contextInfo ||
+      msg?.message?.imageMessage?.contextInfo ||
+      msg?.message?.videoMessage?.contextInfo ||
+      msg?.message?.documentMessage?.contextInfo ||
+      msg?.message?.buttonsResponseMessage?.contextInfo ||
+      msg?.message?.listResponseMessage?.contextInfo ||
+      msg?.message?.templateButtonReplyMessage?.contextInfo ||
+      msg?.message?.interactiveResponseMessage?.contextInfo ||
+      msg?.message?.ephemeralMessage?.message?.extendedTextMessage?.contextInfo ||
+      msg?.message?.ephemeralMessage?.message?.imageMessage?.contextInfo ||
+      msg?.message?.ephemeralMessage?.message?.videoMessage?.contextInfo ||
+      msg?.message?.ephemeralMessage?.message?.documentMessage?.contextInfo ||
+      msg?.message?.ephemeralMessage?.message?.buttonsResponseMessage?.contextInfo ||
+      msg?.message?.ephemeralMessage?.message?.listResponseMessage?.contextInfo ||
+      msg?.message?.ephemeralMessage?.message?.templateButtonReplyMessage?.contextInfo ||
+      msg?.message?.ephemeralMessage?.message?.interactiveResponseMessage?.contextInfo ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
+function normalizeJidToPhone(jid) {
+  if (!jid || typeof jid !== "string") return "";
+  // ej: "18099490457:28@s.whatsapp.net" -> "18099490457"
+  // ej: "whatsapp:+1809..." -> "1809..."
+  const s = jid.trim();
+  const left = s.split("@")[0] || "";
+  const noDevice = left.split(":")[0] || "";
+  const digits = noDevice.replace(/\D/g, "");
+  return digits;
+}
+
+function getSenderJidFromMessage(msg) {
+  // En grupos, el sender es participant (o contextInfo.participant)
+  const remoteJid = msg?.key?.remoteJid || null;
+  const isGroup = !!remoteJid && String(remoteJid).endsWith("@g.us");
+
+  const contextInfo = extractContextInfo(msg);
+  const ctxParticipant = contextInfo?.participant || null;
+
+  if (isGroup) {
+    return msg?.key?.participant || ctxParticipant || remoteJid; // último recurso
+  }
+
+  // 1 a 1: sender = remoteJid (pero si por algo viene participant, se respeta)
+  return msg?.key?.participant || ctxParticipant || remoteJid;
+}
+
+function getClientIdentity(msg, sock) {
+  const remoteJid = msg?.key?.remoteJid || "";
+  const senderJid = getSenderJidFromMessage(msg) || "";
+  const clientPhone = normalizeJidToPhone(senderJid);
+  const botPhone = normalizeJidToPhone(sock?.user?.id || "");
+
+  return {
+    remoteJid,
+    senderJid,
+    clientPhone,
+    botPhone,
+    isGroup: String(remoteJid).endsWith("@g.us"),
+  };
 }
 
 // =====================================================================
@@ -1159,8 +1238,16 @@ async function getOrCreateSession(tenantId) {
 
       if (!msg?.message || msg.key.fromMe) return;
 
-      const remoteJid = msg.key.remoteJid;
-      if (!remoteJid || remoteJid.includes("@g.us")) return;
+      // ✅ identidad real del cliente (NO confundir con bot)
+      const identity = getClientIdentity(msg, sock);
+
+      // Nota: ya no descartamos grupos aquí por defecto; si no quieres atender grupos,
+      // lo puedes mantener como antes (pero ya el sender sale correcto).
+      const remoteJid = identity.remoteJid;
+      if (!remoteJid) return;
+
+      // Si quieres IGNORAR grupos como antes, deja esta línea:
+      if (identity.isGroup) return;
 
       const text =
         msg.message.conversation ||
@@ -1170,7 +1257,35 @@ async function getOrCreateSession(tenantId) {
       if (!text) return;
 
       const pushName = msg.pushName || "Cliente";
-      const userPhone = remoteJid.split("@")[0];
+
+      // ✅ este es el número REAL del cliente
+      const userPhone = identity.clientPhone;
+
+      // fallback ultra seguro si por algo vino vacío
+      if (!userPhone) {
+        logger.warn(
+          {
+            tenantId: tid,
+            remoteJid: identity.remoteJid,
+            senderJid: identity.senderJid,
+            botPhone: identity.botPhone,
+          },
+          "[wa-server] ⚠️ No pude resolver clientPhone. Revisa senderJid/contextInfo."
+        );
+        return;
+      }
+
+      // Log útil (una vez por msg) para debugging de casos raros
+      logger.info(
+        {
+          tenantId: tid,
+          remoteJid: identity.remoteJid,
+          senderJid: identity.senderJid,
+          clientPhone: identity.clientPhone,
+          botPhone: identity.botPhone,
+        },
+        "[wa-server] ✅ Sender resuelto"
+      );
 
       if (!info.conversations) info.conversations = new Map();
 
@@ -1256,6 +1371,7 @@ async function getOrCreateSession(tenantId) {
         }
       }
 
+      // ✅ En 1:1, remoteJid es el chat del cliente. Para enviar, usamos remoteJid.
       await sock.sendMessage(remoteJid, { text: replyText });
 
       // Si n8n mandó icsData, lo mandamos también
@@ -1367,7 +1483,7 @@ app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   if (!phone || !message) {
     return res.status(400).json({
       ok: false,
-      error: "missing_fields",
+     error: "missing_fields",
       detail: "Requiere phone y message",
     });
   }
