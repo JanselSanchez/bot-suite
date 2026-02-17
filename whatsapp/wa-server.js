@@ -9,15 +9,12 @@
  *    → Movimos el availability de Express a /wa/api/v1/availability
  *    → Dejamos un alias GET /api/v1/availability (SIN parser) para compatibilidad.
  *
- * ✅ FIX #3 (CLIENT NUMBER REAL): obtener el número real del cliente que escribe (senderJid)
- *    → En 1:1: sender = remoteJid
+ * ✅ FIX #3 (CLIENT NUMBER REAL + LID SAFE):
+ *    → WhatsApp ahora puede mandar remoteJid con @lid (NO es teléfono).
+ *    → Si es @s.whatsapp.net => phone real (digits).
+ *    → Si es @lid => NO inventamos phone; usamos waId estable (jid completo) como clave.
  *    → En grupos: sender = participant (o contextInfo.participant)
- *    → Normaliza JID: quita @s.whatsapp.net y :device, deja dígitos
  *    → Evita confundir con el número del bot (sock.user.id)
- *
- * ✅ FIX #4 (LID / @lid): cuando WhatsApp Multi-Device manda remoteJid tipo "6219...@lid"
- *    → Se detecta @lid y se convierte a número real (caso común: "62" + teléfono real).
- *    → Se fuerza replyJid = <tel_real>@s.whatsapp.net para responder bien.
  *
  * ✅ IDs: TODO TEXT (tenantId, customerId, etc.).
  * ✅ CEREBRO: n8n (Prioridad) + OpenAI (Fallback).
@@ -84,7 +81,6 @@ try {
 // NO montamos nada en "/api" para no romper Route Handlers / Auth / streams.
 app.use("/sessions", jsonParser);
 app.use("/health", jsonParser);
-// (Si quieres, puedes crear un prefijo /wa para todo lo del bot en el futuro)
 
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
@@ -133,8 +129,10 @@ const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
  * socket,
  * status,
  * qr,
- * conversations: Map<phone, { history: Array<{role, content}> }>
+ * conversations: Map<key, { history: Array<{role, content}> }>
  * }>
+ *
+ * Nota: "key" puede ser phone real (digits) o waId (jid completo) si viene @lid.
  */
 const sessions = new Map();
 
@@ -171,11 +169,10 @@ async function waitForReady(tenantId, timeoutMs = 15000) {
 }
 
 // ---------------------------------------------------------------------
-// ✅ FIX #3/#4: RESOLVER EL NÚMERO REAL DEL CLIENTE (senderJid) + SOPORTE @lid
+// ✅ FIX #3: RESOLVER IDENTIDAD REAL (PHONE SI EXISTE) + LID SAFE
 // ---------------------------------------------------------------------
 
 function extractContextInfo(msg) {
-  // intenta encontrar contextInfo en rutas comunes (quoted/ephemeral/buttons/etc.)
   try {
     return (
       msg?.message?.extendedTextMessage?.contextInfo ||
@@ -202,32 +199,24 @@ function extractContextInfo(msg) {
 }
 
 function isLidJid(jid) {
-  return typeof jid === "string" && jid.trim().endsWith("@lid");
+  return typeof jid === "string" && jid.endsWith("@lid");
+}
+
+function isUserJid(jid) {
+  return typeof jid === "string" && jid.endsWith("@s.whatsapp.net");
 }
 
 function normalizeJidToPhone(jid) {
   if (!jid || typeof jid !== "string") return "";
+
+  // 🔥 CRÍTICO: @lid NO es teléfono. No inventes números.
+  if (isLidJid(jid)) return "";
+
   // ej: "18099490457:28@s.whatsapp.net" -> "18099490457"
-  // ej: "whatsapp:+1809..." -> "1809..."
-  // ej: "62199850614791@lid" -> (fix) "199850614791" (caso común: "62" + phone real)
   const s = jid.trim();
   const left = s.split("@")[0] || "";
   const noDevice = left.split(":")[0] || "";
   const digits = noDevice.replace(/\D/g, "");
-
-  // ✅ FIX #4: LID mapping
-  if (isLidJid(s)) {
-    // Caso observado: remoteJid = "62" + <tel_real>
-    // Ej: 62199850614791 -> 199850614791 (12 dígitos; +1 NANP)
-    if (digits.startsWith("62") && digits.length > 10) {
-      const maybePhone = digits.slice(2);
-      // Si queda un largo "razonable", úsalo
-      if (maybePhone.length >= 10 && maybePhone.length <= 15) return maybePhone;
-    }
-    // fallback: deja digits, pero ya no lo vamos a usar para replyJid si detectamos @lid
-    return digits;
-  }
-
   return digits;
 }
 
@@ -244,33 +233,31 @@ function getSenderJidFromMessage(msg) {
   }
 
   // 1 a 1:
-  // - Normalmente sender = remoteJid
-  // - A veces viene participant/contextInfo.participant (quoted/forward)
-  // - Si remoteJid es @lid, lo dejamos pasar, pero luego lo normalizamos (y reply se fuerza)
+  // Si WhatsApp trae @lid, eso será el remoteJid. No hay participant normalmente.
   return msg?.key?.participant || ctxParticipant || remoteJid;
 }
 
 function getClientIdentity(msg, sock) {
   const remoteJid = msg?.key?.remoteJid || "";
   const senderJid = getSenderJidFromMessage(msg) || "";
-  const clientPhone = normalizeJidToPhone(senderJid);
-  const botPhone = normalizeJidToPhone(sock?.user?.id || "");
 
-  // ✅ FIX #4: JID seguro para responder cuando remoteJid es @lid
-  // Si remoteJid viene como @lid, respondemos directo al número real en @s.whatsapp.net.
-  const replyJid =
-    isLidJid(remoteJid) && clientPhone
-      ? `${clientPhone}@s.whatsapp.net`
-      : remoteJid;
+  // waId estable (jid completo)
+  const clientWaId = senderJid || remoteJid || "";
+
+  // phone solo si es un user jid real
+  const clientPhone = normalizeJidToPhone(senderJid);
+
+  const botPhone = normalizeJidToPhone(sock?.user?.id || "");
 
   return {
     remoteJid,
     senderJid,
+    clientWaId,
     clientPhone,
     botPhone,
-    replyJid,
     isGroup: String(remoteJid).endsWith("@g.us"),
-    isLid: isLidJid(remoteJid) || isLidJid(senderJid),
+    isLid: isLidJid(senderJid) || isLidJid(remoteJid),
+    isUserJid: isUserJid(senderJid) || isUserJid(remoteJid),
   };
 }
 
@@ -1073,19 +1060,19 @@ async function updateSessionDB(tenantId, updateData) {
 // 8. customers + booking events
 // ---------------------------------------------------------------------
 
-async function getOrCreateCustomer(tenantId, phoneNumber) {
+async function getOrCreateCustomer(tenantId, customerKey) {
   const tid = String(tenantId || "");
-  const phone = String(phoneNumber || "");
+  const key = String(customerKey || "").trim();
 
-  if (!tid || !phone) {
-    throw new Error("[wa-server] tenantId y phoneNumber requeridos para customer.");
+  if (!tid || !key) {
+    throw new Error("[wa-server] tenantId y customerKey requeridos para customer.");
   }
 
   const { data, error } = await supabase
     .from("customers")
     .select("id")
     .eq("tenant_id", tid)
-    .eq("phone_number", phone)
+    .eq("phone_number", key)
     .maybeSingle();
 
   if (error) {
@@ -1097,7 +1084,7 @@ async function getOrCreateCustomer(tenantId, phoneNumber) {
 
   const { data: created, error: insertError } = await supabase
     .from("customers")
-    .insert({ tenant_id: tid, phone_number: phone })
+    .insert({ tenant_id: tid, phone_number: key })
     .select("id")
     .single();
 
@@ -1273,15 +1260,13 @@ async function getOrCreateSession(tenantId) {
 
       if (!msg?.message || msg.key.fromMe) return;
 
-      // ✅ identidad real del cliente (NO confundir con bot)
+      // ✅ identidad real del cliente
       const identity = getClientIdentity(msg, sock);
 
-      // Nota: ya no descartamos grupos aquí por defecto; si no quieres atender grupos,
-      // lo puedes mantener como antes (pero ya el sender sale correcto).
       const remoteJid = identity.remoteJid;
       if (!remoteJid) return;
 
-      // Si quieres IGNORAR grupos como antes, deja esta línea:
+      // si quieres ignorar grupos:
       if (identity.isGroup) return;
 
       const text =
@@ -1293,48 +1278,50 @@ async function getOrCreateSession(tenantId) {
 
       const pushName = msg.pushName || "Cliente";
 
-      // ✅ este es el número REAL del cliente
-      const userPhone = identity.clientPhone;
+      // ✅ clave estable del cliente:
+      // - si hay phone real => úsalo
+      // - si viene @lid => usa waId (jid completo)
+      const customerKey = identity.clientPhone || identity.clientWaId;
 
-      // fallback ultra seguro si por algo vino vacío
-      if (!userPhone) {
+      if (!customerKey) {
         logger.warn(
           {
             tenantId: tid,
             remoteJid: identity.remoteJid,
             senderJid: identity.senderJid,
+            clientWaId: identity.clientWaId,
             botPhone: identity.botPhone,
           },
-          "[wa-server] ⚠️ No pude resolver clientPhone. Revisa senderJid/contextInfo."
+          "[wa-server] ⚠️ No pude resolver customerKey (ni phone ni waId)."
         );
         return;
       }
 
-      // Log útil (una vez por msg) para debugging de casos raros
+      // Log útil (una vez por msg)
       logger.info(
         {
           tenantId: tid,
           remoteJid: identity.remoteJid,
           senderJid: identity.senderJid,
-          clientPhone: identity.clientPhone,
-          botPhone: identity.botPhone,
-          replyJid: identity.replyJid,
+          clientWaId: identity.clientWaId,
+          clientPhone: identity.clientPhone || null,
           isLid: identity.isLid,
+          botPhone: identity.botPhone,
         },
         "[wa-server] ✅ Sender resuelto"
       );
 
       if (!info.conversations) info.conversations = new Map();
 
-      let convo = info.conversations.get(userPhone);
+      let convo = info.conversations.get(customerKey);
       if (!convo) {
         convo = { history: [] };
-        info.conversations.set(userPhone, convo);
+        info.conversations.set(customerKey, convo);
       }
       const history = convo.history || [];
 
-      const convoSession = await convoState.getOrCreateSession(tid, userPhone);
-      const customerId = await getOrCreateCustomer(tid, userPhone);
+      const convoSession = await convoState.getOrCreateSession(tid, customerKey);
+      const customerId = await getOrCreateCustomer(tid, customerKey);
       const event = buildBookingEventFromMessage(text, convoSession);
 
       const botApiUrl = process.env.N8N_WEBHOOK_URL;
@@ -1349,7 +1336,16 @@ async function getOrCreateSession(tenantId) {
         const payload = {
           tenantId: tid,
           customerId: String(customerId),
-          phoneNumber: String(userPhone),
+
+          // ✅ siempre manda waId (jid completo). Es lo único 100% estable.
+          waId: String(identity.clientWaId || ""),
+
+          // ✅ phoneNumber SOLO si existe (si es @lid, va null/vacío)
+          phoneNumber: identity.clientPhone ? String(identity.clientPhone) : null,
+
+          // ✅ clave usada en tu sistema (puede ser phone o waId)
+          customerKey: String(customerKey),
+
           text,
           customerName: pushName,
           state: {
@@ -1384,7 +1380,7 @@ async function getOrCreateSession(tenantId) {
 
       if (!replyText) {
         logger.info({ tenantId: tid }, "[wa-server] Usando fallback de OpenAI");
-        const fallback = await generateReply(text, tid, pushName, history, userPhone);
+        const fallback = await generateReply(text, tid, pushName, history, identity.clientPhone || null);
         replyText =
           fallback ||
           "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
@@ -1408,16 +1404,12 @@ async function getOrCreateSession(tenantId) {
         }
       }
 
-      // ✅ Enviar respuesta al chat correcto:
-      // - Normal: remoteJid OK
-      // - Si vino @lid: replyJid = <phone>@s.whatsapp.net
-      const targetJid = identity.replyJid || remoteJid;
-
-      await sock.sendMessage(targetJid, { text: replyText });
+      // ✅ Para responder, SIEMPRE usa remoteJid tal como viene (lid/user).
+      await sock.sendMessage(remoteJid, { text: replyText });
 
       // Si n8n mandó icsData, lo mandamos también
       if (icsData) {
-        const ok = await sendICS(sock, targetJid, icsData, {
+        const ok = await sendICS(sock, remoteJid, icsData, {
           fileName: "cita_confirmada.ics",
           caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
         });
@@ -1433,7 +1425,7 @@ async function getOrCreateSession(tenantId) {
       if (history.length > MAX_MESSAGES) history.splice(0, history.length - MAX_MESSAGES);
 
       convo.history = history;
-      info.conversations.set(userPhone, convo);
+      info.conversations.set(customerKey, convo);
     } catch (e) {
       logger.error("[wa-server] Error en messages.upsert:", e);
     }
@@ -1701,11 +1693,7 @@ app.get("/wa/api/v1/availability", async (req, res) => {
   });
 });
 
-// ✅ Alias de compatibilidad: /api/v1/availability (GET-only, SIN parser)
-// Importante: esto NO debe “romper” Next porque es un GET y no lee body.
-// Si prefieres, elimina este alias y ajusta n8n/cliente a /wa/api/v1/availability.
 app.get("/api/v1/availability", (req, res) => {
-  // Reenvía internamente al handler real
   req.url = "/wa/api/v1/availability" + (req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : "");
   return app._router.handle(req, res, () => res.status(404).end("Not Found"));
 });
@@ -1754,8 +1742,6 @@ async function restoreSessions() {
 // 17. FINAL FUSION HANDLER (FIX FINAL)
 // ---------------------------------------------------------------------
 
-// ✅ FIX CRÍTICO: Catch-all para Next SIN "*" y SIN async
-// (evita PathError y reduce chance de “locked body”)
 app.use((req, res) => {
   try {
     return handle(req, res);
@@ -1768,7 +1754,6 @@ app.use((req, res) => {
   }
 });
 
-// 🔥 ENCENDIDO DEL MOTOR HÍBRIDO
 nextApp
   .prepare()
   .then(() => {
