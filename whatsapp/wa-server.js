@@ -15,6 +15,10 @@
  *    → Normaliza JID: quita @s.whatsapp.net y :device, deja dígitos
  *    → Evita confundir con el número del bot (sock.user.id)
  *
+ * ✅ FIX #4 (LID / @lid): cuando WhatsApp Multi-Device manda remoteJid tipo "6219...@lid"
+ *    → Se detecta @lid y se convierte a número real (caso común: "62" + teléfono real).
+ *    → Se fuerza replyJid = <tel_real>@s.whatsapp.net para responder bien.
+ *
  * ✅ IDs: TODO TEXT (tenantId, customerId, etc.).
  * ✅ CEREBRO: n8n (Prioridad) + OpenAI (Fallback).
  * ✅ CONEXIÓN: Nuclear (Borrado físico de sesión + wait QR/connected).
@@ -167,7 +171,7 @@ async function waitForReady(tenantId, timeoutMs = 15000) {
 }
 
 // ---------------------------------------------------------------------
-// ✅ FIX #3: RESOLVER EL NÚMERO REAL DEL CLIENTE (senderJid)
+// ✅ FIX #3/#4: RESOLVER EL NÚMERO REAL DEL CLIENTE (senderJid) + SOPORTE @lid
 // ---------------------------------------------------------------------
 
 function extractContextInfo(msg) {
@@ -197,14 +201,33 @@ function extractContextInfo(msg) {
   }
 }
 
+function isLidJid(jid) {
+  return typeof jid === "string" && jid.trim().endsWith("@lid");
+}
+
 function normalizeJidToPhone(jid) {
   if (!jid || typeof jid !== "string") return "";
   // ej: "18099490457:28@s.whatsapp.net" -> "18099490457"
   // ej: "whatsapp:+1809..." -> "1809..."
+  // ej: "62199850614791@lid" -> (fix) "199850614791" (caso común: "62" + phone real)
   const s = jid.trim();
   const left = s.split("@")[0] || "";
   const noDevice = left.split(":")[0] || "";
   const digits = noDevice.replace(/\D/g, "");
+
+  // ✅ FIX #4: LID mapping
+  if (isLidJid(s)) {
+    // Caso observado: remoteJid = "62" + <tel_real>
+    // Ej: 62199850614791 -> 199850614791 (12 dígitos; +1 NANP)
+    if (digits.startsWith("62") && digits.length > 10) {
+      const maybePhone = digits.slice(2);
+      // Si queda un largo "razonable", úsalo
+      if (maybePhone.length >= 10 && maybePhone.length <= 15) return maybePhone;
+    }
+    // fallback: deja digits, pero ya no lo vamos a usar para replyJid si detectamos @lid
+    return digits;
+  }
+
   return digits;
 }
 
@@ -220,7 +243,10 @@ function getSenderJidFromMessage(msg) {
     return msg?.key?.participant || ctxParticipant || remoteJid; // último recurso
   }
 
-  // 1 a 1: sender = remoteJid (pero si por algo viene participant, se respeta)
+  // 1 a 1:
+  // - Normalmente sender = remoteJid
+  // - A veces viene participant/contextInfo.participant (quoted/forward)
+  // - Si remoteJid es @lid, lo dejamos pasar, pero luego lo normalizamos (y reply se fuerza)
   return msg?.key?.participant || ctxParticipant || remoteJid;
 }
 
@@ -230,12 +256,21 @@ function getClientIdentity(msg, sock) {
   const clientPhone = normalizeJidToPhone(senderJid);
   const botPhone = normalizeJidToPhone(sock?.user?.id || "");
 
+  // ✅ FIX #4: JID seguro para responder cuando remoteJid es @lid
+  // Si remoteJid viene como @lid, respondemos directo al número real en @s.whatsapp.net.
+  const replyJid =
+    isLidJid(remoteJid) && clientPhone
+      ? `${clientPhone}@s.whatsapp.net`
+      : remoteJid;
+
   return {
     remoteJid,
     senderJid,
     clientPhone,
     botPhone,
+    replyJid,
     isGroup: String(remoteJid).endsWith("@g.us"),
+    isLid: isLidJid(remoteJid) || isLidJid(senderJid),
   };
 }
 
@@ -1283,6 +1318,8 @@ async function getOrCreateSession(tenantId) {
           senderJid: identity.senderJid,
           clientPhone: identity.clientPhone,
           botPhone: identity.botPhone,
+          replyJid: identity.replyJid,
+          isLid: identity.isLid,
         },
         "[wa-server] ✅ Sender resuelto"
       );
@@ -1371,12 +1408,16 @@ async function getOrCreateSession(tenantId) {
         }
       }
 
-      // ✅ En 1:1, remoteJid es el chat del cliente. Para enviar, usamos remoteJid.
-      await sock.sendMessage(remoteJid, { text: replyText });
+      // ✅ Enviar respuesta al chat correcto:
+      // - Normal: remoteJid OK
+      // - Si vino @lid: replyJid = <phone>@s.whatsapp.net
+      const targetJid = identity.replyJid || remoteJid;
+
+      await sock.sendMessage(targetJid, { text: replyText });
 
       // Si n8n mandó icsData, lo mandamos también
       if (icsData) {
-        const ok = await sendICS(sock, remoteJid, icsData, {
+        const ok = await sendICS(sock, targetJid, icsData, {
           fileName: "cita_confirmada.ics",
           caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
         });
@@ -1483,7 +1524,7 @@ app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   if (!phone || !message) {
     return res.status(400).json({
       ok: false,
-     error: "missing_fields",
+      error: "missing_fields",
       detail: "Requiere phone y message",
     });
   }
