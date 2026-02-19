@@ -16,10 +16,17 @@
  *    → En grupos: sender = participant (o contextInfo.participant)
  *    → Evita confundir con el número del bot (sock.user.id)
  *
- * ✅ IDs: TODO TEXT (tenantId, customerId, etc.).
- * ✅ CEREBRO: n8n (Prioridad) + OpenAI (Fallback).
- * ✅ CONEXIÓN: Nuclear (Borrado físico de sesión + wait QR/connected).
- * ✅ COMPATIBILIDAD: Browser "Creativa Web" en Windows (Universal).
+ * ✅ FIX #4 (N8N SEND-MEDIA SIN IF + SOPORTE LID):
+ *    → /sessions/:tenantId/send-media y /send-message y /send-template aceptan:
+ *       - phone (digits)  ✅ legacy
+ *       - jid (ej: "xxx@lid" o "xxx@s.whatsapp.net") ✅ nuevo (prioridad)
+ *       - waId (alias de jid) ✅
+ *    → Si viene @lid, se envía directo a ese JID (NO requiere phone).
+ *
+ * ✅ FIX #5 (BASE64 ROBUSTO):
+ *    → Acepta base64 puro o data URL (data:...;base64,XXXX)
+ *    → Valida buffer no vacío, errores claros.
+ *
  * ✅ AUTO-ICS: Envío automático de archivo de calendario al crear/reagendar.
  * ✅ FUSIÓN: Integrado con Next.js (Dashboard) + Modo Producción forzado.
  */
@@ -206,6 +213,10 @@ function isUserJid(jid) {
   return typeof jid === "string" && jid.endsWith("@s.whatsapp.net");
 }
 
+function isGroupJid(jid) {
+  return typeof jid === "string" && jid.endsWith("@g.us");
+}
+
 function normalizeJidToPhone(jid) {
   if (!jid || typeof jid !== "string") return "";
 
@@ -218,6 +229,35 @@ function normalizeJidToPhone(jid) {
   const noDevice = left.split(":")[0] || "";
   const digits = noDevice.replace(/\D/g, "");
   return digits;
+}
+
+function normalizePhoneToJid(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (!digits) return "";
+  return `${digits}@s.whatsapp.net`;
+}
+
+function normalizeAnyToJid(input) {
+  const v = String(input || "").trim();
+  if (!v) return "";
+
+  // Ya es jid
+  if (v.includes("@s.whatsapp.net") || v.includes("@lid") || v.includes("@g.us")) return v;
+
+  // Es phone
+  const digits = v.replace(/\D/g, "");
+  if (digits) return `${digits}@s.whatsapp.net`;
+
+  return "";
+}
+
+function resolveTargetJidFromBody(body = {}) {
+  // Prioridad: jid/waId -> phone
+  const jid = body.jid || body.waId || body.remoteJid || body.to;
+  const phone = body.phone;
+
+  const target = normalizeAnyToJid(jid) || normalizePhoneToJid(phone);
+  return target;
 }
 
 function getSenderJidFromMessage(msg) {
@@ -356,6 +396,8 @@ function createICSFile(title, description, location, startDate, durationMinutes 
   const end = new Date(start.getTime() + durationMinutes * 60000);
   const now = new Date();
 
+  const safeLine = (v) => String(v || "").replace(/\r?\n/g, " ").trim();
+
   const icsData = [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
@@ -367,9 +409,9 @@ function createICSFile(title, description, location, startDate, durationMinutes 
     `DTSTAMP:${formatTime(now)}`,
     `DTSTART:${formatTime(start)}`,
     `DTEND:${formatTime(end)}`,
-    `SUMMARY:${String(title || "").replace(/\r?\n/g, " ")}`,
-    `DESCRIPTION:${String(description || "").replace(/\r?\n/g, " ")}`,
-    `LOCATION:${String(location || "").replace(/\r?\n/g, " ")}`,
+    `SUMMARY:${safeLine(title)}`,
+    `DESCRIPTION:${safeLine(description)}`,
+    `LOCATION:${safeLine(location)}`,
     "STATUS:CONFIRMED",
     "BEGIN:VALARM",
     "TRIGGER:-PT30M",
@@ -396,6 +438,25 @@ function looksLikeBase64(str) {
   return /^[A-Za-z0-9+/=]+$/.test(s);
 }
 
+function stripDataUrlBase64(input) {
+  const s = String(input || "").trim();
+  const m = s.match(/^data:([^;]+);base64,(.*)$/i);
+  if (m && m[2]) return m[2].trim();
+  return s;
+}
+
+function safeBase64ToBuffer(base64) {
+  const raw = stripDataUrlBase64(base64);
+  if (!raw) return null;
+  try {
+    const buf = Buffer.from(raw, "base64");
+    if (!buf || buf.length === 0) return null;
+    return buf;
+  } catch {
+    return null;
+  }
+}
+
 function icsToBuffer(icsData) {
   if (!icsData) return null;
 
@@ -414,8 +475,11 @@ function icsToBuffer(icsData) {
     return Buffer.from(normalized, "utf8");
   }
 
-  if (looksLikeBase64(raw)) {
-    const buf = Buffer.from(raw, "base64");
+  // Soporta data URL también
+  const stripped = stripDataUrlBase64(raw);
+
+  if (looksLikeBase64(stripped)) {
+    const buf = Buffer.from(stripped, "base64");
     const preview = buf.toString("utf8", 0, Math.min(buf.length, 300));
     if (!looksLikeICS(preview)) return null;
     return buf;
@@ -901,7 +965,7 @@ INSTRUCCIONES:
                     start
                   );
 
-                  const targetJid = phoneArg.replace(/\D/g, "") + "@s.whatsapp.net";
+                  const targetJid = normalizePhoneToJid(phoneArg);
 
                   await session.socket.sendMessage(targetJid, {
                     document: icsBuffer,
@@ -1232,6 +1296,7 @@ async function getOrCreateSession(tenantId) {
     }
 
     if (connection === "close") {
+      const { DisconnectReason } = await import("@whiskeysockets/baileys");
       const shouldReconnect =
         lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
 
@@ -1509,15 +1574,17 @@ app.post("/sessions/:tenantId/disconnect", jsonParser, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ✅ SEND MESSAGE: ahora acepta jid/waId además de phone
 app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
-  const { phone, message } = req.body || {};
+  const { message } = req.body || {};
 
-  if (!phone || !message) {
+  const targetJid = resolveTargetJidFromBody(req.body || {});
+  if (!targetJid || !message) {
     return res.status(400).json({
       ok: false,
       error: "missing_fields",
-      detail: "Requiere phone y message",
+      detail: "Requiere message y (phone o jid/waId)",
     });
   }
 
@@ -1533,11 +1600,9 @@ app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
     return res.status(400).json({ ok: false, error: "wa_not_connected" });
   }
 
-  const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
-
   try {
-    await session.socket.sendMessage(jid, { text: String(message) });
-    logger.info({ tenantId, phone }, "✅ send-message enviado");
+    await session.socket.sendMessage(targetJid, { text: String(message) });
+    logger.info({ tenantId, targetJid }, "✅ send-message enviado");
     return res.json({ ok: true });
   } catch (e) {
     logger.error(e, "Error en send-message");
@@ -1545,11 +1610,13 @@ app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   }
 });
 
+// ✅ SEND TEMPLATE: acepta jid/waId además de phone
 app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
-  const { event, phone, variables } = req.body || {};
+  const { event, variables } = req.body || {};
 
-  if (!event || !phone) return res.status(400).json({ error: "Faltan datos" });
+  const targetJid = resolveTargetJidFromBody(req.body || {});
+  if (!event || !targetJid) return res.status(400).json({ error: "Faltan datos (event + phone o jid/waId)" });
 
   let session = sessions.get(tenantId);
   if (!session || session.status !== "connected") {
@@ -1567,10 +1634,9 @@ app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   if (!templateBody) return res.status(404).json({ error: `Plantilla no encontrada: ${event}` });
 
   const message = renderTemplate(templateBody, variables || {});
-  const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
 
   try {
-    await session.socket.sendMessage(jid, { text: message });
+    await session.socket.sendMessage(targetJid, { text: message });
 
     // ICS SOLO si date/time vienen y parsea bien
     if (event === "booking_confirmed" && variables?.date && variables?.time) {
@@ -1585,14 +1651,14 @@ app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
           appointmentDate
         );
 
-        await session.socket.sendMessage(jid, {
+        await session.socket.sendMessage(targetJid, {
           document: icsBuffer,
           mimetype: "text/calendar; charset=utf-8",
           fileName: "agendar_cita.ics",
           caption: "📅 Toca este archivo para agregar el recordatorio a tu calendario.",
         });
 
-        logger.info({ tenantId, event, phone }, "✅ Plantilla + ICS enviados");
+        logger.info({ tenantId, event, targetJid }, "✅ Plantilla + ICS enviados");
       } else {
         logger.warn({ tenantId, variables }, "⚠️ No pude parsear date/time para ICS en send-template");
       }
@@ -1605,12 +1671,17 @@ app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   }
 });
 
+// ✅ SEND MEDIA: acepta jid/waId además de phone (LID SAFE), base64 robusto
 app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
-  const { phone, type, base64, fileName, mimetype, caption } = req.body || {};
+  const { type, base64, fileName, mimetype, caption } = req.body || {};
 
-  if (!phone || !base64 || !type) {
-    return res.status(400).json({ error: "Faltan datos (phone, base64, type)" });
+  const targetJid = resolveTargetJidFromBody(req.body || {});
+  if (!targetJid || !base64 || !type) {
+    return res.status(400).json({
+      error: "Faltan datos (type, base64 y (phone o jid/waId))",
+      hint: "Envía 'jid' (ej: xxx@lid) cuando no haya phone real.",
+    });
   }
 
   let session = sessions.get(tenantId);
@@ -1625,10 +1696,14 @@ app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
     return res.status(400).json({ error: "Bot no conectado." });
   }
 
-  const jid = String(phone).replace(/\D/g, "") + "@s.whatsapp.net";
-
   try {
-    const mediaBuffer = Buffer.from(String(base64), "base64");
+    const mediaBuffer = safeBase64ToBuffer(base64);
+    if (!mediaBuffer) {
+      return res.status(400).json({
+        error: "base64 inválido o vacío",
+        detail: "Asegúrate de enviar base64 puro o data URL (data:...;base64,XXXX).",
+      });
+    }
 
     let messagePayload = {};
 
@@ -1647,9 +1722,9 @@ app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
       return res.status(400).json({ error: "type inválido. Usa document|image|audio" });
     }
 
-    await session.socket.sendMessage(jid, messagePayload);
+    await session.socket.sendMessage(targetJid, messagePayload);
 
-    logger.info({ tenantId, phone, type }, "📎 Archivo enviado por API externa");
+    logger.info({ tenantId, targetJid, type }, "📎 Archivo enviado por API externa");
     res.json({ ok: true });
   } catch (e) {
     logger.error(e, "Error enviando media");
@@ -1767,3 +1842,4 @@ nextApp
     console.error(ex.stack);
     process.exit(1);
   });
+
