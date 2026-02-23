@@ -29,6 +29,12 @@
  *
  * ✅ AUTO-ICS: Envío automático de archivo de calendario al crear/reagendar.
  * ✅ FUSIÓN: Integrado con Next.js (Dashboard) + Modo Producción forzado.
+ *
+ * ✅ FIX #6 (SUPABASE AUTH STATE + RECONNECT HARDENED):
+ *    → Credenciales persistentes en whatsapp_sessions.auth_creds (jsonb)
+ *    → Keys persistentes en wa_session_keys (type, key_id, value)
+ *    → Reconnect automático SIEMPRE, excepto loggedOut o /disconnect (logout explícito)
+ *    → /connect nuclear: limpia DB auth_creds + keys para forzar QR (sin depender de disco)
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -136,14 +142,17 @@ const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
  * socket,
  * status,
  * qr,
- * conversations: Map<key, { history: Array<{role, content}> }>
+ * conversations: Map<key, { history: Array<{role, content}> }>,
+ * reconnecting?: boolean,
+ * reconnect_attempt?: number,
+ * last_connect_at?: string
  * }>
  *
  * Nota: "key" puede ser phone real (digits) o waId (jid completo) si viene @lid.
  */
 const sessions = new Map();
 
-// Carpeta persistencia
+// Carpeta persistencia (ya no es requisito para auth, pero no rompe mantenerla)
 const WA_SESSIONS_ROOT =
   process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
 
@@ -1089,35 +1098,100 @@ async function updateSessionDB(tenantId, updateData) {
   const tid = String(tenantId || "");
   if (!tid) return;
 
+  const payload = {
+    tenant_id: tid,
+    ...updateData,
+    updated_at: new Date().toISOString(),
+  };
+
   try {
-    const { data: existing, error: selectError } = await supabase
+    const { error: upsertError } = await supabase
       .from("whatsapp_sessions")
-      .select("id")
-      .eq("tenant_id", tid)
-      .maybeSingle();
+      .upsert(payload, { onConflict: "tenant_id" });
 
-    if (selectError) {
-      console.error("[updateSessionDB] Error select whatsapp_sessions:", selectError);
-      return;
-    }
-
-    if (existing) {
-      const { error: updateError } = await supabase.from("whatsapp_sessions").update(updateData).eq("tenant_id", tid);
-      if (updateError) console.error("[updateSessionDB] Error update whatsapp_sessions:", updateError);
-    } else {
-      const row = { tenant_id: tid, ...updateData };
-      const { error: insertError } = await supabase.from("whatsapp_sessions").insert([row]);
-      if (insertError) console.error("[updateSessionDB] Error insert whatsapp_sessions:", insertError);
+    if (upsertError) {
+      console.error("[updateSessionDB] Error upsert whatsapp_sessions:", upsertError);
     }
 
     if (updateData.status) {
       const isConnected = updateData.status === "connected";
-      const { error: tenantError } = await supabase.from("tenants").update({ wa_connected: isConnected }).eq("id", tid);
-      if (tenantError) console.error("[updateSessionDB] Error update tenants.wa_connected:", tenantError);
+      const tenantUpdate = { wa_connected: isConnected };
+
+      if (Object.prototype.hasOwnProperty.call(updateData, "phone_number")) {
+        tenantUpdate.wa_phone = updateData.phone_number ? String(updateData.phone_number) : null;
+      }
+      if (isConnected) tenantUpdate.wa_last_connected_at = new Date().toISOString();
+
+      const { error: tenantError } = await supabase
+        .from("tenants")
+        .update(tenantUpdate)
+        .eq("id", tid);
+
+      if (tenantError) console.error("[updateSessionDB] Error update tenants:", tenantError);
     }
   } catch (e) {
     console.error("[updateSessionDB] Error inesperado:", e);
   }
+}
+
+// ---------------------------------------------------------------------
+// DB HELPERS: whatsapp_sessions + wa_session_keys
+// ---------------------------------------------------------------------
+
+async function dbGetWhatsAppSessionRow(tenantId) {
+  const tid = String(tenantId || "");
+  const { data, error } = await supabase
+    .from("whatsapp_sessions")
+    .select("tenant_id, auth_creds, status, phone_number, wa_user_id, last_error, qr_data, qr_svg, qr_expires_at")
+    .eq("tenant_id", tid)
+    .maybeSingle();
+
+  if (error) {
+    logger.error({ err: error, tenantId: tid }, "dbGetWhatsAppSessionRow failed");
+    return null;
+  }
+  return data || null;
+}
+
+// Limpia creds + keys para forzar QR en el próximo connect
+async function dbClearAuthState(tenantId) {
+  const tid = String(tenantId || "");
+  if (!tid) return;
+
+  const { error: delKeysErr } = await supabase
+    .from("wa_session_keys")
+    .delete()
+    .eq("tenant_id", tid);
+
+  if (delKeysErr) logger.error({ err: delKeysErr, tenantId: tid }, "Error deleting wa_session_keys");
+
+  const { error: clearSessErr } = await supabase
+    .from("whatsapp_sessions")
+    .upsert(
+      {
+        tenant_id: tid,
+        auth_creds: null,
+        qr_data: null,
+        qr_svg: null,
+        qr_expires_at: null,
+        phone_number: null,
+        wa_user_id: null,
+        status: "disconnected",
+        last_error: null,
+        last_seen_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "tenant_id" }
+    );
+
+  if (clearSessErr) logger.error({ err: clearSessErr, tenantId: tid }, "Error clearing whatsapp_sessions auth");
+
+  const { error: tErr } = await supabase
+    .from("tenants")
+    .update({ wa_connected: false, wa_phone: null })
+    .eq("id", tid);
+
+  if (tErr) logger.error({ err: tErr, tenantId: tid }, "Error updating tenants after clearAuth");
 }
 
 // ---------------------------------------------------------------------
@@ -1219,18 +1293,148 @@ async function useSupabaseAuthState(tenantId) {
   const tid = String(tenantId || "");
   if (!tid) throw new Error("useSupabaseAuthState requiere tenantId");
 
-  const { useMultiFileAuthState } = await import("@whiskeysockets/baileys");
-  const sessionFolder = path.join(WA_SESSIONS_ROOT, tid);
+  const { initAuthCreds, BufferJSON, addTransactionCapability } = await import("@whiskeysockets/baileys");
 
-  if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder, { recursive: true });
+  const row = await dbGetWhatsAppSessionRow(tid);
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+  let creds = null;
+  if (row?.auth_creds) {
+    try {
+      creds = JSON.parse(JSON.stringify(row.auth_creds), BufferJSON.reviver);
+    } catch (e) {
+      logger.error({ tenantId: tid, err: e }, "No pude parsear auth_creds, inicializando nuevo");
+      creds = null;
+    }
+  }
+  if (!creds) creds = initAuthCreds();
+
+  const baseKeyStore = {
+    get: async (type, ids) => {
+      if (!Array.isArray(ids) || ids.length === 0) return {};
+
+      const { data, error } = await supabase
+        .from("wa_session_keys")
+        .select("key_id, value")
+        .eq("tenant_id", tid)
+        .eq("type", String(type))
+        .in("key_id", ids.map(String));
+
+      if (error) {
+        logger.error({ tenantId: tid, type, err: error }, "wa_session_keys.get failed");
+        return {};
+      }
+
+      const out = {};
+      for (const row of data || []) {
+        try {
+          out[row.key_id] = JSON.parse(JSON.stringify(row.value), BufferJSON.reviver);
+        } catch {
+          out[row.key_id] = row.value;
+        }
+      }
+      return out;
+    },
+
+    set: async (data) => {
+      const rows = [];
+      for (const type of Object.keys(data || {})) {
+        const entries = data[type] || {};
+        for (const id of Object.keys(entries)) {
+          const value = entries[id];
+          if (value === null || typeof value === "undefined") continue;
+          rows.push({
+            tenant_id: tid,
+            type: String(type),
+            key_id: String(id),
+            value: JSON.parse(JSON.stringify(value), BufferJSON.replacer),
+            updated_at: new Date().toISOString(),
+          });
+        }
+      }
+      if (rows.length === 0) return;
+
+      const { error } = await supabase
+        .from("wa_session_keys")
+        .upsert(rows, { onConflict: "tenant_id,type,key_id" });
+
+      if (error) logger.error({ tenantId: tid, err: error }, "wa_session_keys.set failed");
+    },
+
+    remove: async (type, ids) => {
+      if (!Array.isArray(ids) || ids.length === 0) return;
+
+      const { error } = await supabase
+        .from("wa_session_keys")
+        .delete()
+        .eq("tenant_id", tid)
+        .eq("type", String(type))
+        .in("key_id", ids.map(String));
+
+      if (error) logger.error({ tenantId: tid, type, err: error }, "wa_session_keys.remove failed");
+    },
+  };
+
+  const keys = addTransactionCapability(baseKeyStore);
+
+  const state = { creds, keys };
+
+  const saveCreds = async () => {
+    try {
+      const auth_creds = JSON.parse(JSON.stringify(state.creds), BufferJSON.replacer);
+
+      const waUserId = state?.creds?.me?.id ? String(state.creds.me.id) : null;
+      const phone = waUserId ? normalizeJidToPhone(waUserId) : null;
+
+      await updateSessionDB(tid, {
+        auth_creds,
+        wa_user_id: waUserId,
+        phone_number: phone || null,
+        last_seen_at: new Date().toISOString(),
+      });
+    } catch (e) {
+      logger.error({ tenantId: tid, err: e }, "saveCreds failed");
+    }
+  };
+
   return { state, saveCreds };
 }
 
 // ---------------------------------------------------------------------
 // 10. CORE WHATSAPP
 // ---------------------------------------------------------------------
+
+async function scheduleReconnect(tenantId, reason = "unknown") {
+  const tid = String(tenantId || "");
+  if (!tid) return;
+
+  const s = sessions.get(tid);
+  if (s && s.reconnecting) return;
+
+  const attempt = (s?.reconnect_attempt || 0) + 1;
+  const delay = Math.min(30000, 1500 * attempt);
+
+  const keepConversations = s?.conversations || new Map();
+
+  sessions.set(tid, {
+    ...(s || {}),
+    tenantId: tid,
+    reconnecting: true,
+    reconnect_attempt: attempt,
+    conversations: keepConversations,
+  });
+
+  logger.info({ tenantId: tid, attempt, delay, reason }, "🔄 Reconnect programado");
+
+  await sleep(delay);
+
+  try {
+    sessions.delete(tid);
+    await getOrCreateSession(tid);
+  } catch (e) {
+    logger.error({ tenantId: tid, err: e }, "Reconnect fallo, reintentando");
+    await scheduleReconnect(tid, "retry_error");
+  }
+}
 
 async function getOrCreateSession(tenantId) {
   const tid = String(tenantId || "");
@@ -1253,12 +1457,16 @@ async function getOrCreateSession(tenantId) {
     retryRequestDelayMs: 5000,
   });
 
+  const previous = sessions.get(tid);
   const info = {
     tenantId: tid,
     socket: sock,
     status: "connecting",
     qr: null,
-    conversations: new Map(),
+    conversations: previous?.conversations || new Map(),
+    reconnecting: false,
+    reconnect_attempt: 0,
+    last_connect_at: new Date().toISOString(),
   };
   sessions.set(tid, info);
 
@@ -1270,9 +1478,12 @@ async function getOrCreateSession(tenantId) {
       info.qr = qr;
       logger.info({ tenantId: tid }, "✨ QR Generado");
 
+      const expires = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+
       await updateSessionDB(tid, {
         qr_data: qr,
         status: "qrcode",
+        qr_expires_at: expires,
         last_seen_at: new Date().toISOString(),
       });
 
@@ -1284,29 +1495,38 @@ async function getOrCreateSession(tenantId) {
       info.qr = null;
 
       logger.info({ tenantId: tid }, "✅ Conectado");
-      const phone = sock?.user?.id ? sock.user.id.split(":")[0] : null;
+      const waUserId = sock?.user?.id ? String(sock.user.id) : null;
+      const phone = waUserId ? normalizeJidToPhone(waUserId.split(":")[0] || waUserId) : null;
 
       await updateSessionDB(tid, {
         status: "connected",
         qr_data: null,
-        phone_number: phone,
+        qr_expires_at: null,
+        phone_number: phone || null,
+        wa_user_id: waUserId,
         last_connected_at: new Date().toISOString(),
         last_seen_at: new Date().toISOString(),
+        last_error: null,
       });
     }
 
     if (connection === "close") {
-      const { DisconnectReason } = await import("@whiskeysockets/baileys");
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-      if (shouldReconnect) {
+      if (!isLoggedOut) {
         sessions.delete(tid);
-        logger.info({ tenantId: tid }, "🔄 Conexión perdida, reconectando...");
-        getOrCreateSession(tid);
+        logger.info({ tenantId: tid, statusCode }, "🔄 Conexión perdida, reconectando...");
+        await updateSessionDB(tid, {
+          status: "connecting",
+          last_seen_at: new Date().toISOString(),
+          last_error: statusCode ? String(statusCode) : "connection_close",
+        });
+        scheduleReconnect(tid, `close_${statusCode || "unknown"}`).catch(() => {});
       } else {
         sessions.delete(tid);
-        await updateSessionDB(tid, { status: "disconnected", qr_data: null });
+        await dbClearAuthState(tid);
+        await updateSessionDB(tid, { status: "disconnected", qr_data: null, last_error: "loggedOut" });
         logger.info({ tenantId: tid }, "❌ Sesión cerrada permanentemente (Logout).");
       }
     }
@@ -1491,6 +1711,9 @@ async function getOrCreateSession(tenantId) {
 
       convo.history = history;
       info.conversations.set(customerKey, convo);
+
+      // heartbeat útil en DB
+      updateSessionDB(tid, { last_seen_at: new Date().toISOString() }).catch(() => {});
     } catch (e) {
       logger.error("[wa-server] Error en messages.upsert:", e);
     }
@@ -1529,7 +1752,8 @@ app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
 
   try {
-    await updateSessionDB(tenantId, { status: "disconnected", qr_data: null });
+    // nuclear real: limpiar DB auth_state (creds + keys) para forzar QR
+    await dbClearAuthState(tenantId);
 
     const existing = sessions.get(tenantId);
     if (existing) {
@@ -1541,16 +1765,19 @@ app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
       }
     }
 
+    // mantenemos este bloque por compatibilidad, pero ya no dependemos del disco
     const sessionFolder = path.join(WA_SESSIONS_ROOT, tenantId);
     if (fs.existsSync(sessionFolder)) {
       try {
         fs.rmSync(sessionFolder, { recursive: true, force: true });
-        await sleep(2000);
+        await sleep(500);
         logger.info({ tenantId }, "🗑️ Carpeta de sesión eliminada.");
       } catch (err) {
         logger.error({ tenantId, err }, "No se pudo borrar la carpeta de sesión.");
       }
     }
+
+    await updateSessionDB(tenantId, { status: "connecting", qr_data: null, last_seen_at: new Date().toISOString() });
 
     await getOrCreateSession(tenantId);
     const ready = await waitForReady(tenantId, 12000);
@@ -1568,9 +1795,17 @@ app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
 app.post("/sessions/:tenantId/disconnect", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const s = sessions.get(tenantId);
-  if (s?.socket) await s.socket.logout().catch(() => {});
+
+  try {
+    if (s?.socket) await s.socket.logout().catch(() => {});
+  } catch {}
+
   sessions.delete(tenantId);
-  await updateSessionDB(tenantId, { status: "disconnected", qr_data: null });
+
+  // logout explícito: limpiamos DB para que NO reconecte hasta nuevo connect/QR
+  await dbClearAuthState(tenantId);
+  await updateSessionDB(tenantId, { status: "disconnected", qr_data: null, last_seen_at: new Date().toISOString() });
+
   res.json({ ok: true });
 });
 
@@ -1842,4 +2077,3 @@ nextApp
     console.error(ex.stack);
     process.exit(1);
   });
-
