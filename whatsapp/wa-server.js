@@ -35,6 +35,10 @@
  *    → Keys persistentes en wa_session_keys (type, key_id, value)
  *    → Reconnect automático SIEMPRE, excepto loggedOut o /disconnect (logout explícito)
  *    → /connect nuclear: limpia DB auth_creds + keys para forzar QR (sin depender de disco)
+ *
+ * ✅ FIX #7 (QR ALWAYS AVAILABLE TO FRONTEND):
+ *    → Si no hay session en memoria (cold start / render restart), GET /sessions/:tenantId
+ *      devuelve qr_data/status DESDE DB (whatsapp_sessions) para que el frontend siempre lo vea.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -1023,7 +1027,9 @@ INSTRUCCIONES:
 
             if (booking?.id) {
               const newStart = args.newStartsAtISO;
-              const newEnd = args.newEndsAtISO || new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
+              const newEnd =
+                args.newEndsAtISO ||
+                new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
 
               const { error } = await supabase
                 .from("bookings")
@@ -1054,7 +1060,10 @@ INSTRUCCIONES:
               .maybeSingle();
 
             if (booking?.id) {
-              const { error } = await supabase.from("bookings").update({ status: "cancelled" }).eq("id", booking.id);
+              const { error } = await supabase
+                .from("bookings")
+                .update({ status: "cancelled" })
+                .eq("id", booking.id);
 
               response = !error
                 ? JSON.stringify({ success: true, message: "Cita cancelada." })
@@ -1732,8 +1741,19 @@ app.get("/sessions/:tenantId", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const info = sessions.get(tenantId);
 
+  // ✅ FIX #7: si no hay session viva en memoria (cold start), devolvemos estado/QR desde DB
   if (!info) {
-    return res.json({ ok: true, session: { id: tenantId, status: "disconnected", qr_data: null } });
+    const row = await dbGetWhatsAppSessionRow(tenantId);
+
+    return res.json({
+      ok: true,
+      session: {
+        id: tenantId,
+        status: row?.status || "disconnected",
+        qr_data: row?.qr_data || null,
+        phone_number: row?.phone_number || null,
+      },
+    });
   }
 
   return res.json({
