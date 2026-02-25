@@ -60,7 +60,7 @@ const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
 const next = require("next");
-const NodeCache = require("node-cache");
+
 
 // Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -1409,7 +1409,12 @@ async function getOrCreateSession(tenantId) {
 
   const { state, saveCreds } = await useSupabaseAuthState(tid);
 
-  const msgRetryCounterCache = new NodeCache();
+  const msgRetryCounterCache = {
+    _m: new Map(),
+    get: (k) => msgRetryCounterCache._m.get(k),
+    set: (k, v) => msgRetryCounterCache._m.set(k, v),
+    del: (k) => msgRetryCounterCache._m.delete(k),
+  };
 
   const sock = makeWASocket({
     version, // 👈 CLAVE
