@@ -1383,7 +1383,10 @@ async function useSupabaseAuthState(tenantId) {
     },
   };
 
-  const keys = addTransactionCapability(baseKeyStore);
+  const keys = addTransactionCapability(baseKeyStore, {
+    maxCommitRetries: 10,
+    delayBetweenTriesMs: 250,
+  });
 
   const state = { creds, keys };
 
