@@ -40,10 +40,9 @@
  *    → Si no hay session en memoria (cold start / render restart), GET /sessions/:tenantId
  *      devuelve qr_data/status DESDE DB (whatsapp_sessions) para que el frontend siempre lo vea.
  *
- * ✅ FIX #8 (BAILEYS rc.9 addTransactionCapability):
- *    → En rc.9 la firma puede ser (store, logger, options). Antes se llamaba con 2 params y crasheaba:
- *      "Cannot destructure property 'maxCommitRetries' of 'undefined'"
- *    → Implementamos wrapper compatible con 1/2/3 args + fallback seguro.
+ * ✅ FIX #8 (TU LOG 405):
+ *    → WhatsApp está cortando el registro/handshake (statusCode 405) en Render.
+ *    → Solución: fetchLatestBaileysVersion() y pasar "version" al socket + backoff + lock.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -61,6 +60,7 @@ const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
 const next = require("next");
+const NodeCache = require("node-cache");
 
 // Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -72,7 +72,6 @@ const convoState = require("./conversationState");
 // CONFIGURACIÓN GLOBAL & NEXT.JS (FIX DIRECTORIO)
 // ---------------------------------------------------------------------
 
-// Next app está una carpeta atrás: /whatsapp/wa-server.js -> root del proyecto
 const projectRoot = path.join(__dirname, "..");
 const dev = false;
 const nextApp = next({ dev, dir: projectRoot });
@@ -99,20 +98,13 @@ try {
 // MIDDLEWARES (IMPORTANTÍSIMO)
 // ---------------------------------------------------------------------
 
-// ✅ SOLO estas rutas son de Express (bot). Next NO se toca.
-// NO montamos nada en "/api" para no romper Route Handlers / Auth / streams.
 app.use("/sessions", jsonParser);
 app.use("/health", jsonParser);
 
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
-// Timezone configurable (fallback RD)
 const TIMEZONE_LOCALE = process.env.TIMEZONE_LOCALE || "America/Santo_Domingo";
-
-// Offset fijo (RD normalmente -04:00). Para parsing ICS robusto.
 const TZ_OFFSET = process.env.TZ_OFFSET || "-04:00";
-
-// Si sigues usando offset viejo para business_hours
 const SERVER_OFFSET_HOURS = Number(process.env.SERVER_OFFSET_HOURS || 4);
 
 const logger = P({
@@ -146,20 +138,13 @@ if (!openaiApiKey) {
 const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
 
 /**
- * sessions: Map<tenantId, {
- * tenantId,
- * socket,
- * status,
- * qr,
- * conversations: Map<key, { history: Array<{role, content}> }>,
- * reconnecting?: boolean,
- * reconnect_attempt?: number,
- * last_connect_at?: string
- * }>
- *
- * Nota: "key" puede ser phone real (digits) o waId (jid completo) si viene @lid.
+ * sessions: Map<tenantId, { tenantId, socket, status, qr, conversations, reconnecting, reconnect_attempt }>
  */
 const sessions = new Map();
+
+// Lock de reconexión por tenant (evita que corran 2 loops a la vez)
+const reconnectLocks = new Map(); // tenantId -> boolean
+const reconnectStopAfter = Number(process.env.WA_RECONNECT_MAX_ATTEMPTS || 12);
 
 // Carpeta persistencia (ya no es requisito para auth, pero no rompe mantenerla)
 const WA_SESSIONS_ROOT =
@@ -181,7 +166,6 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Espera hasta que esté connected o al menos tenga QR listo
 async function waitForReady(tenantId, timeoutMs = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -226,22 +210,16 @@ function extractContextInfo(msg) {
 function isLidJid(jid) {
   return typeof jid === "string" && jid.endsWith("@lid");
 }
-
 function isUserJid(jid) {
   return typeof jid === "string" && jid.endsWith("@s.whatsapp.net");
 }
-
 function isGroupJid(jid) {
   return typeof jid === "string" && jid.endsWith("@g.us");
 }
 
 function normalizeJidToPhone(jid) {
   if (!jid || typeof jid !== "string") return "";
-
-  // 🔥 CRÍTICO: @lid NO es teléfono. No inventes números.
   if (isLidJid(jid)) return "";
-
-  // ej: "18099490457:28@s.whatsapp.net" -> "18099490457"
   const s = jid.trim();
   const left = s.split("@")[0] || "";
   const noDevice = left.split(":")[0] || "";
@@ -258,53 +236,36 @@ function normalizePhoneToJid(phone) {
 function normalizeAnyToJid(input) {
   const v = String(input || "").trim();
   if (!v) return "";
-
-  // Ya es jid
   if (v.includes("@s.whatsapp.net") || v.includes("@lid") || v.includes("@g.us")) return v;
-
-  // Es phone
   const digits = v.replace(/\D/g, "");
   if (digits) return `${digits}@s.whatsapp.net`;
-
   return "";
 }
 
 function resolveTargetJidFromBody(body = {}) {
-  // Prioridad: jid/waId -> phone
   const jid = body.jid || body.waId || body.remoteJid || body.to;
   const phone = body.phone;
-
   const target = normalizeAnyToJid(jid) || normalizePhoneToJid(phone);
   return target;
 }
 
 function getSenderJidFromMessage(msg) {
-  // En grupos, el sender es participant (o contextInfo.participant)
   const remoteJid = msg?.key?.remoteJid || null;
   const isGroup = !!remoteJid && String(remoteJid).endsWith("@g.us");
-
   const contextInfo = extractContextInfo(msg);
   const ctxParticipant = contextInfo?.participant || null;
 
   if (isGroup) {
-    return msg?.key?.participant || ctxParticipant || remoteJid; // último recurso
+    return msg?.key?.participant || ctxParticipant || remoteJid;
   }
-
-  // 1 a 1:
-  // Si WhatsApp trae @lid, eso será el remoteJid. No hay participant normalmente.
   return msg?.key?.participant || ctxParticipant || remoteJid;
 }
 
 function getClientIdentity(msg, sock) {
   const remoteJid = msg?.key?.remoteJid || "";
   const senderJid = getSenderJidFromMessage(msg) || "";
-
-  // waId estable (jid completo)
   const clientWaId = senderJid || remoteJid || "";
-
-  // phone solo si es un user jid real
   const clientPhone = normalizeJidToPhone(senderJid);
-
   const botPhone = normalizeJidToPhone(sock?.user?.id || "");
 
   return {
@@ -327,26 +288,21 @@ function hmsToParts(hms) {
   const [h, m] = hms.split(":").map(Number);
   return { h, m };
 }
-
 function pad2(n) {
   return n.toString().padStart(2, "0");
 }
-
 function toHHMM(t) {
   if (!t) return "";
   const parts = t.split(":");
   return `${pad2(Number(parts[0]))}:${pad2(Number(parts[1]))}`;
 }
 
-/**
- * Calcula ventanas abiertas basadas en business_hours.
- */
 function weeklyOpenWindows(weekStart, businessHours) {
   const windows = [];
   let currentDayCursor = new Date(weekStart);
 
   for (let i = 0; i < 7; i++) {
-    const currentDow = currentDayCursor.getDay(); // 0=Dom, 1=Lun...
+    const currentDow = currentDayCursor.getDay();
 
     const dayConfig = (businessHours || []).find(
       (bh) => bh.dow === currentDow && bh.is_closed === false
@@ -370,9 +326,6 @@ function weeklyOpenWindows(weekStart, businessHours) {
   return windows;
 }
 
-/**
- * Resta bookings a las ventanas abiertas.
- */
 function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
   const slots = [];
   for (const window of openWindows || []) {
@@ -388,14 +341,10 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
       const isBusy = (bookings || []).some((booking) => {
         const busyStart = new Date(booking.starts_at);
         const busyEnd = new Date(booking.ends_at);
-        return (
-          cursor.getTime() < busyEnd.getTime() &&
-          slotEnd.getTime() > busyStart.getTime()
-        );
+        return cursor.getTime() < busyEnd.getTime() && slotEnd.getTime() > busyStart.getTime();
       });
 
       if (!isBusy) slots.push({ start: new Date(cursor), end: slotEnd });
-
       cursor.setMinutes(cursor.getMinutes() + stepMin);
     }
   }
@@ -407,8 +356,7 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
 // ---------------------------------------------------------------------
 
 function createICSFile(title, description, location, startDate, durationMinutes = 60) {
-  const formatTime = (date) =>
-    date.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
+  const formatTime = (date) => date.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
 
   const start = new Date(startDate);
   const end = new Date(start.getTime() + durationMinutes * 60000);
@@ -447,7 +395,6 @@ function looksLikeICS(str) {
   if (!str || typeof str !== "string") return false;
   return str.includes("BEGIN:VCALENDAR") && str.includes("END:VCALENDAR");
 }
-
 function looksLikeBase64(str) {
   if (!str || typeof str !== "string") return false;
   const s = str.trim();
@@ -455,14 +402,12 @@ function looksLikeBase64(str) {
   if (s.length % 4 !== 0) return false;
   return /^[A-Za-z0-9+/=]+$/.test(s);
 }
-
 function stripDataUrlBase64(input) {
   const s = String(input || "").trim();
   const m = s.match(/^data:([^;]+);base64,(.*)$/i);
   if (m && m[2]) return m[2].trim();
   return s;
 }
-
 function safeBase64ToBuffer(base64) {
   const raw = stripDataUrlBase64(base64);
   if (!raw) return null;
@@ -474,10 +419,8 @@ function safeBase64ToBuffer(base64) {
     return null;
   }
 }
-
 function icsToBuffer(icsData) {
   if (!icsData) return null;
-
   if (typeof icsData !== "string") {
     try {
       icsData = String(icsData);
@@ -493,7 +436,6 @@ function icsToBuffer(icsData) {
     return Buffer.from(normalized, "utf8");
   }
 
-  // Soporta data URL también
   const stripped = stripDataUrlBase64(raw);
 
   if (looksLikeBase64(stripped)) {
@@ -502,10 +444,8 @@ function icsToBuffer(icsData) {
     if (!looksLikeICS(preview)) return null;
     return buf;
   }
-
   return null;
 }
-
 async function sendICS(sock, remoteJid, icsData, opts = {}) {
   const buf = icsToBuffer(icsData);
   if (!buf) return false;
@@ -520,14 +460,12 @@ async function sendICS(sock, remoteJid, icsData, opts = {}) {
   return true;
 }
 
-// Parsing robusto date+time usando offset fijo
 function parseLocalDateTimeToDate(dateStr, timeStr) {
   const d = String(dateStr || "").trim();
   const t = String(timeStr || "").trim().toUpperCase();
 
   if (!d) return null;
 
-  // Si viene ISO completo, úsalo
   if (d.includes("T")) {
     const dt = new Date(d);
     return isNaN(dt.getTime()) ? null : dt;
@@ -664,7 +602,8 @@ async function buildIntentHints(tenantId, userText) {
         row.locale &&
         normalizeForIntent(row.locale) !== normalizeForIntent("es-DO") &&
         normalizeForIntent(row.locale) !== normalizeForIntent("es")
-      ) continue;
+      )
+        continue;
 
       if (row.es_error) continue;
 
@@ -786,7 +725,7 @@ const tools = [
 // ---------------------------------------------------------------------
 // 6. OPENAI FALLBACK
 // ---------------------------------------------------------------------
-
+// (sin cambios, igual que tu versión)
 async function generateReply(text, tenantId, pushName, historyMessages = [], userPhone = null) {
   if (!openai) {
     logger.error("[generateReply] OpenAI no está configurado, no puedo generar respuesta IA.");
@@ -964,7 +903,6 @@ INSTRUCCIONES:
               .single();
 
             if (!error && booking?.id) {
-              // AUTO-ICS desde servidor (fallback)
               try {
                 const session = sessions.get(tid);
                 if (session?.status === "connected" && session.socket) {
@@ -1033,8 +971,7 @@ INSTRUCCIONES:
             if (booking?.id) {
               const newStart = args.newStartsAtISO;
               const newEnd =
-                args.newEndsAtISO ||
-                new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
+                args.newEndsAtISO || new Date(new Date(newStart).getTime() + 60 * 60000).toISOString();
 
               const { error } = await supabase
                 .from("bookings")
@@ -1065,10 +1002,7 @@ INSTRUCCIONES:
               .maybeSingle();
 
             if (booking?.id) {
-              const { error } = await supabase
-                .from("bookings")
-                .update({ status: "cancelled" })
-                .eq("id", booking.id);
+              const { error } = await supabase.from("bookings").update({ status: "cancelled" }).eq("id", booking.id);
 
               response = !error
                 ? JSON.stringify({ success: true, message: "Cita cancelada." })
@@ -1119,9 +1053,7 @@ async function updateSessionDB(tenantId, updateData) {
   };
 
   try {
-    const { error: upsertError } = await supabase
-      .from("whatsapp_sessions")
-      .upsert(payload, { onConflict: "tenant_id" });
+    const { error: upsertError } = await supabase.from("whatsapp_sessions").upsert(payload, { onConflict: "tenant_id" });
 
     if (upsertError) {
       console.error("[updateSessionDB] Error upsert whatsapp_sessions:", upsertError);
@@ -1136,10 +1068,7 @@ async function updateSessionDB(tenantId, updateData) {
       }
       if (isConnected) tenantUpdate.wa_last_connected_at = new Date().toISOString();
 
-      const { error: tenantError } = await supabase
-        .from("tenants")
-        .update(tenantUpdate)
-        .eq("id", tid);
+      const { error: tenantError } = await supabase.from("tenants").update(tenantUpdate).eq("id", tid);
 
       if (tenantError) console.error("[updateSessionDB] Error update tenants:", tenantError);
     }
@@ -1147,10 +1076,6 @@ async function updateSessionDB(tenantId, updateData) {
     console.error("[updateSessionDB] Error inesperado:", e);
   }
 }
-
-// ---------------------------------------------------------------------
-// DB HELPERS: whatsapp_sessions + wa_session_keys
-// ---------------------------------------------------------------------
 
 async function dbGetWhatsAppSessionRow(tenantId) {
   const tid = String(tenantId || "");
@@ -1167,44 +1092,33 @@ async function dbGetWhatsAppSessionRow(tenantId) {
   return data || null;
 }
 
-// Limpia creds + keys para forzar QR en el próximo connect
 async function dbClearAuthState(tenantId) {
   const tid = String(tenantId || "");
   if (!tid) return;
 
-  const { error: delKeysErr } = await supabase
-    .from("wa_session_keys")
-    .delete()
-    .eq("tenant_id", tid);
-
+  const { error: delKeysErr } = await supabase.from("wa_session_keys").delete().eq("tenant_id", tid);
   if (delKeysErr) logger.error({ err: delKeysErr, tenantId: tid }, "Error deleting wa_session_keys");
 
-  const { error: clearSessErr } = await supabase
-    .from("whatsapp_sessions")
-    .upsert(
-      {
-        tenant_id: tid,
-        auth_creds: null,
-        qr_data: null,
-        qr_svg: null,
-        qr_expires_at: null,
-        phone_number: null,
-        wa_user_id: null,
-        status: "disconnected",
-        last_error: null,
-        last_seen_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "tenant_id" }
-    );
+  const { error: clearSessErr } = await supabase.from("whatsapp_sessions").upsert(
+    {
+      tenant_id: tid,
+      auth_creds: null,
+      qr_data: null,
+      qr_svg: null,
+      qr_expires_at: null,
+      phone_number: null,
+      wa_user_id: null,
+      status: "disconnected",
+      last_error: null,
+      last_seen_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "tenant_id" }
+  );
 
   if (clearSessErr) logger.error({ err: clearSessErr, tenantId: tid }, "Error clearing whatsapp_sessions auth");
 
-  const { error: tErr } = await supabase
-    .from("tenants")
-    .update({ wa_connected: false, wa_phone: null })
-    .eq("id", tid);
-
+  const { error: tErr } = await supabase.from("tenants").update({ wa_connected: false, wa_phone: null }).eq("id", tid);
   if (tErr) logger.error({ err: tErr, tenantId: tid }, "Error updating tenants after clearAuth");
 }
 
@@ -1367,10 +1281,7 @@ async function useSupabaseAuthState(tenantId) {
       }
       if (rows.length === 0) return;
 
-      const { error } = await supabase
-        .from("wa_session_keys")
-        .upsert(rows, { onConflict: "tenant_id,type,key_id" });
-
+      const { error } = await supabase.from("wa_session_keys").upsert(rows, { onConflict: "tenant_id,type,key_id" });
       if (error) logger.error({ tenantId: tid, err: error }, "wa_session_keys.set failed");
     },
 
@@ -1388,29 +1299,10 @@ async function useSupabaseAuthState(tenantId) {
     },
   };
 
-  // ✅ FIX #8: wrapper compatible con bailey rc/stable
-  const txOpts = { maxCommitRetries: 10, delayBetweenTriesMs: 250 };
-  let keys;
-
-  try {
-    if (typeof addTransactionCapability === "function") {
-      const arity = addTransactionCapability.length;
-
-      // rc.9 suele ser (store, logger, options)
-      if (arity >= 3) {
-        keys = addTransactionCapability(baseKeyStore, logger, txOpts);
-      } else if (arity === 2) {
-        keys = addTransactionCapability(baseKeyStore, txOpts);
-      } else {
-        keys = addTransactionCapability(baseKeyStore);
-      }
-    } else {
-      keys = baseKeyStore;
-    }
-  } catch (e) {
-    logger.error({ tenantId: tid, err: e }, "addTransactionCapability failed, usando baseKeyStore sin tx");
-    keys = baseKeyStore;
-  }
+  const keys = addTransactionCapability(baseKeyStore, {
+    maxCommitRetries: 10,
+    delayBetweenTriesMs: 250,
+  });
 
   const state = { creds, keys };
 
@@ -1436,39 +1328,59 @@ async function useSupabaseAuthState(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 10. CORE WHATSAPP
+// 10. CORE WHATSAPP (RECONNECT HARDENED)
 // ---------------------------------------------------------------------
 
 async function scheduleReconnect(tenantId, reason = "unknown") {
   const tid = String(tenantId || "");
   if (!tid) return;
 
-  const s = sessions.get(tid);
-  if (s && s.reconnecting) return;
-
-  const attempt = (s?.reconnect_attempt || 0) + 1;
-  const delay = Math.min(30000, 1500 * attempt);
-
-  const keepConversations = s?.conversations || new Map();
-
-  sessions.set(tid, {
-    ...(s || {}),
-    tenantId: tid,
-    reconnecting: true,
-    reconnect_attempt: attempt,
-    conversations: keepConversations,
-  });
-
-  logger.info({ tenantId: tid, attempt, delay, reason }, "🔄 Reconnect programado");
-
-  await sleep(delay);
+  // lock duro: evita reconexiones paralelas
+  if (reconnectLocks.get(tid)) return;
+  reconnectLocks.set(tid, true);
 
   try {
-    sessions.delete(tid);
-    await getOrCreateSession(tid);
-  } catch (e) {
-    logger.error({ tenantId: tid, err: e }, "Reconnect fallo, reintentando");
-    await scheduleReconnect(tid, "retry_error");
+    const s = sessions.get(tid);
+    const attempt = (s?.reconnect_attempt || 0) + 1;
+
+    if (attempt > reconnectStopAfter) {
+      logger.error({ tenantId: tid, attempt, reason }, "🛑 Reconnect stop (max attempts). Marcando disconnected.");
+      await updateSessionDB(tid, {
+        status: "disconnected",
+        last_error: `reconnect_stop_${reason}`,
+        last_seen_at: new Date().toISOString(),
+      });
+      sessions.delete(tid);
+      return;
+    }
+
+    // backoff progresivo + jitter
+    const base = 1500 * attempt;
+    const jitter = Math.floor(Math.random() * 600);
+    const delay = Math.min(60000, base + jitter);
+
+    const keepConversations = s?.conversations || new Map();
+    sessions.set(tid, {
+      ...(s || {}),
+      tenantId: tid,
+      reconnecting: true,
+      reconnect_attempt: attempt,
+      conversations: keepConversations,
+    });
+
+    logger.info({ tenantId: tid, attempt, delay, reason }, "🔄 Reconnect programado");
+
+    await sleep(delay);
+
+    try {
+      sessions.delete(tid);
+      await getOrCreateSession(tid);
+    } catch (e) {
+      logger.error({ tenantId: tid, err: e }, "Reconnect fallo (inner)");
+      // dejamos que el loop externo vuelva a llamar por close events; no recursivo infinito aquí
+    }
+  } finally {
+    reconnectLocks.set(tid, false);
   }
 }
 
@@ -1479,10 +1391,28 @@ async function getOrCreateSession(tenantId) {
 
   logger.info({ tenantId: tid }, "🔌 Iniciando Socket...");
 
-  const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
+  const {
+    default: makeWASocket,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+  } = await import("@whiskeysockets/baileys");
+
+  // ✅ FIX #8: version latest (reduce 405 en Render)
+  let version = undefined;
+  try {
+    const v = await fetchLatestBaileysVersion();
+    version = v?.version;
+    logger.info({ tenantId: tid, version, isLatest: v?.isLatest }, "Using WA Web version");
+  } catch (e) {
+    logger.warn({ tenantId: tid, err: e?.message || e }, "No pude fetchLatestBaileysVersion (usando default)");
+  }
+
   const { state, saveCreds } = await useSupabaseAuthState(tid);
 
+  const msgRetryCounterCache = new NodeCache();
+
   const sock = makeWASocket({
+    version, // 👈 CLAVE
     auth: state,
     logger,
     printQRInTerminal: false,
@@ -1491,6 +1421,7 @@ async function getOrCreateSession(tenantId) {
     connectTimeoutMs: 60000,
     keepAliveIntervalMs: 10000,
     retryRequestDelayMs: 5000,
+    msgRetryCounterCache,
   });
 
   const previous = sessions.get(tid);
@@ -1501,7 +1432,7 @@ async function getOrCreateSession(tenantId) {
     qr: null,
     conversations: previous?.conversations || new Map(),
     reconnecting: false,
-    reconnect_attempt: 0,
+    reconnect_attempt: previous?.reconnect_attempt || 0,
     last_connect_at: new Date().toISOString(),
   };
   sessions.set(tid, info);
@@ -1529,6 +1460,7 @@ async function getOrCreateSession(tenantId) {
     if (connection === "open") {
       info.status = "connected";
       info.qr = null;
+      info.reconnect_attempt = 0;
 
       logger.info({ tenantId: tid }, "✅ Conectado");
       const waUserId = sock?.user?.id ? String(sock.user.id) : null;
@@ -1548,23 +1480,32 @@ async function getOrCreateSession(tenantId) {
 
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-      if (!isLoggedOut) {
-        sessions.delete(tid);
-        logger.info({ tenantId: tid, statusCode }, "🔄 Conexión perdida, reconectando...");
-        await updateSessionDB(tid, {
-          status: "connecting",
-          last_seen_at: new Date().toISOString(),
-          last_error: statusCode ? String(statusCode) : "connection_close",
-        });
-        scheduleReconnect(tid, `close_${statusCode || "unknown"}`).catch(() => {});
-      } else {
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+      if (isLoggedOut) {
         sessions.delete(tid);
         await dbClearAuthState(tid);
-        await updateSessionDB(tid, { status: "disconnected", qr_data: null, last_error: "loggedOut" });
+        await updateSessionDB(tid, {
+          status: "disconnected",
+          qr_data: null,
+          last_error: "loggedOut",
+          last_seen_at: new Date().toISOString(),
+        });
         logger.info({ tenantId: tid }, "❌ Sesión cerrada permanentemente (Logout).");
+        return;
       }
+
+      // ✅ IMPORTANT: NO borrar auth por 405. Es handshake/version/rate. Solo reconnect backoff.
+      sessions.delete(tid);
+      logger.info({ tenantId: tid, statusCode }, "🔄 Conexión perdida, reconectando...");
+
+      await updateSessionDB(tid, {
+        status: "connecting",
+        last_seen_at: new Date().toISOString(),
+        last_error: statusCode ? String(statusCode) : "connection_close",
+      });
+
+      scheduleReconnect(tid, `close_${statusCode || "unknown"}`).catch(() => {});
     }
   });
 
@@ -1581,13 +1522,10 @@ async function getOrCreateSession(tenantId) {
 
       if (!msg?.message || msg.key.fromMe) return;
 
-      // ✅ identidad real del cliente
       const identity = getClientIdentity(msg, sock);
-
       const remoteJid = identity.remoteJid;
       if (!remoteJid) return;
 
-      // si quieres ignorar grupos:
       if (identity.isGroup) return;
 
       const text =
@@ -1599,11 +1537,7 @@ async function getOrCreateSession(tenantId) {
 
       const pushName = msg.pushName || "Cliente";
 
-      // ✅ clave estable del cliente:
-      // - si hay phone real => úsalo
-      // - si viene @lid => usa waId (jid completo)
       const customerKey = identity.clientPhone || identity.clientWaId;
-
       if (!customerKey) {
         logger.warn(
           {
@@ -1618,7 +1552,6 @@ async function getOrCreateSession(tenantId) {
         return;
       }
 
-      // Log útil (una vez por msg)
       logger.info(
         {
           tenantId: tid,
@@ -1657,16 +1590,9 @@ async function getOrCreateSession(tenantId) {
         const payload = {
           tenantId: tid,
           customerId: String(customerId),
-
-          // ✅ siempre manda waId (jid completo). Es lo único 100% estable.
           waId: String(identity.clientWaId || ""),
-
-          // ✅ phoneNumber SOLO si existe (si es @lid, va null/vacío)
           phoneNumber: identity.clientPhone ? String(identity.clientPhone) : null,
-
-          // ✅ clave usada en tu sistema (puede ser phone o waId)
           customerKey: String(customerKey),
-
           text,
           customerName: pushName,
           state: {
@@ -1725,10 +1651,8 @@ async function getOrCreateSession(tenantId) {
         }
       }
 
-      // ✅ Para responder, SIEMPRE usa remoteJid tal como viene (lid/user).
       await sock.sendMessage(remoteJid, { text: replyText });
 
-      // Si n8n mandó icsData, lo mandamos también
       if (icsData) {
         const ok = await sendICS(sock, remoteJid, icsData, {
           fileName: "cita_confirmada.ics",
@@ -1748,7 +1672,6 @@ async function getOrCreateSession(tenantId) {
       convo.history = history;
       info.conversations.set(customerKey, convo);
 
-      // heartbeat útil en DB
       updateSessionDB(tid, { last_seen_at: new Date().toISOString() }).catch(() => {});
     } catch (e) {
       logger.error("[wa-server] Error en messages.upsert:", e);
@@ -1768,10 +1691,8 @@ app.get("/sessions/:tenantId", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const info = sessions.get(tenantId);
 
-  // ✅ FIX #7: si no hay session viva en memoria (cold start), devolvemos estado/QR desde DB
   if (!info) {
     const row = await dbGetWhatsAppSessionRow(tenantId);
-
     return res.json({
       ok: true,
       session: {
@@ -1794,12 +1715,10 @@ app.get("/sessions/:tenantId", jsonParser, async (req, res) => {
   });
 });
 
-// CONNECT NUCLEAR (corrige wait)
 app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
 
   try {
-    // nuclear real: limpiar DB auth_state (creds + keys) para forzar QR
     await dbClearAuthState(tenantId);
 
     const existing = sessions.get(tenantId);
@@ -1812,7 +1731,6 @@ app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
       }
     }
 
-    // mantenemos este bloque por compatibilidad, pero ya no dependemos del disco
     const sessionFolder = path.join(WA_SESSIONS_ROOT, tenantId);
     if (fs.existsSync(sessionFolder)) {
       try {
@@ -1824,7 +1742,11 @@ app.post("/sessions/:tenantId/connect", jsonParser, async (req, res) => {
       }
     }
 
-    await updateSessionDB(tenantId, { status: "connecting", qr_data: null, last_seen_at: new Date().toISOString() });
+    await updateSessionDB(tenantId, {
+      status: "connecting",
+      qr_data: null,
+      last_seen_at: new Date().toISOString(),
+    });
 
     await getOrCreateSession(tenantId);
     const ready = await waitForReady(tenantId, 12000);
@@ -1849,14 +1771,16 @@ app.post("/sessions/:tenantId/disconnect", jsonParser, async (req, res) => {
 
   sessions.delete(tenantId);
 
-  // logout explícito: limpiamos DB para que NO reconecte hasta nuevo connect/QR
   await dbClearAuthState(tenantId);
-  await updateSessionDB(tenantId, { status: "disconnected", qr_data: null, last_seen_at: new Date().toISOString() });
+  await updateSessionDB(tenantId, {
+    status: "disconnected",
+    qr_data: null,
+    last_seen_at: new Date().toISOString(),
+  });
 
   res.json({ ok: true });
 });
 
-// ✅ SEND MESSAGE: ahora acepta jid/waId además de phone
 app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const { message } = req.body || {};
@@ -1892,7 +1816,6 @@ app.post("/sessions/:tenantId/send-message", jsonParser, async (req, res) => {
   }
 });
 
-// ✅ SEND TEMPLATE: acepta jid/waId además de phone
 app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const { event, variables } = req.body || {};
@@ -1920,7 +1843,6 @@ app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   try {
     await session.socket.sendMessage(targetJid, { text: message });
 
-    // ICS SOLO si date/time vienen y parsea bien
     if (event === "booking_confirmed" && variables?.date && variables?.time) {
       const context = await getTenantContext(tenantId);
       const appointmentDate = parseLocalDateTimeToDate(variables.date, variables.time);
@@ -1953,7 +1875,6 @@ app.post("/sessions/:tenantId/send-template", jsonParser, async (req, res) => {
   }
 });
 
-// ✅ SEND MEDIA: acepta jid/waId además de phone (LID SAFE), base64 robusto
 app.post("/sessions/:tenantId/send-media", jsonParser, async (req, res) => {
   const tenantId = String(req.params.tenantId || "");
   const { type, base64, fileName, mimetype, caption } = req.body || {};
@@ -2056,7 +1977,7 @@ app.get("/api/v1/availability", (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 16. RESTORE SESSIONS
+// 16. RESTORE SESSIONS (SECUENCIAL PARA NO MATAR WA EN RENDER)
 // ---------------------------------------------------------------------
 
 async function restoreSessions() {
@@ -2078,6 +1999,7 @@ async function restoreSessions() {
       return;
     }
 
+    // ✅ secuencial + delay para evitar handshake/rate-limit (reduce 405)
     for (const row of data) {
       const tenantId = String(row.tenant_id || "");
       if (!tenantId) continue;
@@ -2089,6 +2011,8 @@ async function restoreSessions() {
       } catch (err) {
         logger.error({ tenantId, err }, "Error restaurando sesión de WhatsApp");
       }
+
+      await sleep(900); // mini throttle
     }
   } catch (e) {
     logger.error(e, "Fallo general en restoreSessions");
