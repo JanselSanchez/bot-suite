@@ -26,7 +26,6 @@ function getTenantId(req: Request) {
 }
 
 function logSbError(tag: string, err: any) {
-  // Supabase PostgrestError normalmente trae: message, details, hint, code
   console.error(tag, {
     message: err?.message ?? "",
     code: err?.code ?? "",
@@ -48,12 +47,18 @@ export async function GET(req: Request) {
         hasUrl: !!supabaseUrl,
         hasService: !!serviceRoleKey,
       });
-      return Response.json({ ok: false, error: "ENV_MISSING" } satisfies MetricsResponse, { status: 500 });
+      return Response.json(
+        { ok: false, error: "ENV_MISSING" } satisfies MetricsResponse,
+        { status: 500 }
+      );
     }
 
     const tenantId = getTenantId(req);
     if (!tenantId) {
-      return Response.json({ ok: false, error: "tenantId required" } satisfies MetricsResponse, { status: 400 });
+      return Response.json(
+        { ok: false, error: "tenantId required" } satisfies MetricsResponse,
+        { status: 400 }
+      );
     }
 
     const sb = createClient(supabaseUrl, serviceRoleKey, {
@@ -61,23 +66,31 @@ export async function GET(req: Request) {
     });
 
     const now = new Date();
-    const start = new Date(now);
-    start.setHours(0, 0, 0, 0);
+
+    // Rango de "hoy" en UTC (consistente con toISOString()).
+    // Si quieres "hoy" en hora local RD, hay que calcularlo por TZ en servidor,
+    // pero por ahora mantenemos coherencia con tus timestamps ISO.
+    const startOfToday = new Date(now);
+    startOfToday.setUTCHours(0, 0, 0, 0);
+
+    const startOfTomorrow = new Date(startOfToday);
+    startOfTomorrow.setUTCDate(startOfTomorrow.getUTCDate() + 1);
 
     const isoNow = now.toISOString();
-    const isoStart = start.toISOString();
+    const isoStartToday = startOfToday.toISOString();
+    const isoStartTomorrow = startOfTomorrow.toISOString();
 
     // ✅ bookingsToday (solo count)
+    // 🔥 FIX: la columna correcta en tu sistema es "starts_at" (no start_at)
     const bookingsTodayRes = await sb
       .from("bookings")
       .select("id", { count: "exact", head: true })
       .eq("tenant_id", tenantId)
-      .gte("start_at", isoStart)
-      .lte("start_at", isoNow);
+      .gte("starts_at", isoStartToday)
+      .lt("starts_at", isoStartTomorrow);
 
     if (bookingsTodayRes.error) {
       logSbError("[/api/admin/metrics] bookingsToday error", bookingsTodayRes.error);
-      // 🔥 NO devolver el error crudo; devolver strings
       return Response.json(
         {
           ok: false,
@@ -94,12 +107,13 @@ export async function GET(req: Request) {
       );
     }
 
-    // ✅ upcoming
+    // ✅ upcoming (desde ahora en adelante)
+    // 🔥 FIX: "starts_at"
     const upcomingRes = await sb
       .from("bookings")
       .select("id", { count: "exact", head: true })
       .eq("tenant_id", tenantId)
-      .gte("start_at", isoNow);
+      .gte("starts_at", isoNow);
 
     if (upcomingRes.error) {
       logSbError("[/api/admin/metrics] upcoming error", upcomingRes.error);
@@ -137,6 +151,9 @@ export async function GET(req: Request) {
       stack: e?.stack,
     });
 
-    return Response.json({ ok: false, error: "internal_error" } satisfies MetricsResponse, { status: 500 });
+    return Response.json(
+      { ok: false, error: "internal_error" } satisfies MetricsResponse,
+      { status: 500 }
+    );
   }
 }
