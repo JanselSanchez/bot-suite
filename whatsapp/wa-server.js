@@ -1109,6 +1109,7 @@ async function dbClearAuthState(tenantId) {
     {
       tenant_id: tid,
       auth_creds: null,
+      auth_keys: null, // ✅ NUEVO: limpiar mirror JSONB de keys también (no afecta tu tabla wa_session_keys)
       qr_data: null,
       qr_svg: null,
       qr_expires_at: null,
@@ -1250,6 +1251,111 @@ function addTransactionCapabilityCompat(addTransactionCapabilityFn, store, log) 
   }
 }
 
+// ✅ NUEVO: helpers para MIRROR de keys en whatsapp_sessions.auth_keys (jsonb)
+// (Esto NO reemplaza wa_session_keys, solo lo refleja en la fila principal para que tú puedas ver "tamaño" y verificar persistencia.)
+function mergeDeep(target, source) {
+  if (!source || typeof source !== "object") return target;
+  const out = { ...(target || {}) };
+  for (const k of Object.keys(source)) {
+    const sv = source[k];
+    const tv = out[k];
+    out[k] =
+      sv && typeof sv === "object" && !Array.isArray(sv)
+        ? mergeDeep(tv, sv)
+        : sv;
+  }
+  return out;
+}
+
+async function dbGetAuthKeysBlob(tenantId) {
+  const tid = String(tenantId || "");
+  if (!tid) return null;
+
+  const { data, error } = await supabase
+    .from("whatsapp_sessions")
+    .select("auth_keys")
+    .eq("tenant_id", tid)
+    .maybeSingle();
+
+  if (error) {
+    logger.error({ tenantId: tid, err: error }, "dbGetAuthKeysBlob failed");
+    return null;
+  }
+  return data?.auth_keys || null;
+}
+
+async function dbUpsertAuthKeysBlob(tenantId, nextAuthKeysBlob) {
+  const tid = String(tenantId || "");
+  if (!tid) return;
+
+  try {
+    await updateSessionDB(tid, {
+      auth_keys: nextAuthKeysBlob,
+      last_seen_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    logger.error({ tenantId: tid, err: e }, "dbUpsertAuthKeysBlob failed");
+  }
+}
+
+async function mirrorKeysToAuthKeysJsonb(tenantId, dataToSet, BufferJSON) {
+  const tid = String(tenantId || "");
+  if (!tid) return;
+
+  try {
+    // leer blob existente (si no hay, iniciamos)
+    const currentRaw = await dbGetAuthKeysBlob(tid);
+    let current = {};
+    if (currentRaw) {
+      try {
+        current = JSON.parse(JSON.stringify(currentRaw), BufferJSON.reviver) || {};
+      } catch {
+        current = currentRaw || {};
+      }
+    }
+
+    // dataToSet viene como { type: { id: value } } (Baileys style)
+    const merged = mergeDeep(current, dataToSet || {});
+    const payload = JSON.parse(JSON.stringify(merged), BufferJSON.replacer);
+
+    await dbUpsertAuthKeysBlob(tid, payload);
+  } catch (e) {
+    logger.error({ tenantId: tid, err: e }, "mirrorKeysToAuthKeysJsonb failed");
+  }
+}
+
+async function mirrorKeysRemoveFromAuthKeysJsonb(tenantId, type, ids, BufferJSON) {
+  const tid = String(tenantId || "");
+  if (!tid) return;
+  if (!type || !Array.isArray(ids) || ids.length === 0) return;
+
+  try {
+    const currentRaw = await dbGetAuthKeysBlob(tid);
+    if (!currentRaw) return; // nada que remover
+
+    let current = {};
+    try {
+      current = JSON.parse(JSON.stringify(currentRaw), BufferJSON.reviver) || {};
+    } catch {
+      current = currentRaw || {};
+    }
+
+    if (!current || typeof current !== "object") return;
+    if (!current[type] || typeof current[type] !== "object") return;
+
+    for (const id of ids) {
+      try {
+        delete current[type][String(id)];
+      } catch {}
+    }
+
+    const payload = JSON.parse(JSON.stringify(current), BufferJSON.replacer);
+    await dbUpsertAuthKeysBlob(tid, payload);
+  } catch (e) {
+    logger.error({ tenantId: tid, err: e }, "mirrorKeysRemoveFromAuthKeysJsonb failed");
+  }
+}
+
 async function useSupabaseAuthState(tenantId) {
   const tid = String(tenantId || "");
   if (!tid) throw new Error("useSupabaseAuthState requiere tenantId");
@@ -1316,6 +1422,10 @@ async function useSupabaseAuthState(tenantId) {
 
       const { error } = await supabase.from("wa_session_keys").upsert(rows, { onConflict: "tenant_id,type,key_id" });
       if (error) logger.error({ tenantId: tid, err: error }, "wa_session_keys.set failed");
+
+      // ✅ NUEVO: mirror a whatsapp_sessions.auth_keys (jsonb) para verificar persistencia en una sola fila
+      // (No afecta tu tabla wa_session_keys ni la lógica de Baileys)
+      mirrorKeysToAuthKeysJsonb(tid, data, BufferJSON).catch(() => {});
     },
 
     remove: async (type, ids) => {
@@ -1329,6 +1439,9 @@ async function useSupabaseAuthState(tenantId) {
         .in("key_id", ids.map(String));
 
       if (error) logger.error({ tenantId: tid, type, err: error }, "wa_session_keys.remove failed");
+
+      // ✅ NUEVO: mirror remove en whatsapp_sessions.auth_keys (jsonb)
+      mirrorKeysRemoveFromAuthKeysJsonb(tid, String(type), ids.map(String), BufferJSON).catch(() => {});
     },
   };
 
