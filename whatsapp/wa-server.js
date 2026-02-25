@@ -39,6 +39,11 @@
  * ✅ FIX #7 (QR ALWAYS AVAILABLE TO FRONTEND):
  *    → Si no hay session en memoria (cold start / render restart), GET /sessions/:tenantId
  *      devuelve qr_data/status DESDE DB (whatsapp_sessions) para que el frontend siempre lo vea.
+ *
+ * ✅ FIX #8 (BAILEYS rc.9 addTransactionCapability):
+ *    → En rc.9 la firma puede ser (store, logger, options). Antes se llamaba con 2 params y crasheaba:
+ *      "Cannot destructure property 'maxCommitRetries' of 'undefined'"
+ *    → Implementamos wrapper compatible con 1/2/3 args + fallback seguro.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -1383,10 +1388,29 @@ async function useSupabaseAuthState(tenantId) {
     },
   };
 
-  const keys = addTransactionCapability(baseKeyStore, {
-    maxCommitRetries: 10,
-    delayBetweenTriesMs: 250,
-  });
+  // ✅ FIX #8: wrapper compatible con bailey rc/stable
+  const txOpts = { maxCommitRetries: 10, delayBetweenTriesMs: 250 };
+  let keys;
+
+  try {
+    if (typeof addTransactionCapability === "function") {
+      const arity = addTransactionCapability.length;
+
+      // rc.9 suele ser (store, logger, options)
+      if (arity >= 3) {
+        keys = addTransactionCapability(baseKeyStore, logger, txOpts);
+      } else if (arity === 2) {
+        keys = addTransactionCapability(baseKeyStore, txOpts);
+      } else {
+        keys = addTransactionCapability(baseKeyStore);
+      }
+    } else {
+      keys = baseKeyStore;
+    }
+  } catch (e) {
+    logger.error({ tenantId: tid, err: e }, "addTransactionCapability failed, usando baseKeyStore sin tx");
+    keys = baseKeyStore;
+  }
 
   const state = { creds, keys };
 
