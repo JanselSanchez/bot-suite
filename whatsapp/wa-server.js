@@ -43,6 +43,13 @@
  * ✅ FIX #8 (TU LOG 405):
  *    → WhatsApp está cortando el registro/handshake (statusCode 405) en Render.
  *    → Solución: fetchLatestBaileysVersion() y pasar "version" al socket + backoff + lock.
+ *
+ * ✅ FIX #9 (EL ERROR REAL DE HOY):
+ *    → Baileys cambió la firma de addTransactionCapability:
+ *        - Algunas versiones: addTransactionCapability(store, options)
+ *        - Otras versiones:   addTransactionCapability(store, logger, options)
+ *      En Render te está pidiendo la 2da (3 args) y por eso options llega undefined.
+ *      → Implementamos wrapper compatible para ambas.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -60,7 +67,6 @@ const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
 const next = require("next");
-
 
 // Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -1217,6 +1223,33 @@ function buildBookingEventFromMessage(text, session) {
 // 9. AUTH STATE
 // ---------------------------------------------------------------------
 
+function addTransactionCapabilityCompat(addTransactionCapabilityFn, store, log) {
+  const txOptions = { maxCommitRetries: 10, delayBetweenTriesMs: 250 };
+
+  // Si no existe o falla, devolvemos store limpio (sin transacciones) para no romper el boot
+  if (typeof addTransactionCapabilityFn !== "function") return store;
+
+  // Hay versiones que usan: (store, options)
+  // Otras que usan:        (store, logger, options)
+  try {
+    if (addTransactionCapabilityFn.length >= 3) {
+      return addTransactionCapabilityFn(store, log, txOptions);
+    }
+    return addTransactionCapabilityFn(store, txOptions);
+  } catch (e1) {
+    try {
+      // fallback inverso por si length miente (bundling/transpile)
+      return addTransactionCapabilityFn(store, log, txOptions);
+    } catch (e2) {
+      try {
+        return addTransactionCapabilityFn(store, txOptions);
+      } catch {
+        return store;
+      }
+    }
+  }
+}
+
 async function useSupabaseAuthState(tenantId) {
   const tid = String(tenantId || "");
   if (!tid) throw new Error("useSupabaseAuthState requiere tenantId");
@@ -1299,10 +1332,8 @@ async function useSupabaseAuthState(tenantId) {
     },
   };
 
-  const keys = addTransactionCapability(baseKeyStore, {
-    maxCommitRetries: 10,
-    delayBetweenTriesMs: 250,
-  });
+  // ✅ FIX #9: wrapper compatible para addTransactionCapability (2 o 3 args)
+  const keys = addTransactionCapabilityCompat(addTransactionCapability, baseKeyStore, logger);
 
   const state = { creds, keys };
 
