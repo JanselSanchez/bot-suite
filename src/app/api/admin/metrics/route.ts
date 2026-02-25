@@ -25,15 +25,22 @@ function getTenantId(req: Request) {
   return "";
 }
 
+function normalizeAnyError(err: any) {
+  // Soporta PostgrestError y errores tipo TypeError (fetch failed, etc.)
+  const isObject = err && typeof err === "object";
+  return {
+    message: isObject ? (err.message ?? String(err)) : String(err ?? ""),
+    code: isObject ? (err.code ?? "") : "",
+    details: isObject ? (err.details ?? "") : "",
+    hint: isObject ? (err.hint ?? "") : "",
+    status: isObject ? (err.status ?? "") : "",
+    name: isObject ? (err.name ?? "") : "",
+    stack: isObject ? (err.stack ?? "") : "",
+  };
+}
+
 function logSbError(tag: string, err: any) {
-  console.error(tag, {
-    message: err?.message ?? "",
-    code: err?.code ?? "",
-    details: err?.details ?? "",
-    hint: err?.hint ?? "",
-    status: err?.status ?? "",
-    name: err?.name ?? "",
-  });
+  console.error(tag, normalizeAnyError(err));
 }
 
 export async function GET(req: Request) {
@@ -67,9 +74,7 @@ export async function GET(req: Request) {
 
     const now = new Date();
 
-    // Rango de "hoy" en UTC (consistente con toISOString()).
-    // Si quieres "hoy" en hora local RD, hay que calcularlo por TZ en servidor,
-    // pero por ahora mantenemos coherencia con tus timestamps ISO.
+    // "hoy" en UTC (coherente con timestamps ISO)
     const startOfToday = new Date(now);
     startOfToday.setUTCHours(0, 0, 0, 0);
 
@@ -80,8 +85,7 @@ export async function GET(req: Request) {
     const isoStartToday = startOfToday.toISOString();
     const isoStartTomorrow = startOfTomorrow.toISOString();
 
-    // ✅ bookingsToday (solo count)
-    // 🔥 FIX: la columna correcta en tu sistema es "starts_at" (no start_at)
+    // ✅ FIX: columna correcta es starts_at (no start_at)
     const bookingsTodayRes = await sb
       .from("bookings")
       .select("id", { count: "exact", head: true })
@@ -91,24 +95,18 @@ export async function GET(req: Request) {
 
     if (bookingsTodayRes.error) {
       logSbError("[/api/admin/metrics] bookingsToday error", bookingsTodayRes.error);
+      const e = normalizeAnyError(bookingsTodayRes.error);
       return Response.json(
         {
           ok: false,
           tenantId,
           error: "DB_ERROR_BOOKINGS_TODAY",
-          detail: {
-            message: bookingsTodayRes.error.message ?? "",
-            code: (bookingsTodayRes.error as any).code ?? "",
-            details: (bookingsTodayRes.error as any).details ?? "",
-            hint: (bookingsTodayRes.error as any).hint ?? "",
-          },
+          detail: e,
         } satisfies MetricsResponse,
         { status: 500 }
       );
     }
 
-    // ✅ upcoming (desde ahora en adelante)
-    // 🔥 FIX: "starts_at"
     const upcomingRes = await sb
       .from("bookings")
       .select("id", { count: "exact", head: true })
@@ -117,17 +115,13 @@ export async function GET(req: Request) {
 
     if (upcomingRes.error) {
       logSbError("[/api/admin/metrics] upcoming error", upcomingRes.error);
+      const e = normalizeAnyError(upcomingRes.error);
       return Response.json(
         {
           ok: false,
           tenantId,
           error: "DB_ERROR_UPCOMING",
-          detail: {
-            message: upcomingRes.error.message ?? "",
-            code: (upcomingRes.error as any).code ?? "",
-            details: (upcomingRes.error as any).details ?? "",
-            hint: (upcomingRes.error as any).hint ?? "",
-          },
+          detail: e,
         } satisfies MetricsResponse,
         { status: 500 }
       );
@@ -145,14 +139,11 @@ export async function GET(req: Request) {
       { status: 200 }
     );
   } catch (e: any) {
-    console.error("[/api/admin/metrics] FATAL", {
-      message: e?.message,
-      name: e?.name,
-      stack: e?.stack,
-    });
+    const info = normalizeAnyError(e);
+    console.error("[/api/admin/metrics] FATAL", info);
 
     return Response.json(
-      { ok: false, error: "internal_error" } satisfies MetricsResponse,
+      { ok: false, error: "internal_error", detail: info } satisfies MetricsResponse,
       { status: 500 }
     );
   }
