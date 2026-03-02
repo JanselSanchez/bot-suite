@@ -10,6 +10,13 @@ type MetricsResponse = {
     bookingsToday: number;
     bookingsUpcoming: number;
   };
+  // ✅ Añadimos los tipos que el Dashboard (UI) está esperando
+  totals?: {
+    bookings: number;
+    tenants: number;
+    messages: number;
+  };
+  recent?: any[];
   error?: string;
   detail?: any;
 };
@@ -127,6 +134,37 @@ export async function GET(req: Request) {
       );
     }
 
+    // ==========================================
+    // ✅ NUEVAS CONSULTAS PARA ALIMENTAR EL UI
+    // ==========================================
+    
+    // 1. Total histórico de citas
+    const totalBookingsRes = await sb
+      .from("bookings")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenantId);
+
+    // 2. Total de clientes (tenants)
+    const totalCustomersRes = await sb
+      .from("customers")
+      .select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenantId);
+
+    // 3. Últimas 5 citas (Actividad Reciente)
+    const recentRes = await sb
+      .from("bookings")
+      .select("id, customer_name, created_at, starts_at")
+      .eq("tenant_id", tenantId)
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    // Formateamos las citas recientes para que el UI las lea fácil
+    const recentFormatted = (recentRes.data || []).map((b: any) => ({
+      id: String(b.id),
+      title: b.customer_name ? `Cita: ${b.customer_name}` : "Cita agendada",
+      created_at: b.created_at || b.starts_at,
+    }));
+
     return Response.json(
       {
         ok: true,
@@ -135,6 +173,13 @@ export async function GET(req: Request) {
           bookingsToday: bookingsTodayRes.count ?? 0,
           bookingsUpcoming: upcomingRes.count ?? 0,
         },
+        // ✅ Pasamos las variables exactas que tu UI está pidiendo
+        totals: {
+          bookings: totalBookingsRes.count ?? 0,
+          tenants: totalCustomersRes.count ?? 0,
+          messages: 0, // Si tienes tabla de mensajes en un futuro, va aquí
+        },
+        recent: recentFormatted,
       } satisfies MetricsResponse,
       { status: 200 }
     );
