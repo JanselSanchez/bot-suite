@@ -1776,8 +1776,8 @@ async function getOrCreateSession(tenantId) {
 
       if (!replyText) {
         logger.info({ tenantId: tid }, "[wa-server] Usando fallback de OpenAI");
-        const fallback = await generateReply(text, tid, pushName, history, identity.clientPhone || null);
-        replyText =
+// Pasamos customerKey (que siempre tiene un valor, sea phone o JID) en lugar de solo clientPhone
+const fallback = await generateReply(text, tid, pushName, history, customerKey);        replyText =
           fallback ||
           "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
 
