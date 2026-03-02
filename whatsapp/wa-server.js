@@ -1446,7 +1446,7 @@ async function useSupabaseAuthState(tenantId) {
   };
 
   // ✅ FIX #9: wrapper compatible para addTransactionCapability (2 o 3 args)
-  const keys = baseKeyStore;
+  const keys = addTransactionCapabilityCompat(addTransactionCapability, baseKeyStore, logger);
   
   const state = { creds, keys };
 
