@@ -204,12 +204,30 @@ export default function AdminBookingsPage() {
             ) : (
               rows.map((b) => {
                 const d = new Date(b.starts_at);
-                const day = d.toLocaleDateString("es-DO", { year: "numeric", month: "2-digit", day: "2-digit" });
-                const hour = d.toLocaleTimeString("es-DO", { hour: "2-digit", minute: "2-digit" });
+                let day = "-";
+                let hour = "-";
+                
+                // ✅ Formateo robusto con zona horaria estricta
+                if (!isNaN(d.getTime())) {
+                  day = new Intl.DateTimeFormat("es-DO", {
+                    day: "2-digit",
+                    month: "short",
+                    year: "numeric",
+                    timeZone: "America/Santo_Domingo",
+                  }).format(d);
+                  
+                  hour = new Intl.DateTimeFormat("es-DO", {
+                    hour: "numeric",
+                    minute: "2-digit",
+                    hour12: true,
+                    timeZone: "America/Santo_Domingo",
+                  }).format(d);
+                }
+
                 return (
                   <tr key={b.id} className="border-t">
-                    <td className="p-3">{day}</td>
-                    <td className="p-3">{hour}</td>
+                    <td className="p-3 capitalize">{day}</td>
+                    <td className="p-3 uppercase">{hour}</td>
                     <td className="p-3">{b.customer_name ?? "Cliente"}</td>
                     <td className="p-3">{b.customer_phone ?? "-"}</td>
                     <td className="p-3 capitalize">{b.status?.replace("_", " ") ?? "-"}</td>
