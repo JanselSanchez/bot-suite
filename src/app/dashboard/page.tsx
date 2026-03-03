@@ -5,6 +5,12 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { CalendarDays, Users, MessageSquare, ArrowUpRight, PlusCircle } from "lucide-react";
 import { useActiveTenant } from "@/app/providers/active-tenant";
+import { createClient } from "@supabase/supabase-js";
+
+// Inicializamos el cliente de Supabase para consultas directas a la DB
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
 type Totals = {
   bookings: number; // total bookings del tenant activo
@@ -17,6 +23,26 @@ type Recent = {
   title: string;
   created_at: string;
 };
+
+// Función para formatear las fechas de forma consistente (ej: "3 mar 2026, 9:00 AM")
+function formatElegantDate(isoString: string) {
+  try {
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return isoString; // Si falla, devuelve la original
+
+    return new Intl.DateTimeFormat("es-DO", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+      timeZone: "America/Santo_Domingo", // Mantenemos tu zona horaria
+    }).format(d);
+  } catch (e) {
+    return isoString;
+  }
+}
 
 export default function DashboardHome() {
   const { tenantId, loading: loadingTenant } = useActiveTenant();
@@ -49,7 +75,7 @@ export default function DashboardHome() {
     })();
   }, [tenantId, loadingTenant]);
 
-  // Totales + recientes (desde /api/admin/metrics)
+  // Totales + recientes (desde /api/admin/metrics y directo desde la DB)
   useEffect(() => {
     if (loadingTenant) return;
     if (!tenantId) {
@@ -60,18 +86,73 @@ export default function DashboardHome() {
     (async () => {
       setLoadingData(true);
       try {
+        // 1. LÓGICA ORIGINAL INTACTA (Fetch a la API)
         const r = await fetch(`/api/admin/metrics?tenantId=${tenantId}`, {
           credentials: "include",
           cache: "no-store",
         });
         const j = await r.json();
+        
+        let apiTotals = { bookings: 0, tenants: 0, messages: 0 };
+        let apiRecent: Recent[] = [];
+
         if (j?.ok) {
-          setTotals(j.totals || { bookings: 0, tenants: 0, messages: 0 });
-          setRecent(j.recent || []);
-        } else {
-          setTotals({ bookings: 0, tenants: 0, messages: 0 });
-          setRecent([]);
+          apiTotals = j.totals || apiTotals;
+          apiRecent = j.recent || [];
         }
+
+        // 2. NUEVA LÓGICA: Consulta Directa a la Base de Datos para asegurar los números reales
+        let dbBookingsCount = apiTotals.bookings;
+        let dbCustomersCount = apiTotals.tenants;
+        let dbRecent = apiRecent;
+
+        if (supabase) {
+          // Conteo real de citas
+          const { count: bCount, error: bErr } = await supabase
+            .from("bookings")
+            .select("*", { count: "exact", head: true })
+            .eq("tenant_id", tenantId);
+
+          if (!bErr && bCount !== null) {
+            dbBookingsCount = bCount;
+          }
+
+          // Conteo real de clientes
+          const { count: cCount, error: cErr } = await supabase
+            .from("customers")
+            .select("*", { count: "exact", head: true })
+            .eq("tenant_id", tenantId);
+
+          if (!cErr && cCount !== null) {
+            dbCustomersCount = cCount;
+          }
+
+          // Últimas citas reales para la "Actividad reciente"
+          const { data: recentData, error: rErr } = await supabase
+            .from("bookings")
+            .select("id, customer_name, created_at, starts_at")
+            .eq("tenant_id", tenantId)
+            .order("created_at", { ascending: false })
+            .limit(5);
+
+          if (!rErr && recentData && recentData.length > 0) {
+            dbRecent = recentData.map((b: any) => ({
+              id: b.id,
+              title: b.customer_name ? `Cita con ${b.customer_name}` : "Cita agendada",
+              // Usamos la fecha de creación si no hay de inicio, pero formatElegantDate se encarga del renderizado
+              created_at: b.created_at || b.starts_at, 
+            }));
+          }
+        }
+
+        // Seteamos los totales combinando la API original y los datos reales de la DB
+        setTotals({
+          bookings: dbBookingsCount,
+          tenants: dbCustomersCount, // La UI usa tenants para "Clientes (total)"
+          messages: apiTotals.messages,
+        });
+        setRecent(dbRecent);
+
       } catch {
         setTotals({ bookings: 0, tenants: 0, messages: 0 });
         setRecent([]);
@@ -173,7 +254,8 @@ export default function DashboardHome() {
                   <div>
                     <p className="font-medium">{r.title}</p>
                     <p className="text-xs text-gray-500">
-                      {new Date(r.created_at).toLocaleString()}
+                      {/* Aplicamos la nueva función de formateo aquí */}
+                      {formatElegantDate(r.created_at)}
                     </p>
                   </div>
                   <Link
